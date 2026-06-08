@@ -1,0 +1,49 @@
+symbols_mode: top20_usdt_perp
+symbol_rank_by: quote_volume_24h
+timeframes:
+  - 15m
+  - 1h
+
+strategy:
+  score_threshold: 75
+  watch_threshold: 60
+  volume_window: 20
+  volume_min_ratio: 1.2
+  volume_extreme_ratio: 2.8
+  ema_fast: 20
+  ema_slow: 50
+  ma_trend: 100
+  bollinger_window: 20
+  bollinger_stddev: 2.0
+  rsi_window: 14
+  atr_window: 14
+  pullback_tolerance_atr: 0.6
+  max_extension_atr: 2.2
+  oi_mild_change_min: 0.001
+  oi_extreme_change: 0.05
+  long_short_overcrowded_long: 2.2
+  long_short_overcrowded_short: 0.45
+  funding_hot_long: 0.0005
+  funding_hot_short: -0.0005
+
+risk:
+  leverage_default: 5
+  leverage_max: 10
+  risk_per_trade: 0.005
+  single_symbol_margin_limit: 0.10
+  total_margin_limit: 0.35
+  max_open_positions: 3
+  daily_loss_limit: 0.02
+  max_consecutive_losses: 3
+  cooldown_hours: 6
+  atr_stop_buffer: 0.5
+  time_stop_bars: 5
+  first_take_profit_r: 1.0
+  second_take_profit_r: 2.0
+  first_take_profit_fraction: 0.35
+  second_take_profit_fraction: 0.35
+
+execution:
+  paper_trading: true
+  taker_fee_rate: 0.0004
+  slippage_rate: 0.0003

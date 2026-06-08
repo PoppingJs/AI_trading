@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ai-trading"
+version = "0.1.0"
+description = "Rule-based Binance USDT-M futures strategy research toolkit."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "fastapi>=0.111.0",
+  "httpx>=0.27.0",
+  "pydantic>=2.7.0",
+  "PyYAML>=6.0.1",
+  "uvicorn>=0.30.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.2.0",
+]
+
+[project.scripts]
+ai-trading = "ai_trading.cli:main"
+ai-trading-api = "ai_trading.api:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
