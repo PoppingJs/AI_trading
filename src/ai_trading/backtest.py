@@ -30,7 +30,8 @@ class BacktestEngine:
     execution_settings: ExecutionSettings = field(default_factory=ExecutionSettings)
 
     def run(self, candles: list[Candle], derivatives: list[DerivativesSnapshot] | None = None) -> BacktestResult:
-        if len(candles) < self.strategy_settings.ma_trend + 5:
+        warmup_bars = max(self.strategy_settings.ma_trend, 200)
+        if len(candles) < warmup_bars + 5:
             return BacktestResult(
                 starting_equity=self.starting_equity,
                 ending_equity=self.starting_equity,
@@ -63,7 +64,7 @@ class BacktestEngine:
         position: Position | None = None
         trades: list[Trade] = []
 
-        warmup = self.strategy_settings.ma_trend + 1
+        warmup = warmup_bars + 1
         for idx in range(warmup, len(candles)):
             candle = candles[idx]
             current_indicator = indicators[idx]

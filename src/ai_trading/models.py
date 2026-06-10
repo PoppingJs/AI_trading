@@ -52,6 +52,7 @@ class IndicatorSnapshot:
     close: float
     ema20: float | None
     ema50: float | None
+    ema200: float | None
     ma100: float | None
     boll_mid: float | None
     boll_upper: float | None
@@ -61,6 +62,7 @@ class IndicatorSnapshot:
     volume_sma20: float | None
     volume_ratio: float | None
     ema50_slope: float | None
+    open_interest: float | None = None
     oi_change: float | None = None
     long_short_ratio: float | None = None
     funding_rate: float | None = None

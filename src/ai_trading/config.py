@@ -9,6 +9,7 @@ from typing import Any
 class StrategySettings:
     score_threshold: int = 75
     watch_threshold: int = 60
+    strict_trend_entry: bool = False
     volume_window: int = 20
     volume_min_ratio: float = 1.2
     volume_extreme_ratio: float = 2.8
@@ -23,8 +24,30 @@ class StrategySettings:
     max_extension_atr: float = 2.2
     oi_mild_change_min: float = 0.001
     oi_extreme_change: float = 0.05
+    oi_4h_entry_min: float = 0.03
+    smart_money_window: int = 16
+    smart_money_oi_flush: float = 0.035
+    smart_money_oi_rebuild: float = 0.012
+    smart_money_oi_trap: float = 0.018
+    smart_money_price_move: float = 0.012
+    smart_money_wick_atr: float = 0.7
+    smart_money_min_wicks: int = 2
+    smart_money_volume_ratio: float = 1.2
+    structure_lookback: int = 20
+    structure_buffer_atr: float = 0.4
+    structure_grind_bars: int = 4
+    structure_grind_tolerance_atr: float = 0.8
+    sweep_wick_atr: float = 0.9
+    wash_oi_drop_min: float = 0.003
+    extreme_atr_pct: float = 0.06
     long_short_overcrowded_long: float = 2.2
     long_short_overcrowded_short: float = 0.45
+    top_long_short_long_min: float = 1.1
+    top_long_short_short_max: float = 0.9
+    funding_long_min: float = -0.0001
+    funding_long_max: float = 0.0005
+    funding_short_min: float = -0.0005
+    funding_short_max: float = 0.0001
     funding_hot_long: float = 0.0005
     funding_hot_short: float = -0.0005
 
@@ -36,8 +59,10 @@ class RiskSettings:
     risk_per_trade: float = 0.005
     single_symbol_margin_limit: float = 0.10
     total_margin_limit: float = 0.35
-    max_open_positions: int = 3
+    max_open_positions: int = 5
     daily_loss_limit: float = 0.02
+    weekly_loss_limit: float = 0.15
+    max_drawdown_circuit_breaker: float = 0.20
     max_consecutive_losses: int = 3
     cooldown_hours: int = 6
     atr_stop_buffer: float = 0.5
@@ -46,6 +71,9 @@ class RiskSettings:
     second_take_profit_r: float = 2.0
     first_take_profit_fraction: float = 0.35
     second_take_profit_fraction: float = 0.35
+    trailing_remainder_fraction: float = 0.20
+    trailing_activation_r: float = 2.0
+    trailing_lock_r: float = 0.5
 
 
 @dataclass

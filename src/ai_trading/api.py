@@ -5,6 +5,7 @@ from pathlib import Path
 
 import uvicorn
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 
 from ai_trading.backtest import BacktestEngine
@@ -13,6 +14,7 @@ from ai_trading.cli import _synthetic_market
 from ai_trading.config import AppSettings, load_settings
 from ai_trading.indicators import build_indicators
 from ai_trading.models import SignalAction
+from ai_trading.paper import PAPER_DEFAULT_BALANCE, PaperTradingEngine
 from ai_trading.strategy import CompositeStrategy
 
 
@@ -20,6 +22,29 @@ class BacktestRequest(BaseModel):
     symbol: str = "DEMOUSDT"
     starting_equity: float = Field(default=10_000.0, gt=0)
     use_demo_data: bool = True
+
+
+class PaperStartRequest(BaseModel):
+    starting_balance: float | None = Field(default=None, gt=0)
+    symbols: list[str] | None = None
+    interval: str = "15m"
+    auto_trade: bool = False
+    poll_seconds: int = Field(default=20, ge=5, le=300)
+    reset_account: bool = False
+
+
+class PaperOrderRequest(BaseModel):
+    symbol: str = "BTCUSDT"
+    side: str = Field(pattern="^(LONG|SHORT)$")
+    margin_usdt: float = Field(default=100.0, gt=0)
+    leverage: int = Field(default=5, ge=1, le=10)
+    stop_loss: float | None = Field(default=None, gt=0)
+    take_profit_1: float | None = Field(default=None, gt=0)
+    take_profit_2: float | None = Field(default=None, gt=0)
+
+
+class PaperCloseRequest(BaseModel):
+    symbol: str = "BTCUSDT"
 
 
 def create_app(settings_path: str | Path = "config/strategy.yaml") -> FastAPI:
@@ -30,6 +55,11 @@ def create_app(settings_path: str | Path = "config/strategy.yaml") -> FastAPI:
         summary="Paper-trading-first Binance USDT-M futures strategy service.",
     )
     app.state.settings = settings
+    app.state.paper_engine = PaperTradingEngine(settings, starting_balance=PAPER_DEFAULT_BALANCE)
+
+    @app.get("/", response_class=HTMLResponse)
+    def paper_dashboard() -> str:
+        return PAPER_DASHBOARD_HTML
 
     @app.get("/api/health")
     def health() -> dict[str, object]:
@@ -38,6 +68,7 @@ def create_app(settings_path: str | Path = "config/strategy.yaml") -> FastAPI:
             "paper_trading": settings.execution.paper_trading,
             "symbols_mode": settings.symbols_mode,
             "timeframes": settings.timeframes,
+            "paper_dashboard": "http://127.0.0.1:8000/",
         }
 
     @app.get("/api/config")
@@ -45,9 +76,10 @@ def create_app(settings_path: str | Path = "config/strategy.yaml") -> FastAPI:
         return settings.model_dump()
 
     @app.get("/api/markets/top20")
-    async def top20_markets() -> dict[str, object]:
+    @app.get("/api/markets/top30")
+    async def top30_markets() -> dict[str, object]:
         client = BinanceFuturesMarketData()
-        symbols = await client.top_usdt_perpetuals(limit=20)
+        symbols = await client.top_usdt_perpetuals(limit=30)
         return {
             "rank_by": settings.symbol_rank_by,
             "symbols": [asdict(symbol) for symbol in symbols],
@@ -88,6 +120,78 @@ def create_app(settings_path: str | Path = "config/strategy.yaml") -> FastAPI:
             "notes": result.notes,
         }
 
+    @app.get("/api/paper/status")
+    def paper_status() -> dict[str, object]:
+        return app.state.paper_engine.status()
+
+    @app.post("/api/paper/start")
+    async def paper_start(request: PaperStartRequest) -> dict[str, object]:
+        engine: PaperTradingEngine = app.state.paper_engine
+        requested_symbols = [symbol.upper() for symbol in request.symbols or []]
+        if not requested_symbols or _uses_default_symbol_pool(requested_symbols):
+            engine.symbols = ["AUTO_TOP30"]
+        else:
+            engine.symbols = requested_symbols
+        engine.interval = request.interval
+        if request.reset_account:
+            await engine.reset(starting_balance=request.starting_balance or PAPER_DEFAULT_BALANCE)
+        elif request.starting_balance is not None and not engine.account.fills and not engine.account.positions:
+            await engine.reset(starting_balance=request.starting_balance)
+        await engine.start(auto_trade=request.auto_trade, poll_seconds=request.poll_seconds)
+        return engine.status()
+
+    @app.post("/api/paper/stop")
+    async def paper_stop() -> dict[str, object]:
+        engine: PaperTradingEngine = app.state.paper_engine
+        await engine.stop()
+        return engine.status()
+
+    @app.post("/api/paper/reset")
+    async def paper_reset(starting_balance: float = PAPER_DEFAULT_BALANCE) -> dict[str, object]:
+        engine: PaperTradingEngine = app.state.paper_engine
+        await engine.reset(starting_balance=starting_balance)
+        return engine.status()
+
+    @app.post("/api/paper/refresh")
+    async def paper_refresh() -> dict[str, object]:
+        engine: PaperTradingEngine = app.state.paper_engine
+        try:
+            await engine.refresh_once()
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(status_code=502, detail=f"Binance market refresh failed: {exc}") from exc
+        return engine.status()
+
+    @app.post("/api/paper/order/open")
+    async def paper_open_order(request: PaperOrderRequest) -> dict[str, object]:
+        engine: PaperTradingEngine = app.state.paper_engine
+        try:
+            await engine.open_position(
+                request.symbol,
+                request.side,  # type: ignore[arg-type]
+                margin_usdt=request.margin_usdt,
+                leverage=request.leverage,
+                stop_loss=request.stop_loss,
+                take_profit_1=request.take_profit_1,
+                take_profit_2=request.take_profit_2,
+                reason="manual dashboard",
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(status_code=502, detail=f"Binance price fetch failed: {exc}") from exc
+        return engine.status()
+
+    @app.post("/api/paper/order/close")
+    async def paper_close_order(request: PaperCloseRequest) -> dict[str, object]:
+        engine: PaperTradingEngine = app.state.paper_engine
+        try:
+            await engine.close_position(request.symbol)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(status_code=502, detail=f"Binance price fetch failed: {exc}") from exc
+        return engine.status()
+
     return app
 
 
@@ -121,6 +225,806 @@ def _signal_payload(signal) -> dict[str, object]:
         "reasons": signal.reasons,
         "indicators": asdict(signal.indicators) if signal.indicators else None,
     }
+
+
+def _uses_default_symbol_pool(symbols: list[str]) -> bool:
+    cleaned = {symbol.replace("/", "").replace("-", "").upper() for symbol in symbols if symbol}
+    return not cleaned or cleaned == {"BTCUSDT", "ETHUSDT", "SOLUSDT"} or cleaned == {"AUTO_TOP30"}
+
+
+PAPER_DASHBOARD_HTML = """
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>AI 量化交易平台</title>
+  <style>
+    :root { color-scheme: light; font-family: "Microsoft YaHei", Arial, sans-serif; }
+    html, body { width: 100%; height: 100%; max-width: 100%; overflow: hidden; }
+    body { margin: 0; background: #f6f7f9; color: #171717; }
+    header { height: 60px; box-sizing: border-box; padding: 12px 24px; background: #111827; color: white; display: flex; justify-content: space-between; align-items: center; gap: 12px; }
+    header h1 { margin: 0; font-size: 20px; }
+    header p { margin: 4px 0 0; color: #cbd5e1; font-size: 13px; }
+    main { height: calc(100vh - 60px); padding: 10px 16px; width: 100%; box-sizing: border-box; margin: 0; overflow: hidden; display: flex; flex-direction: column; gap: 10px; }
+    .grid { display: grid; gap: 10px; }
+    .metrics { grid-template-columns: repeat(6, minmax(130px, 1fr)); flex: 0 0 auto; }
+    .layout { grid-template-columns: 360px minmax(0, 1fr); align-items: stretch; flex: 1 1 auto; min-height: 0; margin-top: 0 !important; }
+    .layout > .card { min-height: 0; overflow: hidden; }
+    .layout > .grid { display: grid; grid-template-rows: 230px minmax(70px, 1fr) 210px; min-height: 0; }
+    .layout > .grid > .card { min-height: 0; overflow: hidden; }
+    .layout > .grid > .card:nth-child(1) { display: flex; flex-direction: column; overflow: hidden; }
+    .layout > .grid > .card:nth-child(1) .scroll { flex: 1 1 auto; min-height: 0; overflow-y: auto; scrollbar-gutter: stable; }
+    .layout > .grid > .card:nth-child(1) thead th { position: sticky; top: 0; z-index: 1; }
+    .layout > .grid > .card:nth-child(2) { display: flex; flex-direction: column; overflow: hidden; }
+    .layout > .grid > .card:nth-child(2) .scroll { flex: 1 1 auto; min-height: 0; max-height: none; overflow-y: auto; }
+    .layout > .grid > .card:nth-child(2) thead th { position: sticky; top: 0; z-index: 1; }
+    .layout > .grid > .card:last-child { display: flex; flex-direction: column; min-height: 0; overflow: hidden; }
+    .card { background: white; border: 1px solid #e5e7eb; border-radius: 8px; padding: 12px; box-shadow: 0 1px 2px rgba(0,0,0,.04); }
+    .metric span { color: #6b7280; font-size: 12px; }
+    .metric strong { display: block; margin-top: 6px; font-size: 20px; }
+    .positive { color: #047857; }
+    .negative { color: #b91c1c; }
+    label { display: block; font-size: 12px; color: #4b5563; margin: 10px 0 5px; }
+    input, select { width: 100%; box-sizing: border-box; padding: 9px 10px; border: 1px solid #d1d5db; border-radius: 6px; background: white; }
+    button { border: 0; border-radius: 6px; padding: 10px 12px; cursor: pointer; font-weight: 600; }
+    button.primary { background: #2563eb; color: white; }
+    button.long { background: #059669; color: white; }
+    button.short { background: #dc2626; color: white; }
+    button.neutral { background: #e5e7eb; color: #111827; }
+    button:disabled { opacity: .55; cursor: not-allowed; }
+    .row { display: flex; gap: 8px; align-items: center; }
+    .row > * { flex: 1; }
+    table { width: max-content; max-width: 100%; border-collapse: collapse; font-size: 13px; table-layout: auto; }
+    th, td { text-align: center; padding: 8px 14px; border-bottom: 1px solid #e5e7eb; vertical-align: middle; overflow-wrap: normal; }
+    th:not(.reason-col), td:not(.reason-col) { white-space: nowrap; }
+    th { color: #6b7280; font-weight: 600; background: #f9fafb; }
+    .scroll { overflow-x: hidden; max-width: 100%; }
+    .fills-scroll { flex: 1 1 auto; min-height: 0; overflow: hidden; padding-right: 0; }
+    .fills-scroll thead th { position: sticky; top: 0; z-index: 1; }
+    #positions, #signals, #fills { font-size: 11px; line-height: 1.05; }
+    #positions th, #positions td, #signals th, #signals td, #fills th, #fills td { height: 16px; padding: 0 5px; line-height: 1.05; }
+    #positions tbody tr, #signals tbody tr, #fills tbody tr { height: 16px; }
+    #signals th, #signals td { height: 22px; padding: 2px 7px; line-height: 1.2; }
+    #signals tbody tr { height: 22px; }
+    #fills { width: 100%; table-layout: fixed; }
+    #fills th, #fills td { padding: 0 1px; overflow: hidden; text-overflow: clip; }
+    #fills .time-col { font-size: 11px; }
+    #fills .side-col { padding-left: 0; padding-right: 0; }
+    #fills .reason-col { text-align: left; line-height: 1.2; overflow-wrap: anywhere; }
+    #fills .empty-fill-row td { color: #111827; }
+    #fills .empty-fill-row:not(:first-child) td { color: transparent; }
+    .pager { display: flex; justify-content: center; align-items: center; gap: 6px; padding-top: 6px; flex: 0 0 auto; }
+    .pager button { min-width: 34px; padding: 6px 9px; background: #e5e7eb; color: #111827; }
+    .pager button.active { background: #2563eb; color: white; }
+    .pager button:disabled { opacity: .45; cursor: not-allowed; }
+    .pager .ellipsis { min-width: 18px; color: #6b7280; text-align: center; }
+    .reason-col { white-space: normal; line-height: 1.45; }
+    .time-col { min-width: 132px; }
+    .num-col { text-align: center; min-width: 72px; }
+    .symbol-col { min-width: 86px; }
+    .side-col, .action-col { min-width: 56px; }
+    .signals-table { width: max-content; table-layout: auto; }
+    .signals-table th, .signals-table td { vertical-align: middle; }
+    .signals-table .symbol-col { min-width: 86px; text-align: center; }
+    .signals-table .side-col { min-width: 72px; text-align: center; }
+    .signals-table .num-col { min-width: 56px; text-align: center; }
+    .signals-table .reason-col { min-width: 520px; max-width: 820px; text-align: left; }
+    .signals-table .veto-col { min-width: 120px; max-width: 200px; text-align: center; white-space: normal; line-height: 1.2; }
+    .signals-table th.reason-col { text-align: center; }
+    .signals-table th.veto-col { text-align: center; }
+    .signals-table th:not(.reason-col), .signals-table td:not(.reason-col):not(.veto-col) { text-align: center; }
+    .center-table th, .center-table td { text-align: center; vertical-align: middle; padding: 1px 6px; }
+    .center-table .symbol-col { min-width: 78px; text-align: center; }
+    .center-table .side-col { min-width: 46px; text-align: center; }
+    .center-table .num-col { min-width: 64px; text-align: center; }
+    .center-table .time-col { min-width: 120px; text-align: center; }
+    .center-table th:last-child:not(.reason-col), .center-table td:last-child:not(.reason-col) { min-width: 62px; }
+    .center-table .reason-col { min-width: 180px; max-width: 360px; text-align: left; white-space: normal; line-height: 1.2; }
+    .center-table th.reason-col { text-align: center; }
+    .status { font-size: 12px; color: #6b7280; }
+    .pill { display: inline-block; padding: 3px 7px; border-radius: 999px; background: #eef2ff; color: #3730a3; font-size: 12px; }
+    .error { color: #b91c1c; font-size: 13px; min-height: 18px; }
+    .chart-wrap {
+      position: fixed;
+      left: 16px;
+      bottom: 16px;
+      width: 360px;
+      box-sizing: border-box;
+      padding: 14px 16px 16px;
+      background: white;
+      border: 1px solid #e5e7eb;
+      border-radius: 8px;
+      box-shadow: 0 8px 24px rgba(15, 23, 42, .12);
+      z-index: 20;
+    }
+    .chart-head { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; margin-bottom: 8px; }
+    .chart-head h2 { font-size: 16px; margin: 0; }
+    .chart-head span { font-size: 12px; color: #6b7280; }
+    #pnlChart { width: 100%; height: 210px; display: block; background: #fbfcfe; border: 1px solid #e5e7eb; border-radius: 8px; }
+    @media (max-width: 980px) {
+      .metrics, .layout { grid-template-columns: 1fr; }
+      header { display: block; }
+      .chart-wrap { position: static; width: 100%; margin-top: 14px; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div>
+      <h1>AI 量化交易平台</h1>
+      <p>Binance USDT-M 实时行情，本地模拟账户，不会产生真实订单。</p>
+    </div>
+    <div class="status" id="updated">loading...</div>
+  </header>
+  <main>
+    <section class="grid metrics" id="metrics"></section>
+    <section class="grid layout" style="margin-top:14px;">
+      <div class="card">
+        <h2 style="font-size:16px;margin:0 0 10px;">控制台</h2>
+        <label>模拟本金 USDT</label>
+        <input id="startingBalance" type="number" value="1200" min="1" step="10" />
+        <label>币种，用逗号分隔</label>
+        <input id="symbols" value="AUTO_TOP30" />
+        <label>周期</label>
+        <select id="interval"><option>15m</option><option>1h</option><option>4h</option><option>1d</option></select>
+        <div class="row" style="margin-top:12px;">
+          <button class="primary" onclick="startPaper(false)">启动Top30行情</button>
+          <button class="primary" onclick="startPaper(true)">启动Top30策略</button>
+        </div>
+        <div class="row" style="margin-top:8px;">
+          <button class="neutral" onclick="refreshPaper()">刷新一次</button>
+          <button class="neutral" onclick="stopPaper()">停止</button>
+          <button class="neutral" onclick="resetPaper()">重置1200U</button>
+        </div>
+        <hr style="border:0;border-top:1px solid #e5e7eb;margin:16px 0;">
+        <h2 style="font-size:16px;margin:0 0 10px;">手动开仓</h2>
+        <label>币种</label>
+        <input id="orderSymbol" value="BTC/USDT" />
+        <div class="row">
+          <div><label>保证金 USDT</label><input id="margin" type="number" value="100" min="1" step="10" /></div>
+          <div><label>杠杆</label><input id="leverage" type="number" value="5" min="1" max="10" step="1" /></div>
+        </div>
+        <div class="row">
+          <button class="long" onclick="openOrder('LONG')">做多</button>
+          <button class="short" onclick="openOrder('SHORT')">做空</button>
+        </div>
+        <button class="neutral" style="width:100%;margin-top:8px;" onclick="closeOrder()">平当前币种</button>
+        <p class="error" id="error"></p>
+        <div class="chart-wrap">
+          <div class="chart-head">
+            <h2>实时总收益曲线</h2>
+            <span>不含本金</span>
+          </div>
+          <canvas id="pnlChart" width="680" height="420"></canvas>
+        </div>
+      </div>
+      <div class="grid">
+        <div class="card">
+          <h2 style="font-size:16px;margin:0 0 10px;">持仓</h2>
+          <div class="scroll"><table id="positions"></table></div>
+        </div>
+        <div class="card">
+          <h2 style="font-size:16px;margin:0 0 10px;">策略信号</h2>
+          <div class="scroll"><table id="signals"></table></div>
+        </div>
+        <div class="card">
+          <h2 style="font-size:16px;margin:0 0 10px;">成交记录</h2>
+          <div class="scroll fills-scroll"><table id="fills"></table></div>
+          <div class="pager" id="fillsPager"></div>
+        </div>
+      </div>
+    </section>
+  </main>
+  <script>
+    const pnlHistory = [];
+    let fillsPage = 1;
+    const fillsPageSize = 7;
+    async function api(path, options = {}) {
+      const response = await fetch(path, { headers: { 'Content-Type': 'application/json' }, ...options });
+      if (!response.ok) {
+        const body = await response.json().catch(() => ({}));
+        throw new Error(body.detail || response.statusText);
+      }
+      return response.json();
+    }
+    function money(v) { return Number(v || 0).toFixed(2); }
+    function wholeUsdt(v) {
+      const n = Number(v || 0);
+      if (!Number.isFinite(n)) return '0';
+      return String(Math.round(n));
+    }
+    function priceText(v, significant = 4) {
+      if (v === null || v === undefined || v === '') return '--';
+      const n = Number(v);
+      if (!Number.isFinite(n)) return String(v);
+      if (n === 0) return '0';
+      const abs = Math.abs(n);
+      if (abs >= 1) {
+        const integerDigits = Math.floor(abs).toString().length;
+        const decimals = Math.max(0, significant - integerDigits);
+        return n.toFixed(decimals);
+      }
+      const decimals = Math.min(10, Math.max(0, Math.ceil(-Math.log10(abs)) + significant - 1));
+      return n.toFixed(decimals);
+    }
+    function pct(v) { return (Number(v || 0) * 100).toFixed(2) + '%'; }
+    function pnlClass(v) { return Number(v || 0) >= 0 ? 'positive' : 'negative'; }
+    function timeText(v) {
+      if (!v) return '--';
+      const date = new Date(v);
+      if (Number.isNaN(date.getTime())) return String(v);
+      const parts = new Intl.DateTimeFormat('zh-CN', {
+        timeZone: 'Asia/Shanghai',
+        year: 'numeric',
+        month: '2-digit',
+        day: '2-digit',
+        hour: '2-digit',
+        minute: '2-digit',
+        second: '2-digit',
+        hour12: false
+      }).formatToParts(date).reduce((acc, part) => {
+        acc[part.type] = part.value;
+        return acc;
+      }, {});
+      return `${parts.year}-${parts.month}-${parts.day} ${parts.hour}:${parts.minute}:${parts.second}`;
+    }
+    const actionText = {
+      ENTRY_LONG: '开多',
+      ENTRY_SHORT: '开空',
+      EXIT_LONG: '平多',
+      EXIT_SHORT: '平空',
+      WATCH: '观察',
+      NO_TRADE: '不交易',
+      OPEN: '开仓',
+      CLOSE: '平仓',
+      LONG: '多',
+      SHORT: '空'
+    };
+    const regimeText = {
+      TREND_LONG: '多头趋势',
+      TREND_SHORT: '空头趋势',
+      CHOP: '震荡',
+      OVERCROWDED: '拥挤',
+      INSUFFICIENT_DATA: '数据不足'
+    };
+    const smartMoneyPhaseText = {
+      NEUTRAL: '中性',
+      ACCUMULATION_REBUILD: '吸筹重建',
+      SHORT_SQUEEZE_MARKUP: '逼空拉升',
+      DISTRIBUTION_EXIT: '派发离场',
+      TRAPPED_LONGS_MARKDOWN: '套多阴跌',
+      CAPITULATION_ABSORB: '杀跌吸筹'
+    };
+    const trendStateText = {
+      CHOP: '震荡',
+      TREND_LONG: '多头趋势',
+      TREND_SHORT: '空头趋势',
+      ONE_WAY_UP: '单边上涨',
+      ONE_WAY_DOWN: '单边下跌'
+    };
+    const riskStateText = {
+      NORMAL: '正常',
+      LONG_CROWD: '多头拥挤',
+      SHORT_CROWD: '空头拥挤',
+      OI_ABNORMAL: 'OI异常',
+      FUNDING_HOT: '资金费率过热'
+    };
+    const reasonText = {
+      'score below trading threshold': '评分低于交易阈值',
+      'both sides failed hard filters': '多空双方都未通过硬性过滤',
+      'not enough candles for MA trend filter': 'K线数量不足，无法计算 MA 趋势过滤',
+      'latest candle lacks required indicators': '最新K线缺少必要指标',
+      'EMA20 above EMA50 and EMA50 rising': 'EMA20 位于 EMA50 上方，且 EMA50 上行',
+      'EMA20 below EMA50 and EMA50 falling': 'EMA20 位于 EMA50 下方，且 EMA50 下行',
+      'EMA20 above EMA50 above EMA200': 'EMA20 > EMA50 > EMA200，三线多头排列',
+      'EMA20 below EMA50 below EMA200': 'EMA20 < EMA50 < EMA200，三线空头排列',
+      'price above MA100 trend filter': '价格位于 MA100 上方，符合多头趋势过滤',
+      'price below MA100 trend filter': '价格位于 MA100 下方，符合空头趋势过滤',
+      'close confirmed near EMA20/BOLL mid without chasing upper band': '收盘确认靠近 EMA20 或布林中轨，未追高上轨',
+      'close confirmed failed retest near EMA20/BOLL mid': '收盘确认反抽 EMA20 或布林中轨失败',
+      'BOLL mid confirmed for long continuation': '连续收盘站上 BOLL 中轨，多头延续确认',
+      'BOLL mid confirmed for short continuation': '连续收盘跌破 BOLL 中轨，空头延续确认',
+      'volume confirms move without extreme blow-off': '成交量确认走势，且未出现极端放量冲高',
+      'volume confirms sell pressure without capitulation chase': '成交量确认卖压，且未追空恐慌下跌',
+      'volume is acceptable but not strong': '成交量尚可，但强度不足',
+      '4h open interest confirms new money entering': '4小时 OI 增加达到阈值，新资金入场确认',
+      'open interest rising mildly with price': '价格配合 OI 温和上升',
+      'open interest rising mildly with falling price': '价格下跌且 OI 温和上升',
+      'open interest stable': 'OI 基本稳定',
+      'long/short ratio is not overcrowded long': '多空比未出现多头过度拥挤',
+      'long/short ratio is not overcrowded short': '多空比未出现空头过度拥挤',
+      'top trader long/short ratio supports longs': '大户多空比支持做多',
+      'top trader long/short ratio supports shorts': '大户多空比支持做空',
+      'RSI in healthy long-trend range': 'RSI 处于健康多头区间',
+      'RSI in healthy short-trend range': 'RSI 处于健康空头区间',
+      'funding rate is not overheated for longs': '资金费率未对多头过热',
+      'funding rate is not overheated for shorts': '资金费率未对空头过热',
+      'funding rate is in long entry range': '资金费率处于多单入场区间',
+      'funding rate is in short entry range': '资金费率处于空单入场区间',
+      'RSI overheated for long entry': 'RSI 过热，禁止追多',
+      'RSI oversold for short entry': 'RSI 超卖，禁止追空',
+      'long side overcrowded': '多头过度拥挤',
+      'short side overcrowded': '空头过度拥挤',
+      'funding too hot for long entry': '资金费率过高，禁止追多',
+      'funding too negative for short entry': '资金费率过低，禁止追空',
+      'open interest spike risks liquidation sweep': 'OI 异常暴增，存在扫损/爆仓风险',
+      'price closed above upper BOLL; no chase': '价格收在布林上轨外，禁止追高',
+      'price closed below lower BOLL; no chase': '价格收在布林下轨外，禁止追空',
+      'smart money accumulation: OI flushed into a 4h pocket, then rebuilt while price recovered': '主力吸筹：4小时 OI 爆减形成洼地，随后 OI 回升且价格修复',
+      'smart money accumulation after OI flush; avoid chasing shorts': 'OI 爆减后疑似吸筹，避免追空',
+      'short squeeze markup: price and OI rise while long/short ratio falls, shorts are being trapped': '逼空拉升：价格和 OI 同升，多空比下降，空头开始被套',
+      'short crowd is vulnerable to a squeeze': '空头拥挤，存在被继续拉升爆空风险',
+      'smart money distribution: repeated upper wicks with OI falling after markup': '主力派发：上涨后多次上插针，同时 OI 回落',
+      'smart money distribution after upper wick sweeps': '上插针扫单后 OI 回落，疑似主力离场',
+      'trapped longs markdown: price falls while OI and long/short ratio rise': '套多阴跌：价格下跌，但 OI 和多空比继续上升',
+      'trapped longs are increasing while price falls': '价格下跌时多头继续拥挤，避免做多',
+      'capitulation absorption: lower wick sweeps with OI flush and volume expansion': '杀跌吸筹：多次下插针，OI 爆减且成交量放大',
+      'capitulation OI flush; avoid late shorts': '下跌尾段 OI 爆减，避免追空',
+      'strict long blocked: EMA20/EMA50/EMA200 not bullish': '严格多单禁止：EMA20/EMA50/EMA200 未多头排列',
+      'strict long blocked: BOLL mid not confirmed twice': '严格多单禁止：未连续站上 BOLL 中轨',
+      'strict long blocked: RSI not in 52-72': '严格多单禁止：RSI 不在 52-72',
+      'strict long blocked: volume below 1.5x average': '严格多单禁止：成交量低于均量 1.5 倍',
+      'strict long blocked: 4h OI increase below 3%': '严格多单禁止：4小时 OI 增幅不足 3%',
+      'strict long blocked: top long/short ratio below 1.1': '严格多单禁止：大户多空比低于 1.1',
+      'strict long blocked: funding outside long range': '严格多单禁止：资金费率不在多单区间',
+      'strict long blocked: EMA lines are too compressed': '严格多单禁止：EMA 三线粘合，趋势不明',
+      'strict long blocked: RSI neutral zone': '严格多单禁止：RSI 位于中性区',
+      'strict long blocked: 1h candle amplitude above 5%': '严格多单禁止：1小时振幅超过 5%',
+      'strict short blocked: EMA20/EMA50/EMA200 not bearish': '严格空单禁止：EMA20/EMA50/EMA200 未空头排列',
+      'strict short blocked: BOLL mid not confirmed twice': '严格空单禁止：未连续跌破 BOLL 中轨',
+      'strict short blocked: RSI not in 28-48': '严格空单禁止：RSI 不在 28-48',
+      'strict short blocked: volume below 1.5x average': '严格空单禁止：成交量低于均量 1.5 倍',
+      'strict short blocked: 4h OI increase below 3%': '严格空单禁止：4小时 OI 增幅不足 3%',
+      'strict short blocked: top long/short ratio above 0.9': '严格空单禁止：大户多空比高于 0.9',
+      'strict short blocked: funding outside short range': '严格空单禁止：资金费率不在空单区间',
+      'strict short blocked: EMA lines are too compressed': '严格空单禁止：EMA 三线粘合，趋势不明',
+      'strict short blocked: RSI neutral zone': '严格空单禁止：RSI 位于中性区',
+      'strict short blocked: 1h candle amplitude above 5%': '严格空单禁止：1小时振幅超过 5%',
+      'market structure confirms long: breakout or retest held': '市场结构确认做多：突破或回踩压力位不破',
+      'market structure confirms short: breakdown or retest failed': '市场结构确认做空：跌破或反抽支撑位失败',
+      'market structure: resistance grind broke upward, shorts may be squeezed': '市场结构：前高压力位磨盘后向上突破，可能逼空',
+      'market structure: support grind broke downward, longs may be liquidated': '市场结构：前低支撑位磨盘后向下跌破，可能爆多',
+      'MA cluster breakout up': '均线密集区向上突破',
+      'MA cluster retest held near MA20': '突破均线密集区后回踩MA20不破',
+      'MA cluster dense; wait for breakout or MA20 retest': '均线密集缠绕，等待突破或回踩MA20确认',
+      'MA cluster breakdown down': '均线密集区向下跌破',
+      'MA cluster retest rejected near MA20': '跌破均线密集区后反抽MA20失败',
+      'MA cluster dense; wait for breakdown or MA20 retest': '均线密集缠绕，等待跌破或反抽MA20确认',
+      'washout confirmed: downside wick swept support, OI dropped, close reclaimed key level': '洗盘确认：下插针扫破支撑，OI下降，收盘收回关键位',
+      'washout confirmed: upside wick swept resistance, OI dropped, close rejected key level': '洗盘确认：上插针扫过压力，OI下降，收盘跌回关键位',
+      'downside sweep reclaimed support; stop-run filter favors long': '下插针扫损后收回支撑，偏向做多',
+      'upside sweep rejected resistance; stop-run filter favors short': '上插针扫损后跌回压力，偏向做空',
+      'upper wick sweep rejected; avoid chasing long': '上插针回落，禁止追多',
+      'lower wick sweep reclaimed; avoid chasing short': '下插针收回，禁止追空',
+      'extreme volatility: skip new long entry': '极端波动，禁止新开多单',
+      'extreme volatility: skip new short entry': '极端波动，禁止新开空单',
+      '1h trigger opposes long entry': '1小时触发方向反对做多，禁止开多',
+      '1h trigger opposes short entry': '1小时触发方向反对做空，禁止开空',
+      '1d bearish bias; long position size reduced': '日线偏空，做多仓位减半',
+      '1d bullish bias; short position size reduced': '日线偏多，做空仓位减半',
+      '1d bullish bias supports long': '日线偏多，支持做多',
+      '1d bearish bias supports short': '日线偏空，支持做空',
+      '4h structure supports upside': '4小时结构支持上行',
+      '4h structure supports downside': '4小时结构支持下行',
+      '4h OI deleverage with price breakdown; avoid long entry': '4小时 OI 大幅去杠杆且价格破位，禁止做多',
+      '4h OI deleveraged but 1h BOLL/EMA held; allow small long only': '4小时 OI 大幅去杠杆但1小时中轨/EMA守住，只允许小仓多',
+      '4h OI deleveraged while long/short ratio rose; 1h support held, only tiny long allowed': '4小时 OI 大跌且多空比上升，1小时支撑守住，仅允许极小仓多',
+      '4h OI rebounds after deleverage and price breaks out; strong long restored': '4小时 OI 去杠杆后重新回升且价格突破，恢复强多',
+      '4h OI deleverage with price breakdown; short candidate improved': '4小时 OI 大幅去杠杆且价格破位，做空候选增强',
+      '4h OI deleverage breakdown with failed bounce; short candidate improved': '4小时 OI 大幅去杠杆后价格破位，且反抽压力失败，做空候选增强',
+      '4h OI deleverage breakdown; wait for resistance retest or upper-wick rejection before short': '4小时 OI 大幅去杠杆后价格破位，但不追空，等待阻力反抽或上插针失败',
+      '4h OI deleveraged but 1h support held; avoid chasing short': '4小时 OI 大幅去杠杆但1小时支撑守住，避免追空',
+      '1h breakout confirms long trigger': '1小时突破确认多头触发',
+      '1h retest confirms long trigger': '1小时回踩确认多头触发',
+      '1h fake_breakdown confirms long trigger': '1小时假跌破确认多头触发',
+      '1h breakdown confirms short trigger': '1小时跌破确认空头触发',
+      '1h retest confirms short trigger': '1小时反抽确认空头触发',
+      '1h fake_breakout confirms short trigger': '1小时假突破确认空头触发',
+      '1h BOLL/EMA pullback held with clean risk': '1小时 BOLL/EMA 回踩不破，风险干净，支持做多',
+      '1h BOLL/EMA pullback rejected with clean risk': '1小时 BOLL/EMA 反抽失败，风险干净，支持做空',
+      'high pullback with OI/funding/crowd risk; avoid long entry': '高位回踩叠加 OI/资金费率/拥挤风险，禁止开多',
+      'low pullback with OI/funding/crowd risk; avoid short entry': '低位反抽叠加 OI/资金费率/拥挤风险，禁止开空',
+      'high area without pullback confirmation; wait for 1h/4h pullback before long': '高位未完成回踩确认，等待1小时/4小时回调后再做多',
+      'low area without bounce confirmation; wait for 1h/4h retest before short': '低位未完成反抽确认，等待1小时/4小时反抽后再做空',
+      'one-way uptrend 15m BOLL/EMA9 pullback confirmed; allow tactical long': '单边上涨中15分钟BOLL中轨/EMA9回踩确认，允许战术做多',
+      'one-way downtrend 15m BOLL/EMA9 bounce rejected; allow tactical short': '单边下跌中15分钟BOLL中轨/EMA9反抽失败，允许战术做空',
+      'multi-timeframe context neutral': '多周期结构中性',
+      'manual dashboard': '手动面板',
+      'manual close': '手动平仓',
+      'stop loss': '止损',
+      'take profit': '止盈',
+      'crowded one-way exit': '单边行情散户拥挤，主动离场'
+    };
+    const riskExitReasonText = {
+      LONG_CROWD: '风险：多头拥挤平仓',
+      SHORT_CROWD: '风险：空头拥挤平仓',
+      OI_ABNORMAL: '风险：OI异常平仓',
+      FUNDING_HOT: '风险：资金费率过热平仓'
+    };
+    const mtfText = {
+      BULL: '偏多',
+      BEAR: '偏空',
+      NEUTRAL: '中性',
+      UNKNOWN: '未知',
+      BREAKOUT_UP: '向上突破',
+      BREAKDOWN_DOWN: '向下跌破',
+      BOX_UPPER_HALF: '箱体上半区',
+      BOX_LOWER_HALF: '箱体下半区',
+      WAIT: '等待',
+      BREAKOUT: '突破',
+      BREAKDOWN: '跌破',
+      RETEST: '回踩/反抽',
+      FAKE_BREAKOUT: '假突破',
+      FAKE_BREAKDOWN: '假跌破',
+      HEALTHY_PULLBACK: '健康回踩',
+      HIGH_PULLBACK: '高位回踩',
+      LOW_PULLBACK: '低位反抽',
+      NORMAL: '正常',
+      DELEVERAGE_WAIT: 'OI去杠杆等待',
+      DELEVERAGE_HOLD_LONG: 'OI去杠杆守住支撑',
+      DELEVERAGE_CROWD_HOLD_LONG: 'OI去杠杆且多头拥挤但守住支撑',
+      DELEVERAGE_BREAKDOWN: 'OI去杠杆后价格破位',
+      DELEVERAGE_CROWD_BREAKDOWN: 'OI去杠杆且多头拥挤后破位',
+      DELEVERAGE_CROWD_WAIT: 'OI去杠杆且多头拥挤等待',
+      REBUILD_BREAKOUT_LONG: 'OI回升并突破',
+      DENSE: '均线密集',
+      SPREAD: '均线发散',
+      RETEST_UP: '回踩均线不破',
+      RETEST_DOWN: '反抽均线失败',
+      LONG: '多头',
+      SHORT: '空头',
+      NONE: '无方向'
+    };
+    function tAction(value) { return actionText[value] || value || ''; }
+    function tRegime(value) { return regimeText[value] || value || ''; }
+    function tSmartMoneyPhase(value) { return smartMoneyPhaseText[value] || value || '中性'; }
+    function tTrendState(value) { return trendStateText[value] || value || '震荡'; }
+    function tRiskState(value) { return riskStateText[value] || value || '正常'; }
+    function tReason(value) {
+      if (!value) return '';
+      if (reasonText[value]) return reasonText[value];
+      const reason = String(value);
+      const maPrefixes = [
+        ['MA cluster breakout up', '均线密集区向上突破'],
+        ['MA cluster retest held near MA20', '突破均线密集区后回踩MA20不破'],
+        ['MA cluster dense; wait for breakout or MA20 retest', '均线密集缠绕，等待突破或回踩MA20确认'],
+        ['MA cluster breakdown down', '均线密集区向下跌破'],
+        ['MA cluster retest rejected near MA20', '跌破均线密集区后反抽MA20失败'],
+        ['MA cluster dense; wait for breakdown or MA20 retest', '均线密集缠绕，等待跌破或反抽MA20确认']
+      ];
+      for (const [prefix, text] of maPrefixes) {
+        if (reason.startsWith(prefix)) return reason.replace(prefix, text).replace('price=', '，密集价=');
+      }
+      if (String(value).startsWith('risk exit:')) {
+        const key = String(value).replace('risk exit:', '').trim();
+        return riskExitReasonText[key] || `风险：${key}平仓`;
+      }
+      if (String(value).startsWith('rotation exit:')) {
+        const text = String(value);
+        const symbol = (text.match(/symbol=([^\\s]+)/) || [])[1] || '';
+        const score = (text.match(/score=(\\d+)/) || [])[1] || '';
+        const display = symbol ? displaySymbol(symbol) : '更强标的';
+        return `调仓：5仓已满，换入高评分强趋势标的 ${display}${score ? `，评分=${score}` : ''}`;
+      }
+      if (String(value).startsWith('pyramid add:')) return String(value).replace('pyramid add:', '强趋势盈利回踩加仓：').replace('score=', '评分=').replace('state=', '状态=');
+      if (String(value).startsWith('auto strategy score=')) return String(value).replace('auto strategy score=', '自动策略开仓，评分=');
+      if (String(value).startsWith('MTF:')) return tMtfSummary(value);
+      return value;
+    }
+    function tMtfSummary(value) {
+      const text = String(value || '');
+      const d1 = (text.match(/1d=([^;]+)/) || [])[1] || 'UNKNOWN';
+      const h4 = (text.match(/4h=([^;]+)/) || [])[1] || 'UNKNOWN';
+      const h1 = (text.match(/1h=([^/;]+)/) || [])[1] || 'UNKNOWN';
+      const h1Dir = (text.match(/1h=[^/;]+\\/([^;]+)/) || [])[1] || 'NONE';
+      const pullback = (text.match(/pullback=([^/;]+)/) || [])[1] || 'UNKNOWN';
+      const pullbackDir = (text.match(/pullback=[^/;]+\\/([^;]+)/) || [])[1] || 'NONE';
+      const oi4h = (text.match(/oi4h=([^;]+)/) || [])[1] || 'UNKNOWN';
+      const ma4h = (text.match(/ma4h=([^@;]+)/) || [])[1] || 'UNKNOWN';
+      const ma4hPrice = (text.match(/ma4h=[^@;]+@([^;]+)/) || [])[1] || '--';
+      const ma1h = (text.match(/ma1h=([^@;]+)/) || [])[1] || 'UNKNOWN';
+      const ma1hPrice = (text.match(/ma1h=[^@;]+@([^;]+)/) || [])[1] || '--';
+      return `多周期：日线=${mtfText[d1] || d1}；4小时=${mtfText[h4] || h4}；1小时=${mtfText[h1] || h1}/${mtfText[h1Dir] || h1Dir}；回踩=${mtfText[pullback] || pullback}/${mtfText[pullbackDir] || pullbackDir}；4H OI=${mtfText[oi4h] || oi4h}；4H均线=${mtfText[ma4h] || ma4h}@${ma4hPrice}；1H均线=${mtfText[ma1h] || ma1h}@${ma1hPrice}`;
+    }
+    function escapeHtml(value) {
+      return String(value ?? '')
+        .replaceAll('&', '&amp;')
+        .replaceAll('<', '&lt;')
+        .replaceAll('>', '&gt;')
+        .replaceAll('"', '&quot;')
+        .replaceAll("'", '&#39;');
+    }
+    function wrapReason(value, limit = 50) {
+      const text = String(value || '');
+      if (text.length <= limit) return escapeHtml(text);
+      const parts = text.split(/([；;])/);
+      const lines = [];
+      let line = '';
+      for (let i = 0; i < parts.length; i += 1) {
+        const part = parts[i] || '';
+        if (!part) continue;
+        const next = line + part;
+        if (next.length > limit && line) {
+          lines.push(line);
+          line = part.replace(/^[；;]\\s*/, '');
+        } else {
+          line = next;
+        }
+      }
+      if (line) lines.push(line);
+      return lines.flatMap(item => {
+        if (item.length <= limit) return [item];
+        const chunks = [];
+        for (let i = 0; i < item.length; i += limit) chunks.push(item.slice(i, i + limit));
+        return chunks;
+      }).map(escapeHtml).join('<br>');
+    }
+    function tReasons(values) { return (values || []).map(tReason).join('；'); }
+    function apiSymbol(value) {
+      return String(value || '').trim().toUpperCase().replace('/', '').replace('-', '');
+    }
+    function displaySymbol(value) {
+      const raw = apiSymbol(value);
+      if (raw.endsWith('USDT') && raw.length > 4) return `${raw.slice(0, -4)}/USDT`;
+      return raw;
+    }
+    function symbols() { return document.getElementById('symbols').value.split(',').map(apiSymbol).filter(Boolean); }
+    async function startPaper(autoTrade) {
+      await call(() => api('/api/paper/start', { method: 'POST', body: JSON.stringify({
+        starting_balance: Number(document.getElementById('startingBalance').value),
+        symbols: symbols(),
+        interval: document.getElementById('interval').value,
+        auto_trade: autoTrade,
+        reset_account: false,
+        poll_seconds: 20
+      }) }));
+    }
+    async function stopPaper() { await call(() => api('/api/paper/stop', { method: 'POST' })); }
+    async function refreshPaper() { await call(() => api('/api/paper/refresh', { method: 'POST' })); }
+    async function resetPaper() {
+      await call(() => api('/api/paper/reset?starting_balance=' + encodeURIComponent(document.getElementById('startingBalance').value), { method: 'POST' }));
+    }
+    async function openOrder(side) {
+      await call(() => api('/api/paper/order/open', { method: 'POST', body: JSON.stringify({
+        symbol: apiSymbol(document.getElementById('orderSymbol').value),
+        side,
+        margin_usdt: Number(document.getElementById('margin').value),
+        leverage: Number(document.getElementById('leverage').value)
+      }) }));
+    }
+    async function closeOrder() {
+      await call(() => api('/api/paper/order/close', { method: 'POST', body: JSON.stringify({ symbol: apiSymbol(document.getElementById('orderSymbol').value) }) }));
+    }
+    async function call(fn) {
+      document.getElementById('error').textContent = '';
+      try { render(await fn()); } catch (err) { document.getElementById('error').textContent = err.message; }
+    }
+    async function load() {
+      try { render(await api('/api/paper/status')); } catch (err) { document.getElementById('error').textContent = err.message; }
+    }
+    function render(data) {
+      const marketAge = data.market_updated_at ? (Date.now() - new Date(data.market_updated_at).getTime()) / 1000 : Infinity;
+      const marketState = marketAge > 60 ? '行情延迟' : '行情正常';
+      document.getElementById('updated').textContent = `${data.running ? '运行中' : '已停止'} | 自动策略 ${data.auto_trade ? '开' : '关'} | ${marketState} | ${timeText(data.market_updated_at || data.updated_at)}`;
+      const metrics = [
+        ['资金', money(data.equity) + ' U'],
+        ['可用', money(data.available_balance) + ' U'],
+        ['占用保证金', money(data.used_margin) + ' U'],
+        ['已实现', money(data.realized_pnl) + ' U'],
+        ['未实现', money(data.unrealized_pnl) + ' U'],
+        ['总收益', money(data.total_pnl) + ' U / ' + pct(data.total_pnl_pct)]
+      ];
+      document.getElementById('metrics').innerHTML = metrics.map(([k,v]) => `<div class="card metric"><span>${k}</span><strong class="${k.includes('收益') || k.includes('实现') ? pnlClass(String(v).split(' ')[0]) : ''}">${v}</strong></div>`).join('');
+      document.getElementById('positions').className = 'center-table';
+      document.getElementById('positions').innerHTML = table(['币种','方向','杠杆','入场','现价','数量','保证金','浮盈亏','收益率','止损','止盈','操作'], data.positions.map(p => [
+        displaySymbol(p.symbol),
+        tAction(p.side),
+        `${p.leverage || 0}x`,
+        priceText(p.entry_price),
+        priceText(p.mark_price),
+        wholeUsdt(p.notional),
+        money(p.margin_usdt),
+        `<span class="${pnlClass(p.unrealized_pnl)}">${money(p.unrealized_pnl)}</span>`,
+        `<span class="${pnlClass(p.unrealized_pnl_pct_on_margin)}">${pct(p.unrealized_pnl_pct_on_margin)}</span>`,
+        priceText(p.stop_price),
+        priceText(p.take_profit_2),
+        `<button class="neutral" onclick="document.getElementById('orderSymbol').value='${displaySymbol(p.symbol)}'; closeOrder()">平仓</button>`
+      ]));
+      const signalRows = Object.entries(data.latest_signals || {})
+        .filter(([, s]) => {
+          const reasons = s.reasons || [];
+          return !(s.action === 'NO_TRADE' && reasons.includes('score below trading threshold'));
+        })
+        .map(([symbol, s]) => [displaySymbol(symbol), `<span class="pill">${tAction(s.action)}</span>`, tTrendState(s.trend_state || s.regime), tRiskState(s.risk_state), tSmartMoneyPhase(s.smart_money_phase), s.score, wrapReason(tReasons(s.reasons), 100), tReasons(s.vetoes)]);
+      document.getElementById('signals').className = 'signals-table';
+      document.getElementById('signals').innerHTML = table(['币种','动作','状态','风险','主力周期','分数','原因','否决'], signalRows);
+      const allFills = [...(data.fills || [])].filter(f => f.action === 'CLOSE' || f.closed_at).reverse();
+      const totalFillPages = Math.max(Math.ceil(allFills.length / fillsPageSize), 1);
+      fillsPage = Math.min(Math.max(fillsPage, 1), totalFillPages);
+      const pageFills = allFills.slice((fillsPage - 1) * fillsPageSize, fillsPage * fillsPageSize);
+      const fills = pageFills.map(f => [
+        displaySymbol(f.symbol),
+        tAction(f.side),
+        `${f.leverage || 0}x`,
+        priceText(f.entry_price || f.price),
+        priceText(f.price),
+        wholeUsdt(Number(f.price || 0) * Number(f.quantity || 0)),
+        priceText(f.stop_price),
+        priceText(f.take_profit_2),
+        `<span class="${pnlClass(f.return_pct)}">${pct(f.return_pct)}</span>`,
+        `<span class="${pnlClass(f.realized_pnl)}">${money(f.realized_pnl)}</span>`,
+        money(f.fee),
+        timeText(f.opened_at),
+        timeText(f.closed_at),
+        wrapReason(tReason(f.reason), 20)
+      ]);
+      document.getElementById('fills').className = 'center-table';
+      document.getElementById('fills').innerHTML = fillsTable(['币种','方向','杠杆','开仓均价','平仓均价','数量','止损','止盈','收益率','实现盈亏','手续费','开仓时间','平仓时间','原因'], fills);
+      renderFillsPager(totalFillPages);
+      if (data.last_error) document.getElementById('error').textContent = data.last_error;
+      updatePnlHistory(data);
+      drawPnlChart();
+    }
+    function table(headers, rows) {
+      const classes = headers.map(tableClass);
+      if (!rows.length) return `<thead><tr>${headers.map((h, i) => `<th class="${classes[i]}">${h}</th>`).join('')}</tr></thead><tbody><tr><td colspan="${headers.length}">暂无数据</td></tr></tbody>`;
+      return `<thead><tr>${headers.map((h, i) => `<th class="${classes[i]}">${h}</th>`).join('')}</tr></thead><tbody>${rows.map(row => `<tr>${row.map((v, i) => `<td class="${classes[i]}">${v}</td>`).join('')}</tr>`).join('')}</tbody>`;
+    }
+    function fillsTable(headers, rows) {
+      const classes = headers.map(tableClass);
+      const widths = headers.map(fillColumnWidth);
+      const colgroup = `<colgroup>${widths.map(width => `<col style="width:${width}">`).join('')}</colgroup>`;
+      const head = `${colgroup}<thead><tr>${headers.map((h, i) => `<th class="${classes[i]}">${h}</th>`).join('')}</tr></thead>`;
+      if (rows.length) {
+        return `${head}<tbody>${rows.map(row => `<tr>${row.map((v, i) => `<td class="${classes[i]}">${v}</td>`).join('')}</tr>`).join('')}</tbody>`;
+      }
+      return `${head}<tbody>${Array.from({ length: fillsPageSize }).map((_, idx) => `<tr class="empty-fill-row"><td colspan="${headers.length}">${idx === 0 ? '暂无数据' : '&nbsp;'}</td></tr>`).join('')}</tbody>`;
+    }
+    function fillColumnWidth(header) {
+      if (header === '币种') return '5.5%';
+      if (header === '方向') return '2.3%';
+      if (header === '杠杆') return '2.6%';
+      if (['开仓均价', '平仓均价', '数量', '止损', '止盈'].includes(header)) return '5.0%';
+      if (header === '收益率') return '4.5%';
+      if (['实现盈亏', '手续费'].includes(header)) return '4.6%';
+      if (header.includes('时间')) return '8.2%';
+      if (header === '原因') return '29.6%';
+      return '4%';
+    }
+    function tableClass(header) {
+      if (header === '原因') return 'reason-col';
+      if (header === '否决') return 'veto-col';
+      if (header.includes('时间')) return 'time-col';
+      if (['价格', '入场', '现价', '成交价', '开仓均价', '平仓均价', '数量', '保证金', '净盈亏', '浮盈亏', '收益率', '止损', '止损价', '止盈', '收益率', '实现盈亏', '手续费', '分数'].includes(header)) return 'num-col';
+      if (header === '币种') return 'symbol-col';
+      if (['方向', '动作', '状态', '风险', '操作', '杠杆'].includes(header)) return 'side-col';
+      return '';
+    }
+    function renderFillsPager(totalPages) {
+      const pager = document.getElementById('fillsPager');
+      if (!pager) return;
+      if (totalPages <= 1) {
+        pager.style.display = 'none';
+        pager.innerHTML = '';
+        return;
+      }
+      pager.style.display = 'flex';
+      const items = [];
+      const addPage = page => items.push(`<button class="${page === fillsPage ? 'active' : ''}" onclick="setFillsPage(${page})">${page}</button>`);
+      const addEllipsis = () => items.push('<span class="ellipsis">...</span>');
+      if (totalPages <= 7) {
+        for (let i = 1; i <= totalPages; i += 1) addPage(i);
+      } else {
+        addPage(1);
+        const start = Math.max(2, fillsPage - 1);
+        const end = Math.min(totalPages - 1, fillsPage + 1);
+        if (start > 2) addEllipsis();
+        for (let i = start; i <= end; i += 1) addPage(i);
+        if (end < totalPages - 1) addEllipsis();
+        addPage(totalPages);
+      }
+      pager.innerHTML = `
+        <button onclick="setFillsPage(${fillsPage - 1})" ${fillsPage <= 1 ? 'disabled' : ''}>上一页</button>
+        ${items.join('')}
+        <button onclick="setFillsPage(${fillsPage + 1})" ${fillsPage >= totalPages ? 'disabled' : ''}>下一页</button>
+      `;
+    }
+    function setFillsPage(page) {
+      fillsPage = page;
+      load();
+    }
+    function updatePnlHistory(data) {
+      const value = Number(data.total_pnl || 0);
+      const ts = data.updated_at || new Date().toISOString();
+      const last = pnlHistory[pnlHistory.length - 1];
+      if (!last || last.ts !== ts || Math.abs(last.value - value) > 0.000001) {
+        pnlHistory.push({ ts, value });
+      }
+      if (pnlHistory.length > 240) pnlHistory.shift();
+    }
+    function drawPnlChart() {
+      const canvas = document.getElementById('pnlChart');
+      if (!canvas) return;
+      const rect = canvas.getBoundingClientRect();
+      const dpr = window.devicePixelRatio || 1;
+      const width = Math.max(Math.floor(rect.width * dpr), 320);
+      const height = Math.max(Math.floor(rect.height * dpr), 180);
+      if (canvas.width !== width || canvas.height !== height) {
+        canvas.width = width;
+        canvas.height = height;
+      }
+      const ctx = canvas.getContext('2d');
+      ctx.clearRect(0, 0, width, height);
+      const pad = { left: 48 * dpr, right: 14 * dpr, top: 18 * dpr, bottom: 30 * dpr };
+      const plotW = width - pad.left - pad.right;
+      const plotH = height - pad.top - pad.bottom;
+      ctx.fillStyle = '#fbfcfe';
+      ctx.fillRect(0, 0, width, height);
+      ctx.strokeStyle = '#e5e7eb';
+      ctx.lineWidth = 1 * dpr;
+      for (let i = 0; i <= 4; i++) {
+        const y = pad.top + (plotH / 4) * i;
+        ctx.beginPath();
+        ctx.moveTo(pad.left, y);
+        ctx.lineTo(width - pad.right, y);
+        ctx.stroke();
+      }
+      const values = pnlHistory.length ? pnlHistory.map(p => p.value) : [0];
+      let min = Math.min(...values, 0);
+      let max = Math.max(...values, 0);
+      if (Math.abs(max - min) < 0.01) {
+        max += 1;
+        min -= 1;
+      }
+      const yFor = value => pad.top + (max - value) / (max - min) * plotH;
+      const xFor = index => pad.left + (pnlHistory.length <= 1 ? 0 : index / (pnlHistory.length - 1) * plotW);
+      const zeroY = yFor(0);
+      ctx.strokeStyle = '#94a3b8';
+      ctx.setLineDash([5 * dpr, 4 * dpr]);
+      ctx.beginPath();
+      ctx.moveTo(pad.left, zeroY);
+      ctx.lineTo(width - pad.right, zeroY);
+      ctx.stroke();
+      ctx.setLineDash([]);
+      if (pnlHistory.length) {
+        ctx.strokeStyle = values[values.length - 1] >= 0 ? '#059669' : '#dc2626';
+        ctx.lineWidth = 2.2 * dpr;
+        ctx.beginPath();
+        pnlHistory.forEach((point, index) => {
+          const x = xFor(index);
+          const y = yFor(point.value);
+          if (index === 0) ctx.moveTo(x, y);
+          else ctx.lineTo(x, y);
+        });
+        ctx.stroke();
+        const last = pnlHistory[pnlHistory.length - 1];
+        ctx.fillStyle = last.value >= 0 ? '#059669' : '#dc2626';
+        ctx.beginPath();
+        ctx.arc(xFor(pnlHistory.length - 1), yFor(last.value), 4 * dpr, 0, Math.PI * 2);
+        ctx.fill();
+      }
+      ctx.fillStyle = '#475569';
+      ctx.font = `${12 * dpr}px "Microsoft YaHei", Arial`;
+      ctx.textAlign = 'right';
+      ctx.textBaseline = 'middle';
+      [max, (max + min) / 2, min].forEach(value => {
+        ctx.fillText(`${value.toFixed(2)}U`, pad.left - 8 * dpr, yFor(value));
+      });
+      const latest = values[values.length - 1] || 0;
+      ctx.textAlign = 'left';
+      ctx.textBaseline = 'bottom';
+      ctx.fillStyle = latest >= 0 ? '#047857' : '#b91c1c';
+      ctx.font = `bold ${14 * dpr}px "Microsoft YaHei", Arial`;
+      ctx.fillText(`当前总收益 ${latest.toFixed(2)}U`, pad.left, height - 8 * dpr);
+    }
+    load();
+    setInterval(load, 3000);
+    window.addEventListener('resize', drawPnlChart);
+  </script>
+</body>
+</html>
+"""
 
 
 app = create_app()

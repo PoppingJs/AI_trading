@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from typing import Any
 
 import httpx
 
@@ -76,9 +78,7 @@ class BinanceFuturesMarketData:
         if end_time_ms is not None:
             params["endTime"] = end_time_ms
         async with httpx.AsyncClient(base_url=self.base_url, timeout=self.timeout) as client:
-            response = await client.get("/fapi/v1/klines", params=params)
-            response.raise_for_status()
-            rows = response.json()
+            rows = await _get_json_with_retry(client, "/fapi/v1/klines", params=params)
         return [
             Candle(
                 timestamp=_from_ms(row[0]),
@@ -93,36 +93,38 @@ class BinanceFuturesMarketData:
 
     async def open_interest_history(self, symbol: str, period: str = "15m", *, limit: int = 500) -> dict[datetime, float]:
         async with httpx.AsyncClient(base_url=self.base_url, timeout=self.timeout) as client:
-            response = await client.get(
+            rows = await _get_json_with_retry(
+                client,
                 "/futures/data/openInterestHist",
                 params={"symbol": symbol.upper(), "period": period, "limit": limit},
             )
-            response.raise_for_status()
-            rows = response.json()
         return {_from_ms(row["timestamp"]): float(row["sumOpenInterest"]) for row in rows}
 
     async def global_long_short_ratio(self, symbol: str, period: str = "15m", *, limit: int = 500) -> dict[datetime, float]:
         async with httpx.AsyncClient(base_url=self.base_url, timeout=self.timeout) as client:
-            response = await client.get(
+            rows = await _get_json_with_retry(
+                client,
                 "/futures/data/globalLongShortAccountRatio",
                 params={"symbol": symbol.upper(), "period": period, "limit": limit},
             )
-            response.raise_for_status()
-            rows = response.json()
         return {_from_ms(row["timestamp"]): float(row["longShortRatio"]) for row in rows}
 
     async def funding_rates(self, symbol: str, *, limit: int = 100) -> dict[datetime, float]:
         async with httpx.AsyncClient(base_url=self.base_url, timeout=self.timeout) as client:
-            response = await client.get("/fapi/v1/fundingRate", params={"symbol": symbol.upper(), "limit": limit})
-            response.raise_for_status()
-            rows = response.json()
+            rows = await _get_json_with_retry(client, "/fapi/v1/fundingRate", params={"symbol": symbol.upper(), "limit": limit})
         return {_from_ms(row["fundingTime"]): float(row["fundingRate"]) for row in rows}
 
     async def historical_bundle(self, symbol: str, interval: str = "15m", *, limit: int = 500) -> tuple[list[Candle], list[DerivativesSnapshot]]:
         candles = await self.klines(symbol, interval, limit=limit)
-        oi_by_time = await self.open_interest_history(symbol, interval, limit=min(limit, 500))
-        ratio_by_time = await self.global_long_short_ratio(symbol, interval, limit=min(limit, 500))
-        funding_by_time = await self.funding_rates(symbol, limit=100)
+        oi_result, ratio_result, funding_result = await asyncio.gather(
+            self.open_interest_history(symbol, interval, limit=min(limit, 500)),
+            self.global_long_short_ratio(symbol, interval, limit=min(limit, 500)),
+            self.funding_rates(symbol, limit=100),
+            return_exceptions=True,
+        )
+        oi_by_time = oi_result if isinstance(oi_result, dict) else {}
+        ratio_by_time = ratio_result if isinstance(ratio_result, dict) else {}
+        funding_by_time = funding_result if isinstance(funding_result, dict) else {}
         funding_times = sorted(funding_by_time)
 
         derivatives: list[DerivativesSnapshot] = []
@@ -140,11 +142,33 @@ class BinanceFuturesMarketData:
 
 
 async def _fetch_exchange_and_tickers(client: httpx.AsyncClient) -> tuple[dict, list[dict]]:
-    exchange_response = await client.get("/fapi/v1/exchangeInfo")
-    exchange_response.raise_for_status()
-    ticker_response = await client.get("/fapi/v1/ticker/24hr")
-    ticker_response.raise_for_status()
-    return exchange_response.json(), ticker_response.json()
+    exchange_info, tickers = await asyncio.gather(
+        _get_json_with_retry(client, "/fapi/v1/exchangeInfo"),
+        _get_json_with_retry(client, "/fapi/v1/ticker/24hr"),
+    )
+    return exchange_info, tickers
+
+
+async def _get_json_with_retry(
+    client: httpx.AsyncClient,
+    path: str,
+    *,
+    params: dict[str, object] | None = None,
+    attempts: int = 3,
+) -> Any:
+    last_exc: Exception | None = None
+    for attempt in range(attempts):
+        try:
+            response = await client.get(path, params=params)
+            response.raise_for_status()
+            return response.json()
+        except (httpx.ConnectError, httpx.ReadError, httpx.RemoteProtocolError, httpx.ReadTimeout, httpx.PoolTimeout) as exc:
+            last_exc = exc
+            if attempt == attempts - 1:
+                break
+            await asyncio.sleep(0.25 * (attempt + 1))
+    assert last_exc is not None
+    raise last_exc
 
 
 def _from_ms(value: int | str) -> datetime:

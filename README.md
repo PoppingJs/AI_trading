@@ -110,6 +110,23 @@ OpenAPI docs are available at:
 http://127.0.0.1:8000/docs
 ```
 
+The paper trading dashboard is available at:
+
+```text
+http://127.0.0.1:8000/
+```
+
+It starts with a local 1200 USDT paper account. You can:
+
+- Start live Binance public market refresh.
+- Enable strategy-driven paper auto trading.
+- Manually open long or short futures positions.
+- Close positions.
+- Watch equity, available balance, used margin, realized PnL, unrealized PnL, fees, signals, and fills.
+
+The dashboard is still paper trading only. It does not log in to Binance and
+does not submit real orders.
+
 ## Data Format
 
 CSV candle files should contain:

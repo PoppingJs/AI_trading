@@ -123,6 +123,7 @@ def build_indicators(
     volumes = [candle.volume for candle in candles]
     ema_fast_values = ema(closes, ema_fast)
     ema_slow_values = ema(closes, ema_slow)
+    ema_trend_values = ema(closes, 200)
     ma_trend_values = sma(closes, ma_trend)
     boll_mid, boll_upper, boll_lower = bollinger(closes, bollinger_window, bollinger_stddev)
     rsi_values = rsi(closes, rsi_window)
@@ -142,10 +143,12 @@ def build_indicators(
             ema_slope = (ema_slow_value - ema_slow_values[idx - 3]) / ema_slow_values[idx - 3]
 
         derivative = derivatives_by_time.get(candle.timestamp)
+        open_interest = None
         oi_change = None
         long_short_ratio = None
         funding_rate = None
         if derivative is not None:
+            open_interest = derivative.open_interest
             long_short_ratio = derivative.long_short_ratio
             funding_rate = derivative.funding_rate
             if derivative.open_interest is not None and previous_oi:
@@ -159,6 +162,7 @@ def build_indicators(
                 close=candle.close,
                 ema20=ema_fast_values[idx],
                 ema50=ema_slow_values[idx],
+                ema200=ema_trend_values[idx],
                 ma100=ma_trend_values[idx],
                 boll_mid=boll_mid[idx],
                 boll_upper=boll_upper[idx],
@@ -168,6 +172,7 @@ def build_indicators(
                 volume_sma20=volume_average,
                 volume_ratio=volume_ratio,
                 ema50_slope=ema_slope,
+                open_interest=open_interest,
                 oi_change=oi_change,
                 long_short_ratio=long_short_ratio,
                 funding_rate=funding_rate,

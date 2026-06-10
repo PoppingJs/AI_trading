@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from collections.abc import Sequence
 
 from ai_trading.config import StrategySettings
@@ -148,6 +149,91 @@ class CompositeStrategy:
                 )
         return None
 
+    def smart_money_cycle(self, candles: Sequence[Candle], indicators: Sequence[IndicatorSnapshot]) -> "SmartMoneyCycle":
+        return _detect_smart_money_cycle(candles, indicators, self.settings)
+
+    def trend_state(self, position_side: str | None, indicators: Sequence[IndicatorSnapshot]) -> str:
+        if not indicators:
+            return "CHOP"
+        current = indicators[-1]
+        regime = self._detect_regime(current)
+        if regime == MarketRegime.CHOP:
+            return "CHOP"
+        if self.strong_trend_mode(position_side or ("LONG" if regime == MarketRegime.TREND_LONG else "SHORT"), indicators):
+            return "ONE_WAY_UP" if regime == MarketRegime.TREND_LONG else "ONE_WAY_DOWN"
+        if regime == MarketRegime.TREND_LONG:
+            return "TREND_LONG"
+        if regime == MarketRegime.TREND_SHORT:
+            return "TREND_SHORT"
+        return "CHOP"
+
+    def risk_state(self, indicators: Sequence[IndicatorSnapshot]) -> str:
+        if not indicators:
+            return "NORMAL"
+        current = indicators[-1]
+        ratio_surge = _ratio_change(indicators[-4:])
+        if current.oi_change is not None and abs(current.oi_change) >= self.settings.oi_extreme_change:
+            return "OI_ABNORMAL"
+        if current.funding_rate is not None and (
+            current.funding_rate >= self.settings.funding_hot_long or current.funding_rate <= self.settings.funding_hot_short
+        ):
+            return "FUNDING_HOT"
+        if current.long_short_ratio is not None:
+            if current.long_short_ratio >= self.settings.long_short_overcrowded_long or ratio_surge >= 0.08:
+                return "LONG_CROWD"
+            if current.long_short_ratio <= self.settings.long_short_overcrowded_short or ratio_surge <= -0.08:
+                return "SHORT_CROWD"
+        return "NORMAL"
+
+    def strong_trend_mode(self, position_side: str, indicators: Sequence[IndicatorSnapshot]) -> bool:
+        if len(indicators) < 6:
+            return False
+        current = indicators[-1]
+        previous = indicators[-2]
+        if _any_none(current.ema20, current.ema50, current.atr14, current.volume_ratio):
+            return False
+        assert current.ema20 is not None
+        assert current.ema50 is not None
+        assert previous.ema20 is not None or previous.ema20 is None
+        ema_gap_expanding = previous.ema20 is not None and previous.ema50 is not None and abs(current.ema20 - current.ema50) > abs(previous.ema20 - previous.ema50)
+        oi_ok = current.oi_change is None or current.oi_change > -self.settings.oi_extreme_change
+        volume_ok = current.volume_ratio is None or current.volume_ratio >= 0.8
+        funding_ok_long = current.funding_rate is None or current.funding_rate < self.settings.funding_hot_long
+        funding_ok_short = current.funding_rate is None or current.funding_rate > self.settings.funding_hot_short
+        recent = indicators[-5:]
+        closes_above_ema20 = sum(1 for item in recent if item.ema20 is not None and item.close >= item.ema20)
+        closes_below_ema20 = sum(1 for item in recent if item.ema20 is not None and item.close <= item.ema20)
+        boll_expanding = _boll_width(current) > _boll_width(indicators[-3])
+        rsi_long_ok = current.rsi14 is None or 55 <= current.rsi14 <= 72
+        rsi_short_ok = current.rsi14 is None or 28 <= current.rsi14 <= 45
+        if position_side == "LONG":
+            checks = [
+                current.close >= current.ema20 and current.ema20 > current.ema50,
+                (current.ema50_slope or 0) > 0,
+                ema_gap_expanding,
+                closes_above_ema20 >= 4,
+                boll_expanding,
+                oi_ok,
+                volume_ok,
+                funding_ok_long,
+                rsi_long_ok,
+            ]
+            return sum(bool(item) for item in checks) >= 7
+        if position_side == "SHORT":
+            checks = [
+                current.close <= current.ema20 and current.ema20 < current.ema50,
+                (current.ema50_slope or 0) < 0,
+                ema_gap_expanding,
+                closes_below_ema20 >= 4,
+                boll_expanding,
+                oi_ok,
+                volume_ok,
+                funding_ok_short,
+                rsi_short_ok,
+            ]
+            return sum(bool(item) for item in checks) >= 7
+        return False
+
     def _detect_regime(self, current: IndicatorSnapshot) -> MarketRegime:
         if _any_none(current.ema20, current.ema50, current.boll_mid, current.boll_upper, current.boll_lower, current.rsi14):
             return MarketRegime.INSUFFICIENT_DATA
@@ -176,9 +262,15 @@ class CompositeStrategy:
     def _score_long(self, candles: Sequence[Candle], indicators: Sequence[IndicatorSnapshot]) -> tuple[int, list[str], list[str]]:
         current = indicators[-1]
         previous = indicators[-2]
+        cycle = self.smart_money_cycle(candles, indicators)
+        structure = _market_structure(candles, indicators, self.settings)
+        strict_vetoes = self._strict_long_vetoes(candles, indicators) if self.settings.strict_trend_entry else []
         score = 0
         reasons: list[str] = []
-        vetoes = self._common_long_vetoes(current)
+        vetoes = self._common_long_vetoes(current) + strict_vetoes
+        sweep_veto = _sweep_veto(candles[-1], current, side="LONG", settings=self.settings)
+        if sweep_veto:
+            vetoes.append(sweep_veto)
 
         if current.ema20 and current.ema50 and current.ma100:
             if current.close > current.ema50 and current.ema20 > current.ema50 and (current.ema50_slope or 0) > 0:
@@ -195,6 +287,22 @@ class CompositeStrategy:
             if (reclaimed_mid or near_pullback_zone) and not_extended:
                 score += 15
                 reasons.append("close confirmed near EMA20/BOLL mid without chasing upper band")
+
+        if structure.long_confirmed:
+            score += 12
+            reasons.append("market structure confirms long: breakout or retest held")
+
+        if structure.long_breakout_after_grind:
+            score += 10
+            reasons.append("market structure: resistance grind broke upward, shorts may be squeezed")
+
+        if _long_washout_confirmed(candles[-1], current, structure, self.settings):
+            score += 14
+            reasons.append("washout confirmed: downside wick swept support, OI dropped, close reclaimed key level")
+
+        if _lower_sweep_reclaimed(candles[-1], current, self.settings):
+            score += 8
+            reasons.append("downside sweep reclaimed support; stop-run filter favors long")
 
         if current.volume_ratio is not None:
             if self.settings.volume_min_ratio <= current.volume_ratio <= self.settings.volume_extreme_ratio:
@@ -224,14 +332,26 @@ class CompositeStrategy:
             score += 10
             reasons.append("funding rate is not overheated for longs")
 
+        if cycle.long_bias > 0:
+            score += cycle.long_bias
+            reasons.append(cycle.reason)
+        if cycle.long_veto:
+            vetoes.append(cycle.long_veto)
+
         return score, reasons, vetoes
 
     def _score_short(self, candles: Sequence[Candle], indicators: Sequence[IndicatorSnapshot]) -> tuple[int, list[str], list[str]]:
         current = indicators[-1]
         previous = indicators[-2]
+        cycle = self.smart_money_cycle(candles, indicators)
+        structure = _market_structure(candles, indicators, self.settings)
+        strict_vetoes = self._strict_short_vetoes(candles, indicators) if self.settings.strict_trend_entry else []
         score = 0
         reasons: list[str] = []
-        vetoes = self._common_short_vetoes(current)
+        vetoes = self._common_short_vetoes(current) + strict_vetoes
+        sweep_veto = _sweep_veto(candles[-1], current, side="SHORT", settings=self.settings)
+        if sweep_veto:
+            vetoes.append(sweep_veto)
 
         if current.ema20 and current.ema50 and current.ma100:
             if current.close < current.ema50 and current.ema20 < current.ema50 and (current.ema50_slope or 0) < 0:
@@ -248,6 +368,22 @@ class CompositeStrategy:
             if (failed_mid or near_retest_zone) and not_extended:
                 score += 15
                 reasons.append("close confirmed failed retest near EMA20/BOLL mid")
+
+        if structure.short_confirmed:
+            score += 12
+            reasons.append("market structure confirms short: breakdown or retest failed")
+
+        if structure.short_breakdown_after_grind:
+            score += 10
+            reasons.append("market structure: support grind broke downward, longs may be liquidated")
+
+        if _short_washout_confirmed(candles[-1], current, structure, self.settings):
+            score += 14
+            reasons.append("washout confirmed: upside wick swept resistance, OI dropped, close rejected key level")
+
+        if _upper_sweep_rejected(candles[-1], current, self.settings):
+            score += 8
+            reasons.append("upside sweep rejected resistance; stop-run filter favors short")
 
         if current.volume_ratio is not None:
             if self.settings.volume_min_ratio <= current.volume_ratio <= self.settings.volume_extreme_ratio:
@@ -277,10 +413,18 @@ class CompositeStrategy:
             score += 10
             reasons.append("funding rate is not overheated for shorts")
 
+        if cycle.short_bias > 0:
+            score += cycle.short_bias
+            reasons.append(cycle.reason)
+        if cycle.short_veto:
+            vetoes.append(cycle.short_veto)
+
         return score, reasons, vetoes
 
     def _common_long_vetoes(self, current: IndicatorSnapshot) -> list[str]:
         vetoes: list[str] = []
+        if _atr_pct(current) >= self.settings.extreme_atr_pct:
+            vetoes.append("extreme volatility: skip new long entry")
         if current.rsi14 is not None and current.rsi14 > 75:
             vetoes.append("RSI overheated for long entry")
         if current.long_short_ratio is not None and current.long_short_ratio >= self.settings.long_short_overcrowded_long:
@@ -289,12 +433,39 @@ class CompositeStrategy:
             vetoes.append("funding too hot for long entry")
         if current.oi_change is not None and current.oi_change >= self.settings.oi_extreme_change:
             vetoes.append("open interest spike risks liquidation sweep")
-        if current.boll_upper is not None and current.close > current.boll_upper:
-            vetoes.append("price closed above upper BOLL; no chase")
+        return vetoes
+
+    def _strict_long_vetoes(self, candles: Sequence[Candle], indicators: Sequence[IndicatorSnapshot]) -> list[str]:
+        current = indicators[-1]
+        previous = indicators[-2]
+        vetoes: list[str] = []
+        if _any_none(current.ema20, current.ema50, current.ema200) or not (current.ema20 > current.ema50 > current.ema200):
+            vetoes.append("strict long blocked: EMA20/EMA50/EMA200 not bullish")
+        if current.boll_mid is None or previous.boll_mid is None or not (current.close > current.boll_mid and previous.close > previous.boll_mid):
+            vetoes.append("strict long blocked: BOLL mid not confirmed twice")
+        if current.rsi14 is None or not (52 <= current.rsi14 <= 72):
+            vetoes.append("strict long blocked: RSI not in 52-72")
+        if current.volume_ratio is None or current.volume_ratio < self.settings.volume_min_ratio:
+            vetoes.append("strict long blocked: volume below 1.5x average")
+        oi_4h_change = _oi_change_over_window(indicators, self.settings.smart_money_window)
+        if oi_4h_change is None or oi_4h_change < self.settings.oi_4h_entry_min:
+            vetoes.append("strict long blocked: 4h OI increase below 3%")
+        if current.long_short_ratio is None or current.long_short_ratio < self.settings.top_long_short_long_min:
+            vetoes.append("strict long blocked: top long/short ratio below 1.1")
+        if current.funding_rate is None or not (self.settings.funding_long_min <= current.funding_rate <= self.settings.funding_long_max):
+            vetoes.append("strict long blocked: funding outside long range")
+        if _ema_gap_too_small(current):
+            vetoes.append("strict long blocked: EMA lines are too compressed")
+        if current.rsi14 is not None and 48 <= current.rsi14 <= 52:
+            vetoes.append("strict long blocked: RSI neutral zone")
+        if _recent_amplitude(candles[-1]) > 0.05:
+            vetoes.append("strict long blocked: 1h candle amplitude above 5%")
         return vetoes
 
     def _common_short_vetoes(self, current: IndicatorSnapshot) -> list[str]:
         vetoes: list[str] = []
+        if _atr_pct(current) >= self.settings.extreme_atr_pct:
+            vetoes.append("extreme volatility: skip new short entry")
         if current.rsi14 is not None and current.rsi14 < 25:
             vetoes.append("RSI oversold for short entry")
         if current.long_short_ratio is not None and current.long_short_ratio <= self.settings.long_short_overcrowded_short:
@@ -303,9 +474,350 @@ class CompositeStrategy:
             vetoes.append("funding too negative for short entry")
         if current.oi_change is not None and current.oi_change >= self.settings.oi_extreme_change:
             vetoes.append("open interest spike risks liquidation sweep")
-        if current.boll_lower is not None and current.close < current.boll_lower:
-            vetoes.append("price closed below lower BOLL; no chase")
         return vetoes
+
+    def _strict_short_vetoes(self, candles: Sequence[Candle], indicators: Sequence[IndicatorSnapshot]) -> list[str]:
+        current = indicators[-1]
+        previous = indicators[-2]
+        vetoes: list[str] = []
+        if _any_none(current.ema20, current.ema50, current.ema200) or not (current.ema20 < current.ema50 < current.ema200):
+            vetoes.append("strict short blocked: EMA20/EMA50/EMA200 not bearish")
+        if current.boll_mid is None or previous.boll_mid is None or not (current.close < current.boll_mid and previous.close < previous.boll_mid):
+            vetoes.append("strict short blocked: BOLL mid not confirmed twice")
+        if current.rsi14 is None or not (28 <= current.rsi14 <= 48):
+            vetoes.append("strict short blocked: RSI not in 28-48")
+        if current.volume_ratio is None or current.volume_ratio < self.settings.volume_min_ratio:
+            vetoes.append("strict short blocked: volume below 1.5x average")
+        oi_4h_change = _oi_change_over_window(indicators, self.settings.smart_money_window)
+        if oi_4h_change is None or oi_4h_change < self.settings.oi_4h_entry_min:
+            vetoes.append("strict short blocked: 4h OI increase below 3%")
+        if current.long_short_ratio is None or current.long_short_ratio > self.settings.top_long_short_short_max:
+            vetoes.append("strict short blocked: top long/short ratio above 0.9")
+        if current.funding_rate is None or not (self.settings.funding_short_min <= current.funding_rate <= self.settings.funding_short_max):
+            vetoes.append("strict short blocked: funding outside short range")
+        if _ema_gap_too_small(current):
+            vetoes.append("strict short blocked: EMA lines are too compressed")
+        if current.rsi14 is not None and 48 <= current.rsi14 <= 52:
+            vetoes.append("strict short blocked: RSI neutral zone")
+        if _recent_amplitude(candles[-1]) > 0.05:
+            vetoes.append("strict short blocked: 1h candle amplitude above 5%")
+        return vetoes
+
+
+@dataclass(frozen=True)
+class SmartMoneyCycle:
+    phase: str = "NEUTRAL"
+    reason: str = "smart money cycle neutral"
+    long_bias: int = 0
+    short_bias: int = 0
+    long_veto: str | None = None
+    short_veto: str | None = None
+
+
+@dataclass(frozen=True)
+class MarketStructure:
+    support: float | None = None
+    resistance: float | None = None
+    long_confirmed: bool = False
+    short_confirmed: bool = False
+    long_breakout_after_grind: bool = False
+    short_breakdown_after_grind: bool = False
+
+
+def _market_structure(
+    candles: Sequence[Candle],
+    indicators: Sequence[IndicatorSnapshot],
+    settings: StrategySettings,
+) -> MarketStructure:
+    lookback = min(settings.structure_lookback, len(candles) - 1, len(indicators) - 1)
+    if lookback < 6:
+        return MarketStructure()
+    current_candle = candles[-1]
+    previous_candle = candles[-2]
+    current = indicators[-1]
+    atr = current.atr14 or 0.0
+    buffer = atr * settings.structure_buffer_atr
+    prior = candles[-lookback - 1 : -1]
+    support = min(candle.low for candle in prior)
+    resistance = max(candle.high for candle in prior)
+    volume_ok = current.volume_ratio is None or current.volume_ratio >= 1.0
+    recent = candles[-min(settings.structure_grind_bars + 1, len(candles) - 1) : -1]
+    grind_tolerance = atr * settings.structure_grind_tolerance_atr
+    grinding_resistance = _grinding_near_resistance(recent, resistance, grind_tolerance)
+    grinding_support = _grinding_near_support(recent, support, grind_tolerance)
+
+    long_breakout = current_candle.close > resistance + buffer and volume_ok
+    long_retest = current_candle.low <= resistance + buffer and current_candle.close > resistance and previous_candle.close > resistance - buffer
+    short_breakdown = current_candle.close < support - buffer and volume_ok
+    short_retest = current_candle.high >= support - buffer and current_candle.close < support and previous_candle.close < support + buffer
+    return MarketStructure(
+        support=support,
+        resistance=resistance,
+        long_confirmed=long_breakout or long_retest,
+        short_confirmed=short_breakdown or short_retest,
+        long_breakout_after_grind=long_breakout and grinding_resistance,
+        short_breakdown_after_grind=short_breakdown and grinding_support,
+    )
+
+
+def _grinding_near_resistance(candles: Sequence[Candle], resistance: float, tolerance: float) -> bool:
+    if not candles or tolerance <= 0:
+        return False
+    touches = sum(1 for candle in candles if resistance - tolerance <= candle.high <= resistance + tolerance or resistance - tolerance <= candle.close <= resistance + tolerance)
+    closes_below = sum(1 for candle in candles if candle.close <= resistance + tolerance)
+    return touches >= max(2, len(candles) // 2) and closes_below >= len(candles) - 1
+
+
+def _grinding_near_support(candles: Sequence[Candle], support: float, tolerance: float) -> bool:
+    if not candles or tolerance <= 0:
+        return False
+    touches = sum(1 for candle in candles if support - tolerance <= candle.low <= support + tolerance or support - tolerance <= candle.close <= support + tolerance)
+    closes_above = sum(1 for candle in candles if candle.close >= support - tolerance)
+    return touches >= max(2, len(candles) // 2) and closes_above >= len(candles) - 1
+
+
+def _sweep_veto(candle: Candle, indicator: IndicatorSnapshot, *, side: str, settings: StrategySettings) -> str | None:
+    if indicator.atr14 is None or indicator.atr14 <= 0:
+        return None
+    upper_wick, lower_wick, close_position = _wick_profile(candle)
+    volume_ok = indicator.volume_ratio is None or indicator.volume_ratio >= 1.1
+    if side == "LONG" and upper_wick >= indicator.atr14 * settings.sweep_wick_atr and close_position <= 0.45 and volume_ok:
+        return "upper wick sweep rejected; avoid chasing long"
+    if side == "SHORT" and lower_wick >= indicator.atr14 * settings.sweep_wick_atr and close_position >= 0.55 and volume_ok:
+        return "lower wick sweep reclaimed; avoid chasing short"
+    return None
+
+
+def _long_washout_confirmed(candle: Candle, indicator: IndicatorSnapshot, structure: MarketStructure, settings: StrategySettings) -> bool:
+    if indicator.atr14 is None or indicator.atr14 <= 0 or structure.support is None:
+        return False
+    if indicator.oi_change is None or indicator.oi_change > -settings.wash_oi_drop_min:
+        return False
+    _, lower_wick, close_position = _wick_profile(candle)
+    buffer = indicator.atr14 * settings.structure_buffer_atr
+    swept_support = candle.low < structure.support - buffer
+    reclaimed_support = indicator.close > structure.support + buffer * 0.25
+    volume_ok = indicator.volume_ratio is None or indicator.volume_ratio >= 1.0
+    return (
+        swept_support
+        and reclaimed_support
+        and lower_wick >= indicator.atr14 * settings.sweep_wick_atr
+        and close_position >= 0.55
+        and volume_ok
+    )
+
+
+def _short_washout_confirmed(candle: Candle, indicator: IndicatorSnapshot, structure: MarketStructure, settings: StrategySettings) -> bool:
+    if indicator.atr14 is None or indicator.atr14 <= 0 or structure.resistance is None:
+        return False
+    if indicator.oi_change is None or indicator.oi_change > -settings.wash_oi_drop_min:
+        return False
+    upper_wick, _, close_position = _wick_profile(candle)
+    buffer = indicator.atr14 * settings.structure_buffer_atr
+    swept_resistance = candle.high > structure.resistance + buffer
+    rejected_resistance = indicator.close < structure.resistance - buffer * 0.25
+    volume_ok = indicator.volume_ratio is None or indicator.volume_ratio >= 1.0
+    return (
+        swept_resistance
+        and rejected_resistance
+        and upper_wick >= indicator.atr14 * settings.sweep_wick_atr
+        and close_position <= 0.45
+        and volume_ok
+    )
+
+
+def _lower_sweep_reclaimed(candle: Candle, indicator: IndicatorSnapshot, settings: StrategySettings) -> bool:
+    if indicator.atr14 is None or indicator.atr14 <= 0:
+        return False
+    _, lower_wick, close_position = _wick_profile(candle)
+    near_mid = indicator.boll_mid is None or indicator.close >= indicator.boll_mid
+    near_ema = indicator.ema20 is None or indicator.close >= indicator.ema20
+    return lower_wick >= indicator.atr14 * settings.sweep_wick_atr and close_position >= 0.60 and near_mid and near_ema
+
+
+def _upper_sweep_rejected(candle: Candle, indicator: IndicatorSnapshot, settings: StrategySettings) -> bool:
+    if indicator.atr14 is None or indicator.atr14 <= 0:
+        return False
+    upper_wick, _, close_position = _wick_profile(candle)
+    near_mid = indicator.boll_mid is None or indicator.close <= indicator.boll_mid
+    near_ema = indicator.ema20 is None or indicator.close <= indicator.ema20
+    return upper_wick >= indicator.atr14 * settings.sweep_wick_atr and close_position <= 0.40 and near_mid and near_ema
+
+
+def _wick_profile(candle: Candle) -> tuple[float, float, float]:
+    body_high = max(candle.open, candle.close)
+    body_low = min(candle.open, candle.close)
+    upper_wick = candle.high - body_high
+    lower_wick = body_low - candle.low
+    candle_range = candle.high - candle.low
+    close_position = (candle.close - candle.low) / candle_range if candle_range > 0 else 0.5
+    return upper_wick, lower_wick, close_position
+
+
+def _detect_smart_money_cycle(
+    candles: Sequence[Candle],
+    indicators: Sequence[IndicatorSnapshot],
+    settings: StrategySettings,
+) -> SmartMoneyCycle:
+    window = min(settings.smart_money_window, len(candles), len(indicators))
+    if window < 8:
+        return SmartMoneyCycle(reason="smart money cycle lacks enough candles")
+
+    recent_candles = candles[-window:]
+    recent_indicators = indicators[-window:]
+    oi_values = [item.open_interest for item in recent_indicators if item.open_interest is not None]
+    if len(oi_values) < max(6, window // 2):
+        return SmartMoneyCycle(reason="smart money cycle lacks OI data")
+
+    first_oi = oi_values[0]
+    last_oi = oi_values[-1]
+    min_oi = min(oi_values)
+    max_oi = max(oi_values)
+    if first_oi <= 0 or min_oi <= 0:
+        return SmartMoneyCycle(reason="smart money cycle invalid OI data")
+
+    valley_index = oi_values.index(min_oi)
+    pre_valley_high = max(oi_values[: valley_index + 1])
+    post_valley_high = max(oi_values[valley_index:])
+    oi_flush_into_valley = (pre_valley_high - min_oi) / pre_valley_high if pre_valley_high else 0.0
+    oi_rebuild_from_valley = (last_oi - min_oi) / min_oi
+    oi_post_valley_rebuild = (post_valley_high - min_oi) / min_oi
+    oi_drop_from_high = (max_oi - last_oi) / max_oi if max_oi else 0.0
+    oi_change_window = (last_oi - first_oi) / first_oi
+
+    first_close = recent_candles[0].close
+    last_close = recent_candles[-1].close
+    valley_close = recent_candles[valley_index].close
+    price_change = (last_close - first_close) / first_close if first_close else 0.0
+    price_recovery_from_valley = (last_close - valley_close) / valley_close if valley_close else 0.0
+    upper_wicks = _count_wicks(recent_candles, recent_indicators, upper=True, settings=settings)
+    lower_wicks = _count_wicks(recent_candles, recent_indicators, upper=False, settings=settings)
+    volume_confirmed = _average_volume_ratio(recent_indicators[-5:]) >= settings.smart_money_volume_ratio
+    ratio_change = _ratio_change(recent_indicators)
+
+    valley_has_room_to_rebuild = valley_index <= len(oi_values) - 3
+    flushed = oi_flush_into_valley >= settings.smart_money_oi_flush
+    rebuilt = valley_has_room_to_rebuild and (
+        oi_rebuild_from_valley >= settings.smart_money_oi_rebuild
+        or oi_post_valley_rebuild >= settings.smart_money_oi_rebuild
+    )
+    oi_rising = oi_change_window >= settings.smart_money_oi_rebuild
+    oi_falling_from_high = oi_drop_from_high >= settings.smart_money_oi_rebuild
+    price_rising = price_change >= settings.smart_money_price_move
+    price_falling = price_change <= -settings.smart_money_price_move
+    upper_sweeps = upper_wicks >= settings.smart_money_min_wicks
+    lower_sweeps = lower_wicks >= settings.smart_money_min_wicks
+    longs_getting_crowded = ratio_change >= 0.08
+    shorts_getting_crowded = ratio_change <= -0.08
+
+    if flushed and rebuilt and (price_rising or price_recovery_from_valley >= settings.smart_money_price_move or lower_sweeps) and volume_confirmed:
+        return SmartMoneyCycle(
+            phase="ACCUMULATION_REBUILD",
+            reason="smart money accumulation: OI flushed into a 4h pocket, then rebuilt while price recovered",
+            long_bias=18,
+            short_veto="smart money accumulation after OI flush; avoid chasing shorts",
+        )
+
+    if oi_rising and price_rising and shorts_getting_crowded and volume_confirmed:
+        return SmartMoneyCycle(
+            phase="SHORT_SQUEEZE_MARKUP",
+            reason="short squeeze markup: price and OI rise while long/short ratio falls, shorts are being trapped",
+            long_bias=14,
+            short_veto="short crowd is vulnerable to a squeeze",
+        )
+
+    if price_rising and upper_sweeps and oi_falling_from_high:
+        return SmartMoneyCycle(
+            phase="DISTRIBUTION_EXIT",
+            reason="smart money distribution: repeated upper wicks with OI falling after markup",
+            short_bias=10,
+            long_veto="smart money distribution after upper wick sweeps",
+        )
+
+    if price_falling and oi_change_window >= settings.smart_money_oi_trap and longs_getting_crowded:
+        return SmartMoneyCycle(
+            phase="TRAPPED_LONGS_MARKDOWN",
+            reason="trapped longs markdown: price falls while OI and long/short ratio rise",
+            short_bias=18,
+            long_veto="trapped longs are increasing while price falls",
+        )
+
+    if price_falling and lower_sweeps and oi_falling_from_high and volume_confirmed:
+        return SmartMoneyCycle(
+            phase="CAPITULATION_ABSORB",
+            reason="capitulation absorption: lower wick sweeps with OI flush and volume expansion",
+            long_bias=12,
+            short_veto="capitulation OI flush; avoid late shorts",
+        )
+
+    return SmartMoneyCycle()
+
+
+def _count_wicks(
+    candles: Sequence[Candle],
+    indicators: Sequence[IndicatorSnapshot],
+    *,
+    upper: bool,
+    settings: StrategySettings,
+) -> int:
+    count = 0
+    for candle, indicator in zip(candles, indicators, strict=True):
+        if indicator.atr14 is None or indicator.atr14 <= 0:
+            continue
+        body_high = max(candle.open, candle.close)
+        body_low = min(candle.open, candle.close)
+        wick = candle.high - body_high if upper else body_low - candle.low
+        if wick >= indicator.atr14 * settings.smart_money_wick_atr:
+            count += 1
+    return count
+
+
+def _average_volume_ratio(indicators: Sequence[IndicatorSnapshot]) -> float:
+    values = [item.volume_ratio for item in indicators if item.volume_ratio is not None]
+    if not values:
+        return 0.0
+    return sum(values) / len(values)
+
+
+def _ratio_change(indicators: Sequence[IndicatorSnapshot]) -> float:
+    values = [item.long_short_ratio for item in indicators if item.long_short_ratio is not None]
+    if len(values) < 2 or values[0] == 0:
+        return 0.0
+    return (values[-1] - values[0]) / values[0]
+
+
+def _boll_width(indicator: IndicatorSnapshot) -> float:
+    if indicator.boll_upper is None or indicator.boll_lower is None or not indicator.boll_mid:
+        return 0.0
+    return (indicator.boll_upper - indicator.boll_lower) / indicator.boll_mid
+
+
+def _atr_pct(indicator: IndicatorSnapshot) -> float:
+    if not indicator.close or not indicator.atr14:
+        return 0.0
+    return indicator.atr14 / indicator.close
+
+
+def _oi_change_over_window(indicators: Sequence[IndicatorSnapshot], window: int) -> float | None:
+    recent = indicators[-window:]
+    values = [item.open_interest for item in recent if item.open_interest is not None]
+    if len(values) < max(2, window // 2) or not values[0]:
+        return None
+    return (values[-1] - values[0]) / values[0]
+
+
+def _ema_gap_too_small(current: IndicatorSnapshot) -> bool:
+    if _any_none(current.ema20, current.ema50, current.ema200) or current.close == 0:
+        return False
+    assert current.ema20 is not None
+    assert current.ema50 is not None
+    assert current.ema200 is not None
+    min_gap = min(abs(current.ema20 - current.ema50), abs(current.ema50 - current.ema200)) / current.close
+    return min_gap < 0.003
+
+
+def _recent_amplitude(candle: Candle) -> float:
+    return (candle.high - candle.low) / candle.open if candle.open else 0.0
 
 
 def _has_required_indicator_values(current: IndicatorSnapshot) -> bool:

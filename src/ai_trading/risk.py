@@ -36,7 +36,7 @@ class RiskManager:
 
         side = PositionSide.LONG if signal.action == SignalAction.ENTRY_LONG else PositionSide.SHORT
         entry = signal.indicators.close
-        stop = self._initial_stop(side, candles, signal.indicators)
+        stop = self._initial_stop(side, candles, signal.indicators, leverage)
         stop_distance = abs(entry - stop)
         if stop_distance <= 0:
             return _blocked("invalid stop distance")
@@ -79,14 +79,23 @@ class RiskManager:
             return current_price <= position.entry_price
         return current_price >= position.entry_price
 
-    def _initial_stop(self, side: PositionSide, candles: Sequence[Candle], indicators: IndicatorSnapshot) -> float:
+    def _initial_stop(self, side: PositionSide, candles: Sequence[Candle], indicators: IndicatorSnapshot, leverage: int) -> float:
         lookback = candles[-10:]
         buffer = (indicators.atr14 or 0.0) * self.settings.atr_stop_buffer
+        fixed_distance = _stop_pct_for_leverage(leverage)
         if side == PositionSide.LONG:
             structure_low = min(candle.low for candle in lookback)
-            return structure_low - buffer
+            candidates = [indicators.close * (1 - fixed_distance), structure_low - buffer]
+            if indicators.boll_lower is not None:
+                candidates.append(indicators.boll_lower)
+            below_entry = [price for price in candidates if price < indicators.close]
+            return max(below_entry) if below_entry else indicators.close * (1 - fixed_distance)
         structure_high = max(candle.high for candle in lookback)
-        return structure_high + buffer
+        candidates = [indicators.close * (1 + fixed_distance), structure_high + buffer]
+        if indicators.boll_upper is not None:
+            candidates.append(indicators.boll_upper)
+        above_entry = [price for price in candidates if price > indicators.close]
+        return min(above_entry) if above_entry else indicators.close * (1 + fixed_distance)
 
     def _take_profit_prices(self, side: PositionSide, entry: float, stop_distance: float) -> tuple[float, float]:
         if side == PositionSide.LONG:
@@ -111,3 +120,11 @@ def _blocked(reason: str) -> RiskDecision:
         take_profit_2=0.0,
         reasons=(reason,),
     )
+
+
+def _stop_pct_for_leverage(leverage: int) -> float:
+    if leverage >= 10:
+        return 0.01
+    if leverage >= 7:
+        return 0.015
+    return 0.02
