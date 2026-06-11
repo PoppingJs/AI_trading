@@ -287,7 +287,7 @@ PAPER_DASHBOARD_HTML = """
     #positions tbody tr, #signals tbody tr, #fills tbody tr { height: 16px; }
     #signals th, #signals td { height: 22px; padding: 2px 7px; line-height: 1.2; }
     #signals tbody tr { height: 22px; }
-    #fills { width: 1380px; max-width: 100%; table-layout: fixed; }
+    #fills { width: max-content; max-width: 100%; table-layout: auto; }
     #fills th, #fills td { padding: 0 1px; overflow: hidden; text-overflow: clip; }
     #fills .time-col { font-size: 11px; }
     #fills .side-col { padding-left: 0; padding-right: 0; }
@@ -913,15 +913,14 @@ PAPER_DASHBOARD_HTML = """
       return `${head}<tbody>${Array.from({ length: fillsPageSize }).map((_, idx) => `<tr class="empty-fill-row"><td colspan="${headers.length}">${idx === 0 ? '暂无数据' : '&nbsp;'}</td></tr>`).join('')}</tbody>`;
     }
     function fillColumnWidth(header) {
-      if (header === '币种') return '5.5%';
-      if (header === '方向') return '2.3%';
-      if (header === '杠杆') return '2.6%';
-      if (['开仓均价', '平仓均价', '数量', '止损', '止盈'].includes(header)) return '5.0%';
-      if (header === '收益率') return '4.5%';
-      if (['实现盈亏', '手续费'].includes(header)) return '4.6%';
+      if (header === '币种') return '7em';
+      if (header === '方向') return '4em';
+      if (header === '杠杆') return '4em';
+      if (['开仓均价', '平仓均价', '数量', '止损', '止盈', '收益率', '实现盈亏'].includes(header)) return '6em';
+      if (header === '手续费') return '5em';
       if (header.includes('时间')) return '8.2%';
       if (header === '原因') return '30em';
-      return '4%';
+      return '6em';
     }
     function tableClass(header) {
       if (header === '原因') return 'reason-col';
