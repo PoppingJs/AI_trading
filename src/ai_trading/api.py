@@ -287,11 +287,11 @@ PAPER_DASHBOARD_HTML = """
     #positions tbody tr, #signals tbody tr, #fills tbody tr { height: 16px; }
     #signals th, #signals td { height: 22px; padding: 2px 7px; line-height: 1.2; }
     #signals tbody tr { height: 22px; }
-    #fills { width: 100%; table-layout: fixed; }
+    #fills { width: 1380px; max-width: 100%; table-layout: fixed; }
     #fills th, #fills td { padding: 0 1px; overflow: hidden; text-overflow: clip; }
     #fills .time-col { font-size: 11px; }
     #fills .side-col { padding-left: 0; padding-right: 0; }
-    #fills .reason-col { text-align: left; line-height: 1.2; overflow-wrap: anywhere; }
+    #fills .reason-col { text-align: center; line-height: 1.2; overflow-wrap: anywhere; }
     #fills .empty-fill-row td { color: #111827; }
     #fills .empty-fill-row:not(:first-child) td { color: transparent; }
     .pager { display: flex; justify-content: center; align-items: center; gap: 6px; padding-top: 6px; flex: 0 0 auto; }
@@ -423,7 +423,7 @@ PAPER_DASHBOARD_HTML = """
               <h2>总收益</h2>
               <strong id="pnlHeaderValue">0.00U</strong>
             </div>
-            <span>不含本金</span>
+            <span>每15分钟采样，不含本金</span>
           </div>
           <canvas id="pnlChart" width="680" height="420"></canvas>
         </div>
@@ -887,7 +887,7 @@ PAPER_DASHBOARD_HTML = """
         money(f.fee),
         timeText(f.opened_at),
         timeText(f.closed_at),
-        wrapReason(tReason(f.reason), 20)
+        wrapReason(tReason(f.reason), 30)
       ]);
       document.getElementById('fills').className = 'center-table';
       document.getElementById('fills').innerHTML = fillsTable(['币种','方向','杠杆','开仓均价','平仓均价','数量','止损','止盈','收益率','实现盈亏','手续费','开仓时间','平仓时间','原因'], fills);
@@ -920,7 +920,7 @@ PAPER_DASHBOARD_HTML = """
       if (header === '收益率') return '4.5%';
       if (['实现盈亏', '手续费'].includes(header)) return '4.6%';
       if (header.includes('时间')) return '8.2%';
-      if (header === '原因') return '29.6%';
+      if (header === '原因') return '30em';
       return '4%';
     }
     function tableClass(header) {
@@ -1067,7 +1067,11 @@ PAPER_DASHBOARD_HTML = """
       const chartPoints = pnlSamples
         .filter(point => point.date >= dayStart && point.date <= dayEnd)
         .sort((a, b) => a.date - b.date);
-      const values = chartPoints.length ? chartPoints.map(point => point.value) : [0];
+      let plotPoints = chartPoints;
+      if (plotPoints.length > 1 && Math.abs(plotPoints[0].value) < 0.005) {
+        plotPoints = plotPoints.slice(1);
+      }
+      const values = plotPoints.length ? plotPoints.map(point => point.value) : [0];
       let min = Math.min(...values, 0);
       let max = Math.max(...values, 0);
       if (Math.abs(max - min) < 0.01) {
@@ -1098,18 +1102,18 @@ PAPER_DASHBOARD_HTML = """
       ctx.stroke();
       ctx.setLineDash([]);
 
-      if (chartPoints.length) {
+      if (plotPoints.length) {
         ctx.strokeStyle = values[values.length - 1] >= 0 ? '#059669' : '#dc2626';
         ctx.lineWidth = 2.2 * dpr;
         ctx.beginPath();
-        chartPoints.forEach((point, index) => {
+        plotPoints.forEach((point, index) => {
           const x = xForDate(point.date);
           const y = yFor(point.value);
           if (index === 0) ctx.moveTo(x, y);
           else ctx.lineTo(x, y);
         });
         ctx.stroke();
-        const last = chartPoints[chartPoints.length - 1];
+        const last = plotPoints[plotPoints.length - 1];
         ctx.fillStyle = last.value >= 0 ? '#059669' : '#dc2626';
         ctx.beginPath();
         ctx.arc(xForDate(last.date), yFor(last.value), 4 * dpr, 0, Math.PI * 2);
