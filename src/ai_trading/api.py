@@ -1056,8 +1056,8 @@ PAPER_DASHBOARD_HTML = """
       const plotW = width - pad.left - pad.right;
       const plotH = height - pad.top - pad.bottom;
       const plotBottom = pad.top + plotH;
-      const timeTickTop = plotBottom + 4 * dpr;
-      const timeLabelY = height - 13 * dpr;
+      const timeTickTop = plotBottom + 3 * dpr;
+      const timeLabelY = plotBottom + 12 * dpr;
       ctx.fillStyle = '#fbfcfe';
       ctx.fillRect(0, 0, width, height);
 
