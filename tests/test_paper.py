@@ -3,17 +3,20 @@ from __future__ import annotations
 import asyncio
 from datetime import UTC, datetime, timedelta
 
+import pytest
 from fastapi.testclient import TestClient
 
 from ai_trading.api import create_app
 from ai_trading.config import AppSettings
 from ai_trading.models import Candle, IndicatorSnapshot, PositionSide
 from ai_trading.paper import (
+    PaperFill,
     PaperTradingEngine,
     _adaptive_exits,
     _apply_multi_timeframe_context,
     _auto_signal_allowed,
     _daily_bias_margin_factor,
+    _daily_pnl_payload,
     _leverage_for_signal,
     _margin_for_signal,
     _ma_cluster_signal_adjustment,
@@ -656,3 +659,78 @@ def test_auto_trade_does_not_rotate_for_ordinary_high_score_candidate() -> None:
 
     assert "TEST5USDT" not in engine.account.positions
     assert set(engine.account.positions) == {f"TEST{idx}USDT" for idx in range(5)}
+
+
+def test_daily_pnl_counts_open_add_and_close_fees() -> None:
+    opened_at = datetime(2026, 6, 11, 1, 0, tzinfo=UTC)
+    closed_at = datetime(2026, 6, 11, 2, 0, tzinfo=UTC)
+    fills = [
+        PaperFill(
+            timestamp=opened_at,
+            symbol="TESTUSDT",
+            action="OPEN",
+            side="LONG",
+            price=100.0,
+            entry_price=100.0,
+            quantity=1.0,
+            realized_pnl=0.0,
+            fee=0.4,
+            reason="open",
+            leverage=5,
+            margin_usdt=100.0,
+            stop_price=98.0,
+            take_profit_1=103.0,
+            take_profit_2=106.0,
+            opened_at=opened_at,
+            closed_at=None,
+            return_pct=0.0,
+        ),
+        PaperFill(
+            timestamp=opened_at + timedelta(minutes=15),
+            symbol="TESTUSDT",
+            action="ADD",
+            side="LONG",
+            price=101.0,
+            entry_price=100.5,
+            quantity=1.0,
+            realized_pnl=0.0,
+            fee=0.2,
+            reason="add",
+            leverage=5,
+            margin_usdt=50.0,
+            stop_price=99.0,
+            take_profit_1=104.0,
+            take_profit_2=107.0,
+            opened_at=opened_at,
+            closed_at=None,
+            return_pct=0.0,
+        ),
+        PaperFill(
+            timestamp=closed_at,
+            symbol="TESTUSDT",
+            action="CLOSE",
+            side="LONG",
+            price=103.0,
+            entry_price=100.5,
+            quantity=2.0,
+            realized_pnl=4.6,
+            fee=0.4,
+            reason="close",
+            leverage=5,
+            margin_usdt=150.0,
+            stop_price=99.0,
+            take_profit_1=104.0,
+            take_profit_2=107.0,
+            opened_at=opened_at,
+            closed_at=closed_at,
+            return_pct=0.0,
+        ),
+    ]
+
+    payload = _daily_pnl_payload(fills)
+
+    assert payload["days"][0]["date"] == "2026-06-11"
+    assert payload["days"][0]["fees"] == 1.0
+    assert payload["days"][0]["open_orders"] == 2
+    assert payload["days"][0]["closed_trades"] == 1
+    assert payload["days"][0]["net_pnl"] == pytest.approx(4.0)

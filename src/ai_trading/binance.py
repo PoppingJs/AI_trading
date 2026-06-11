@@ -13,6 +13,10 @@ from ai_trading.models import Candle, DerivativesSnapshot
 FAPI_BASE_URL = "https://fapi.binance.com"
 
 
+class BinanceMarketDataError(RuntimeError):
+    """Raised when Binance public market data cannot be fetched cleanly."""
+
+
 @dataclass(frozen=True)
 class FuturesSymbol:
     symbol: str
@@ -162,6 +166,14 @@ async def _get_json_with_retry(
             response = await client.get(path, params=params)
             response.raise_for_status()
             return response.json()
+        except httpx.HTTPStatusError as exc:
+            status_code = exc.response.status_code
+            if status_code == 451:
+                raise BinanceMarketDataError(
+                    "Binance 合约行情接口返回 451：当前网络或地区被 Binance 限制访问 fapi.binance.com。"
+                    "这通常发生在本地中国网络出口，建议在海外 VPS 上运行策略，或更换可访问 Binance 合约 API 的服务器网络。"
+                ) from exc
+            raise BinanceMarketDataError(f"Binance 合约行情接口返回 HTTP {status_code}：{path}") from exc
         except (httpx.ConnectError, httpx.ReadError, httpx.RemoteProtocolError, httpx.ReadTimeout, httpx.PoolTimeout) as exc:
             last_exc = exc
             if attempt == attempts - 1:

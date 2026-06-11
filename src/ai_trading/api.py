@@ -158,7 +158,7 @@ def create_app(settings_path: str | Path = "config/strategy.yaml") -> FastAPI:
         try:
             await engine.refresh_once()
         except Exception as exc:  # noqa: BLE001
-            raise HTTPException(status_code=502, detail=f"Binance market refresh failed: {exc}") from exc
+            raise HTTPException(status_code=502, detail=f"币安行情刷新失败：{exc}") from exc
         return engine.status()
 
     @app.post("/api/paper/order/open")
@@ -178,7 +178,7 @@ def create_app(settings_path: str | Path = "config/strategy.yaml") -> FastAPI:
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except Exception as exc:  # noqa: BLE001
-            raise HTTPException(status_code=502, detail=f"Binance price fetch failed: {exc}") from exc
+            raise HTTPException(status_code=502, detail=f"币安价格获取失败：{exc}") from exc
         return engine.status()
 
     @app.post("/api/paper/order/close")
@@ -189,7 +189,7 @@ def create_app(settings_path: str | Path = "config/strategy.yaml") -> FastAPI:
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except Exception as exc:  # noqa: BLE001
-            raise HTTPException(status_code=502, detail=f"Binance price fetch failed: {exc}") from exc
+            raise HTTPException(status_code=502, detail=f"币安价格获取失败：{exc}") from exc
         return engine.status()
 
     return app
@@ -249,8 +249,8 @@ PAPER_DASHBOARD_HTML = """
     main { height: calc(100vh - 60px); padding: 10px 16px; width: 100%; box-sizing: border-box; margin: 0; overflow: hidden; display: flex; flex-direction: column; gap: 10px; }
     .grid { display: grid; gap: 10px; }
     .metrics { grid-template-columns: repeat(6, minmax(130px, 1fr)); flex: 0 0 auto; }
-    .layout { grid-template-columns: 360px minmax(0, 1fr); align-items: stretch; flex: 1 1 auto; min-height: 0; margin-top: 0 !important; }
-    .layout > .card { min-height: 0; overflow: hidden; }
+    .layout { grid-template-columns: 460px minmax(0, 1fr); align-items: stretch; flex: 1 1 auto; min-height: 0; margin-top: 0 !important; }
+    .layout > .card { min-height: 0; overflow: hidden; display: flex; flex-direction: column; }
     .layout > .grid { display: grid; grid-template-rows: 230px minmax(70px, 1fr) 210px; min-height: 0; }
     .layout > .grid > .card { min-height: 0; overflow: hidden; }
     .layout > .grid > .card:nth-child(1) { display: flex; flex-direction: column; overflow: hidden; }
@@ -324,24 +324,51 @@ PAPER_DASHBOARD_HTML = """
     .center-table th.reason-col { text-align: center; }
     .status { font-size: 12px; color: #6b7280; }
     .pill { display: inline-block; padding: 3px 7px; border-radius: 999px; background: #eef2ff; color: #3730a3; font-size: 12px; }
-    .error { color: #b91c1c; font-size: 13px; min-height: 18px; }
-    .chart-wrap {
-      position: fixed;
-      left: 16px;
-      bottom: 16px;
-      width: 360px;
-      box-sizing: border-box;
-      padding: 14px 16px 16px;
-      background: white;
-      border: 1px solid #e5e7eb;
-      border-radius: 8px;
-      box-shadow: 0 8px 24px rgba(15, 23, 42, .12);
-      z-index: 20;
+    .error { color: #b91c1c; font-size: 13px; min-height: 0; margin: 2px 0 0; }
+    .left-main { flex: 0 0 auto; }
+    .left-main label { margin: 6px 0 3px; }
+    .left-main input, .left-main select { padding: 7px 10px; }
+    .left-spacer { display: none; }
+    .control-actions { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; margin-top: 8px; }
+    .control-actions button { height: 44px; padding: 0 8px; white-space: nowrap; }
+    .daily-pnl {
+      flex: 0 0 auto;
+      padding-top: 0;
+      margin-top: 15px;
+      border-top: 0;
     }
-    .chart-head { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; margin-bottom: 8px; }
+    .daily-head, .daily-summary { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
+    .daily-head h2 { font-size: 16px; margin: 0; }
+    .daily-month { display: flex; justify-content: center; align-items: center; gap: 10px; margin: 6px 0 6px; color: #374151; font-weight: 700; }
+    .month-btn { border: 0; background: transparent; color: #6b7280; padding: 2px 7px; font-size: 17px; line-height: 1; }
+    .month-btn:disabled { color: #d1d5db; cursor: not-allowed; }
+    .daily-week, .daily-calendar { display: grid; grid-template-columns: repeat(7, 1fr); gap: 5px; }
+    .daily-week span { text-align: center; color: #6b7280; font-size: 11px; }
+    .daily-day { min-height: 42px; border-radius: 7px; background: #f3f4f6; padding: 5px 4px; box-sizing: border-box; text-align: center; font-size: 12px; }
+    .daily-day.empty { background: transparent; }
+    .daily-day strong { display: block; font-size: 13px; line-height: 1.1; }
+    .daily-day span { display: block; margin-top: 5px; font-size: 11px; color: #6b7280; }
+    .daily-day.profit-day { background: #dcfce7; }
+    .daily-day.loss-day { background: #fee2e2; }
+    .daily-day.profit-day span { color: #059669; font-weight: 700; }
+    .daily-day.loss-day span { color: #dc2626; font-weight: 700; }
+    .chart-wrap {
+      flex: 1 1 auto;
+      min-height: 340px;
+      margin-top: 15px;
+      box-sizing: border-box;
+      padding: 0;
+      background: transparent;
+      border: 0;
+      border-radius: 0;
+      box-shadow: none;
+    }
+    .chart-head { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; margin: 0 0 8px; }
+    .chart-title-row { display: flex; align-items: baseline; gap: 16px; min-width: 0; }
     .chart-head h2 { font-size: 16px; margin: 0; }
+    .chart-head strong { font-size: 16px; font-weight: 800; white-space: nowrap; }
     .chart-head span { font-size: 12px; color: #6b7280; }
-    #pnlChart { width: 100%; height: 210px; display: block; background: #fbfcfe; border: 1px solid #e5e7eb; border-radius: 8px; }
+    #pnlChart { width: 100%; height: 315px; display: block; background: transparent; border: 0; border-radius: 0; }
     @media (max-width: 980px) {
       .metrics, .layout { grid-template-columns: 1fr; }
       header { display: block; }
@@ -361,39 +388,41 @@ PAPER_DASHBOARD_HTML = """
     <section class="grid metrics" id="metrics"></section>
     <section class="grid layout" style="margin-top:14px;">
       <div class="card">
+        <div class="left-main">
         <h2 style="font-size:16px;margin:0 0 10px;">控制台</h2>
         <label>模拟本金 USDT</label>
         <input id="startingBalance" type="number" value="1200" min="1" step="10" />
-        <label>币种，用逗号分隔</label>
+        <label>币种标的池</label>
         <input id="symbols" value="AUTO_TOP30" />
         <label>周期</label>
-        <select id="interval"><option>15m</option><option>1h</option><option>4h</option><option>1d</option></select>
-        <div class="row" style="margin-top:12px;">
-          <button class="primary" onclick="startPaper(false)">启动Top30行情</button>
-          <button class="primary" onclick="startPaper(true)">启动Top30策略</button>
-        </div>
-        <div class="row" style="margin-top:8px;">
-          <button class="neutral" onclick="refreshPaper()">刷新一次</button>
+        <select id="interval"><option>15m</option><option selected>1h</option><option>4h</option><option>1d</option></select>
+        <div class="control-actions">
+          <button class="primary" onclick="startPaper(true)">启动策略</button>
           <button class="neutral" onclick="stopPaper()">停止</button>
           <button class="neutral" onclick="resetPaper()">重置1200U</button>
         </div>
-        <hr style="border:0;border-top:1px solid #e5e7eb;margin:16px 0;">
-        <h2 style="font-size:16px;margin:0 0 10px;">手动开仓</h2>
-        <label>币种</label>
-        <input id="orderSymbol" value="BTC/USDT" />
-        <div class="row">
-          <div><label>保证金 USDT</label><input id="margin" type="number" value="100" min="1" step="10" /></div>
-          <div><label>杠杆</label><input id="leverage" type="number" value="5" min="1" max="10" step="1" /></div>
-        </div>
-        <div class="row">
-          <button class="long" onclick="openOrder('LONG')">做多</button>
-          <button class="short" onclick="openOrder('SHORT')">做空</button>
-        </div>
-        <button class="neutral" style="width:100%;margin-top:8px;" onclick="closeOrder()">平当前币种</button>
         <p class="error" id="error"></p>
+        </div>
+        <div class="daily-pnl" id="dailyPnl">
+          <div class="daily-head">
+            <h2>每日盈亏</h2>
+            <span class="status">08:00 - 次日08:00</span>
+          </div>
+          <div class="daily-month">
+            <button class="month-btn" id="dailyPrevMonth" onclick="shiftDailyMonth(-1)">‹</button>
+            <span id="dailyMonth">--</span>
+            <button class="month-btn" id="dailyNextMonth" onclick="shiftDailyMonth(1)">›</button>
+          </div>
+          <div class="daily-week"><span>日</span><span>一</span><span>二</span><span>三</span><span>四</span><span>五</span><span>六</span></div>
+          <div class="daily-calendar" id="dailyCalendar"></div>
+        </div>
+        <div class="left-spacer"></div>
         <div class="chart-wrap">
           <div class="chart-head">
-            <h2>实时总收益曲线</h2>
+            <div class="chart-title-row">
+              <h2>总收益</h2>
+              <strong id="pnlHeaderValue">0.00U</strong>
+            </div>
             <span>不含本金</span>
           </div>
           <canvas id="pnlChart" width="680" height="420"></canvas>
@@ -420,6 +449,8 @@ PAPER_DASHBOARD_HTML = """
     const pnlHistory = [];
     let fillsPage = 1;
     const fillsPageSize = 7;
+    let dailyMonthKey = null;
+    let latestDailyPnl = null;
     async function api(path, options = {}) {
       const response = await fetch(path, { headers: { 'Content-Type': 'application/json' }, ...options });
       if (!response.ok) {
@@ -429,6 +460,12 @@ PAPER_DASHBOARD_HTML = """
       return response.json();
     }
     function money(v) { return Number(v || 0).toFixed(2); }
+    function signedMoney(v) {
+      const n = Number(v || 0);
+      if (!Number.isFinite(n)) return '0.00';
+      if (Math.abs(n) < 0.005) return '0.00';
+      return `${n > 0 ? '+' : ''}${n.toFixed(2)}`;
+    }
     function wholeUsdt(v) {
       const n = Number(v || 0);
       if (!Number.isFinite(n)) return '0';
@@ -717,9 +754,9 @@ PAPER_DASHBOARD_HTML = """
       const d1 = (text.match(/1d=([^;]+)/) || [])[1] || 'UNKNOWN';
       const h4 = (text.match(/4h=([^;]+)/) || [])[1] || 'UNKNOWN';
       const h1 = (text.match(/1h=([^/;]+)/) || [])[1] || 'UNKNOWN';
-      const h1Dir = (text.match(/1h=[^/;]+\\/([^;]+)/) || [])[1] || 'NONE';
+      const h1Dir = (text.match(new RegExp('1h=[^/;]+/([^;]+)')) || [])[1] || 'NONE';
       const pullback = (text.match(/pullback=([^/;]+)/) || [])[1] || 'UNKNOWN';
-      const pullbackDir = (text.match(/pullback=[^/;]+\\/([^;]+)/) || [])[1] || 'NONE';
+      const pullbackDir = (text.match(new RegExp('pullback=[^/;]+/([^;]+)')) || [])[1] || 'NONE';
       const oi4h = (text.match(/oi4h=([^;]+)/) || [])[1] || 'UNKNOWN';
       const ma4h = (text.match(/ma4h=([^@;]+)/) || [])[1] || 'UNKNOWN';
       const ma4hPrice = (text.match(/ma4h=[^@;]+@([^;]+)/) || [])[1] || '--';
@@ -785,16 +822,8 @@ PAPER_DASHBOARD_HTML = """
     async function resetPaper() {
       await call(() => api('/api/paper/reset?starting_balance=' + encodeURIComponent(document.getElementById('startingBalance').value), { method: 'POST' }));
     }
-    async function openOrder(side) {
-      await call(() => api('/api/paper/order/open', { method: 'POST', body: JSON.stringify({
-        symbol: apiSymbol(document.getElementById('orderSymbol').value),
-        side,
-        margin_usdt: Number(document.getElementById('margin').value),
-        leverage: Number(document.getElementById('leverage').value)
-      }) }));
-    }
-    async function closeOrder() {
-      await call(() => api('/api/paper/order/close', { method: 'POST', body: JSON.stringify({ symbol: apiSymbol(document.getElementById('orderSymbol').value) }) }));
+    async function closePosition(symbol) {
+      await call(() => api('/api/paper/order/close', { method: 'POST', body: JSON.stringify({ symbol: apiSymbol(symbol) }) }));
     }
     async function call(fn) {
       document.getElementById('error').textContent = '';
@@ -829,7 +858,7 @@ PAPER_DASHBOARD_HTML = """
         `<span class="${pnlClass(p.unrealized_pnl_pct_on_margin)}">${pct(p.unrealized_pnl_pct_on_margin)}</span>`,
         priceText(p.stop_price),
         priceText(p.take_profit_2),
-        `<button class="neutral" onclick="document.getElementById('orderSymbol').value='${displaySymbol(p.symbol)}'; closeOrder()">平仓</button>`
+        `<button class="neutral" onclick="closePosition('${displaySymbol(p.symbol)}')">平仓</button>`
       ]));
       const signalRows = Object.entries(data.latest_signals || {})
         .filter(([, s]) => {
@@ -862,6 +891,7 @@ PAPER_DASHBOARD_HTML = """
       document.getElementById('fills').className = 'center-table';
       document.getElementById('fills').innerHTML = fillsTable(['币种','方向','杠杆','开仓均价','平仓均价','数量','止损','止盈','收益率','实现盈亏','手续费','开仓时间','平仓时间','原因'], fills);
       renderFillsPager(totalFillPages);
+      renderDailyPnl(data.daily_pnl);
       if (data.last_error) document.getElementById('error').textContent = data.last_error;
       updatePnlHistory(data);
       drawPnlChart();
@@ -934,6 +964,60 @@ PAPER_DASHBOARD_HTML = """
       fillsPage = page;
       load();
     }
+    function shiftDailyMonth(delta) {
+      if (!latestDailyPnl) return;
+      const months = dailyAvailableMonths(latestDailyPnl);
+      const index = months.indexOf(dailyMonthKey);
+      const next = months[Math.min(Math.max(index + delta, 0), months.length - 1)];
+      if (!next || next === dailyMonthKey) return;
+      dailyMonthKey = next;
+      renderDailyPnl(latestDailyPnl);
+    }
+    function dailyAvailableMonths(daily) {
+      const months = new Set((daily?.days || []).map(day => String(day.date || '').slice(0, 7)).filter(Boolean));
+      months.add(String(daily?.today || tradingDayKey(new Date())).slice(0, 7));
+      return [...months].sort();
+    }
+    function renderDailyPnl(daily) {
+      const calendar = document.getElementById('dailyCalendar');
+      const monthLabel = document.getElementById('dailyMonth');
+      const prevButton = document.getElementById('dailyPrevMonth');
+      const nextButton = document.getElementById('dailyNextMonth');
+      if (!calendar || !monthLabel) return;
+      latestDailyPnl = daily;
+      const today = daily?.today || tradingDayKey(new Date());
+      const months = dailyAvailableMonths(daily);
+      if (!dailyMonthKey || !months.includes(dailyMonthKey)) dailyMonthKey = today.slice(0, 7);
+      const [year, month] = dailyMonthKey.split('-').map(Number);
+      monthLabel.textContent = dailyMonthKey;
+      if (prevButton) prevButton.disabled = months.indexOf(dailyMonthKey) <= 0;
+      if (nextButton) nextButton.disabled = months.indexOf(dailyMonthKey) >= months.length - 1;
+      const daysByDate = new Map((daily?.days || []).map(day => [day.date, day]));
+      const first = new Date(year, month - 1, 1);
+      const daysInMonth = new Date(year, month, 0).getDate();
+      const cells = [];
+      for (let i = 0; i < first.getDay(); i += 1) {
+        cells.push('<div class="daily-day empty"></div>');
+      }
+      for (let day = 1; day <= daysInMonth; day += 1) {
+        const key = `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+        const item = daysByDate.get(key);
+        const pnl = Number(item?.net_pnl || 0);
+        const cls = pnl > 0 ? 'profit-day' : pnl < 0 ? 'loss-day' : '';
+        cells.push(`<div class="daily-day ${cls}"><strong>${day}</strong><span>${signedMoney(pnl)}</span></div>`);
+      }
+      calendar.innerHTML = cells.join('');
+    }
+    function tradingDayStart(date) {
+      const d = new Date(date);
+      const start = new Date(d.getFullYear(), d.getMonth(), d.getDate(), 8, 0, 0, 0);
+      if (d < start) start.setDate(start.getDate() - 1);
+      return start;
+    }
+    function tradingDayKey(date) {
+      const start = tradingDayStart(date);
+      return `${start.getFullYear()}-${String(start.getMonth() + 1).padStart(2, '0')}-${String(start.getDate()).padStart(2, '0')}`;
+    }
     function updatePnlHistory(data) {
       const value = Number(data.total_pnl || 0);
       const ts = data.updated_at || new Date().toISOString();
@@ -942,6 +1026,32 @@ PAPER_DASHBOARD_HTML = """
         pnlHistory.push({ ts, value });
       }
       if (pnlHistory.length > 240) pnlHistory.shift();
+    }
+    function quarterHourSeries(points, dayStart, dayEnd, now) {
+      const sorted = [...points].sort((a, b) => a.date - b.date);
+      if (!sorted.length) return [];
+      const endTime = Math.min(now.getTime(), dayEnd.getTime());
+      const step = 15 * 60 * 1000;
+      const series = [];
+      let cursor = dayStart.getTime();
+      let index = 0;
+      while (cursor <= endTime) {
+        while (index < sorted.length - 1 && sorted[index + 1].date.getTime() <= cursor) index += 1;
+        const prev = sorted[index];
+        const next = sorted[index + 1];
+        let value = prev.value;
+        if (next && next.date.getTime() > prev.date.getTime() && cursor > prev.date.getTime()) {
+          const ratio = (cursor - prev.date.getTime()) / (next.date.getTime() - prev.date.getTime());
+          value = prev.value + (next.value - prev.value) * Math.max(0, Math.min(1, ratio));
+        }
+        series.push({ date: new Date(cursor), value });
+        cursor += step;
+      }
+      const last = sorted[sorted.length - 1];
+      if (!series.length || series[series.length - 1].date.getTime() !== last.date.getTime()) {
+        series.push(last);
+      }
+      return series;
     }
     function drawPnlChart() {
       const canvas = document.getElementById('pnlChart');
@@ -956,29 +1066,44 @@ PAPER_DASHBOARD_HTML = """
       }
       const ctx = canvas.getContext('2d');
       ctx.clearRect(0, 0, width, height);
-      const pad = { left: 48 * dpr, right: 14 * dpr, top: 18 * dpr, bottom: 30 * dpr };
+      const pad = { left: 52 * dpr, right: 6 * dpr, top: 10 * dpr, bottom: 24 * dpr };
       const plotW = width - pad.left - pad.right;
       const plotH = height - pad.top - pad.bottom;
       ctx.fillStyle = '#fbfcfe';
       ctx.fillRect(0, 0, width, height);
+
+      const now = new Date();
+      const dayStart = tradingDayStart(now);
+      const dayEnd = new Date(dayStart.getTime() + 24 * 60 * 60 * 1000);
+      const dayPoints = pnlHistory
+        .map(point => ({ ...point, date: new Date(point.ts), value: Number(point.value || 0) }))
+        .filter(point => point.date >= dayStart && point.date <= dayEnd);
+      if (!dayPoints.length) {
+        dayPoints.push({ ts: now.toISOString(), date: now, value: Number(pnlHistory[pnlHistory.length - 1]?.value || 0) });
+      }
+      const chartPoints = quarterHourSeries(dayPoints, dayStart, dayEnd, now);
+      const values = chartPoints.map(point => point.value);
+      let min = Math.min(...values, 0);
+      let max = Math.max(...values, 0);
+      if (Math.abs(max - min) < 0.01) {
+        max = 1;
+        min = -1;
+      }
+      const yFor = value => pad.top + (max - value) / (max - min) * plotH;
+      const xForDate = date => {
+        const ratio = (date.getTime() - dayStart.getTime()) / (dayEnd.getTime() - dayStart.getTime());
+        return pad.left + Math.max(0, Math.min(1, ratio)) * plotW;
+      };
+
       ctx.strokeStyle = '#e5e7eb';
       ctx.lineWidth = 1 * dpr;
-      for (let i = 0; i <= 4; i++) {
+      for (let i = 0; i <= 4; i += 1) {
         const y = pad.top + (plotH / 4) * i;
         ctx.beginPath();
         ctx.moveTo(pad.left, y);
         ctx.lineTo(width - pad.right, y);
         ctx.stroke();
       }
-      const values = pnlHistory.length ? pnlHistory.map(p => p.value) : [0];
-      let min = Math.min(...values, 0);
-      let max = Math.max(...values, 0);
-      if (Math.abs(max - min) < 0.01) {
-        max += 1;
-        min -= 1;
-      }
-      const yFor = value => pad.top + (max - value) / (max - min) * plotH;
-      const xFor = index => pad.left + (pnlHistory.length <= 1 ? 0 : index / (pnlHistory.length - 1) * plotW);
       const zeroY = yFor(0);
       ctx.strokeStyle = '#94a3b8';
       ctx.setLineDash([5 * dpr, 4 * dpr]);
@@ -987,36 +1112,55 @@ PAPER_DASHBOARD_HTML = """
       ctx.lineTo(width - pad.right, zeroY);
       ctx.stroke();
       ctx.setLineDash([]);
-      if (pnlHistory.length) {
+
+      if (chartPoints.length) {
         ctx.strokeStyle = values[values.length - 1] >= 0 ? '#059669' : '#dc2626';
         ctx.lineWidth = 2.2 * dpr;
         ctx.beginPath();
-        pnlHistory.forEach((point, index) => {
-          const x = xFor(index);
+        chartPoints.forEach((point, index) => {
+          const x = xForDate(point.date);
           const y = yFor(point.value);
           if (index === 0) ctx.moveTo(x, y);
           else ctx.lineTo(x, y);
         });
         ctx.stroke();
-        const last = pnlHistory[pnlHistory.length - 1];
+        const last = chartPoints[chartPoints.length - 1];
         ctx.fillStyle = last.value >= 0 ? '#059669' : '#dc2626';
         ctx.beginPath();
-        ctx.arc(xFor(pnlHistory.length - 1), yFor(last.value), 4 * dpr, 0, Math.PI * 2);
+        ctx.arc(xForDate(last.date), yFor(last.value), 4 * dpr, 0, Math.PI * 2);
         ctx.fill();
       }
+
       ctx.fillStyle = '#475569';
-      ctx.font = `${12 * dpr}px "Microsoft YaHei", Arial`;
+      ctx.font = `${11 * dpr}px "Microsoft YaHei", Arial`;
       ctx.textAlign = 'right';
       ctx.textBaseline = 'middle';
       [max, (max + min) / 2, min].forEach(value => {
         ctx.fillText(`${value.toFixed(2)}U`, pad.left - 8 * dpr, yFor(value));
       });
+
+      ctx.fillStyle = '#64748b';
+      ctx.font = `${8.5 * dpr}px "Microsoft YaHei", Arial`;
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'top';
+      for (let i = 0; i < 24; i += 1) {
+        const tickDate = new Date(dayStart.getTime() + i * 60 * 60 * 1000);
+        const x = xForDate(tickDate);
+        const label = i === 16 ? '24' : String((8 + i) % 24);
+        ctx.beginPath();
+        ctx.moveTo(x, pad.top + plotH);
+        ctx.lineTo(x, pad.top + plotH + 3 * dpr);
+        ctx.strokeStyle = '#cbd5e1';
+        ctx.stroke();
+        ctx.fillText(label, x, pad.top + plotH + 6 * dpr);
+      }
+
       const latest = values[values.length - 1] || 0;
-      ctx.textAlign = 'left';
-      ctx.textBaseline = 'bottom';
-      ctx.fillStyle = latest >= 0 ? '#047857' : '#b91c1c';
-      ctx.font = `bold ${14 * dpr}px "Microsoft YaHei", Arial`;
-      ctx.fillText(`当前总收益 ${latest.toFixed(2)}U`, pad.left, height - 8 * dpr);
+      const headline = document.getElementById('pnlHeaderValue');
+      if (headline) {
+        headline.textContent = `${signedMoney(latest)}U`;
+        headline.className = latest >= 0 ? 'positive' : 'negative';
+      }
     }
     load();
     setInterval(load, 3000);

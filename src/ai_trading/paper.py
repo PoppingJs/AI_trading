@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import asdict, dataclass, field
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta, timezone
 from typing import Literal
 
 from ai_trading.binance import BinanceFuturesMarketData
@@ -289,6 +289,7 @@ class PaperTradingEngine:
             "latest_timeframe_contexts": self.latest_timeframe_contexts,
             "positions": positions,
             "fills": [_fill_payload(fill) for fill in self.account.fills[-100:]],
+            "daily_pnl": _daily_pnl_payload(self.account.fills),
             "last_error": self.last_error,
             "market_updated_at": self.last_market_update_at.isoformat() if self.last_market_update_at else None,
             "updated_at": datetime.now(UTC).isoformat(),
@@ -1666,3 +1667,63 @@ def _fill_payload(fill: PaperFill) -> dict[str, object]:
     payload["opened_at"] = fill.opened_at.isoformat()
     payload["closed_at"] = fill.closed_at.isoformat() if fill.closed_at else None
     return payload
+
+
+CN_TZ = timezone(timedelta(hours=8))
+
+
+def _trading_day_key(timestamp: datetime) -> str:
+    local = timestamp.astimezone(CN_TZ)
+    if local.hour < 8:
+        local -= timedelta(days=1)
+    return local.date().isoformat()
+
+
+def _daily_pnl_payload(fills: list[PaperFill]) -> dict[str, object]:
+    days: dict[str, dict[str, object]] = {}
+    for fill in fills:
+        day = _trading_day_key(fill.closed_at or fill.timestamp)
+        bucket = days.setdefault(
+            day,
+            {
+                "date": day,
+                "profit": 0.0,
+                "loss": 0.0,
+                "net_pnl": 0.0,
+                "fees": 0.0,
+                "closed_trades": 0,
+                "open_orders": 0,
+            },
+        )
+        bucket["fees"] = float(bucket["fees"]) + fill.fee
+        if fill.action in {"OPEN", "ADD"}:
+            bucket["open_orders"] = int(bucket["open_orders"]) + 1
+            bucket["net_pnl"] = float(bucket["net_pnl"]) - fill.fee
+            continue
+        if fill.action == "CLOSE":
+            pnl = fill.realized_pnl
+            if pnl >= 0:
+                bucket["profit"] = float(bucket["profit"]) + pnl
+            else:
+                bucket["loss"] = float(bucket["loss"]) + pnl
+            bucket["net_pnl"] = float(bucket["net_pnl"]) + pnl
+            bucket["closed_trades"] = int(bucket["closed_trades"]) + 1
+
+    ordered = [days[key] for key in sorted(days)]
+    total_profit = sum(float(day["profit"]) for day in ordered)
+    total_loss = sum(float(day["loss"]) for day in ordered)
+    total_fees = sum(float(day["fees"]) for day in ordered)
+    total_net = sum(float(day["net_pnl"]) for day in ordered)
+    today_key = _trading_day_key(datetime.now(UTC))
+    return {
+        "timezone": "Asia/Shanghai",
+        "day_start_hour": 8,
+        "today": today_key,
+        "days": ordered,
+        "summary": {
+            "profit": total_profit,
+            "loss": total_loss,
+            "net_pnl": total_net,
+            "fees": total_fees,
+        },
+    }
