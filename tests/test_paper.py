@@ -18,6 +18,7 @@ from ai_trading.paper import (
     _leverage_for_signal,
     _margin_for_signal,
     _ma_cluster_signal_adjustment,
+    _pnl_history_payload,
     _protect_confirmed_breakout_position,
     _refine_stop_with_ma_cluster,
     _refine_stop_with_precision,
@@ -676,3 +677,18 @@ def test_daily_pnl_uses_8am_total_pnl_snapshot_delta() -> None:
     assert round(float(next_day["days"][0]["net_pnl"]), 2) == 20.24
     assert next_day["days"][1]["date"] == "2026-06-12"
     assert next_day["days"][1]["net_pnl"] == 0.0
+
+
+def test_pnl_history_keeps_first_value_per_15_minute_bucket() -> None:
+    samples: dict[str, float] = {}
+
+    first = _pnl_history_payload(samples, -1.2, now=datetime(2026, 6, 11, 1, 2, tzinfo=UTC))
+    second = _pnl_history_payload(samples, 8.8, now=datetime(2026, 6, 11, 1, 14, tzinfo=UTC))
+    third = _pnl_history_payload(samples, 3.5, now=datetime(2026, 6, 11, 1, 15, tzinfo=UTC))
+
+    assert first == [{"timestamp": "2026-06-11T01:00:00+00:00", "total_pnl": -1.2}]
+    assert second == first
+    assert third == [
+        {"timestamp": "2026-06-11T01:00:00+00:00", "total_pnl": -1.2},
+        {"timestamp": "2026-06-11T01:15:00+00:00", "total_pnl": 3.5},
+    ]

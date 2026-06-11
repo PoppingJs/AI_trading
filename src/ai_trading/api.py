@@ -446,7 +446,7 @@ PAPER_DASHBOARD_HTML = """
     </section>
   </main>
   <script>
-    const pnlSamples = new Map();
+    let pnlSamples = [];
     let latestTotalPnl = 0;
     let fillsPage = 1;
     const fillsPageSize = 7;
@@ -1021,23 +1021,18 @@ PAPER_DASHBOARD_HTML = """
     }
     function updatePnlHistory(data) {
       const value = Number(data.total_pnl || 0);
-      const ts = data.updated_at || new Date().toISOString();
       latestTotalPnl = value;
       const headline = document.getElementById('pnlHeaderValue');
       if (headline) {
         headline.textContent = `${signedMoney(latestTotalPnl)}U`;
         headline.className = latestTotalPnl >= 0 ? 'positive' : 'negative';
       }
-      const sampleTime = quarterHourBucketStart(new Date(ts));
-      const key = sampleTime.toISOString();
-      if (!pnlSamples.has(key)) {
-        pnlSamples.set(key, { date: sampleTime, value });
-      }
-      const todayStart = tradingDayStart(new Date());
-      const oldest = todayStart.getTime() - 24 * 60 * 60 * 1000;
-      for (const [sampleKey, point] of pnlSamples.entries()) {
-        if (point.date.getTime() < oldest) pnlSamples.delete(sampleKey);
-      }
+      pnlSamples = (data.pnl_history || [])
+        .map(point => ({
+          date: new Date(point.timestamp),
+          value: Number(point.total_pnl || 0)
+        }))
+        .filter(point => !Number.isNaN(point.date.getTime()));
     }
     function quarterHourBucketStart(date) {
       const d = new Date(date);
@@ -1057,16 +1052,19 @@ PAPER_DASHBOARD_HTML = """
       }
       const ctx = canvas.getContext('2d');
       ctx.clearRect(0, 0, width, height);
-      const pad = { left: 52 * dpr, right: 6 * dpr, top: 10 * dpr, bottom: 24 * dpr };
+      const pad = { left: 52 * dpr, right: 6 * dpr, top: 10 * dpr, bottom: 34 * dpr };
       const plotW = width - pad.left - pad.right;
       const plotH = height - pad.top - pad.bottom;
+      const plotBottom = pad.top + plotH;
+      const timeTickTop = plotBottom + 4 * dpr;
+      const timeLabelY = height - 13 * dpr;
       ctx.fillStyle = '#fbfcfe';
       ctx.fillRect(0, 0, width, height);
 
       const now = new Date();
       const dayStart = tradingDayStart(now);
       const dayEnd = new Date(dayStart.getTime() + 24 * 60 * 60 * 1000);
-      const chartPoints = [...pnlSamples.values()]
+      const chartPoints = pnlSamples
         .filter(point => point.date >= dayStart && point.date <= dayEnd)
         .sort((a, b) => a.date - b.date);
       const values = chartPoints.length ? chartPoints.map(point => point.value) : [0];
@@ -1135,11 +1133,11 @@ PAPER_DASHBOARD_HTML = """
         const x = xForDate(tickDate);
         const label = i === 16 ? '24' : String((8 + i) % 24);
         ctx.beginPath();
-        ctx.moveTo(x, pad.top + plotH);
-        ctx.lineTo(x, pad.top + plotH + 3 * dpr);
+        ctx.moveTo(x, timeTickTop);
+        ctx.lineTo(x, timeTickTop + 3 * dpr);
         ctx.strokeStyle = '#cbd5e1';
         ctx.stroke();
-        ctx.fillText(label, x, pad.top + plotH + 6 * dpr);
+        ctx.fillText(label, x, timeLabelY);
       }
 
     }

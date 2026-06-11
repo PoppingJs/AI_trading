@@ -61,6 +61,7 @@ class PaperAccount:
     positions: dict[str, Position] = field(default_factory=dict)
     fills: list[PaperFill] = field(default_factory=list)
     daily_pnl_baselines: dict[str, float] = field(default_factory=dict)
+    pnl_history: dict[str, float] = field(default_factory=dict)
 
 
 class PaperTradingEngine:
@@ -271,6 +272,8 @@ class PaperTradingEngine:
             )
         equity = self.account.wallet_balance + unrealized
         total_pnl = equity - self.account.starting_balance
+        now = datetime.now(UTC)
+        pnl_history = _pnl_history_payload(self.account.pnl_history, total_pnl, now=now)
         return {
             "running": self.running,
             "auto_trade": self.auto_trade,
@@ -291,10 +294,11 @@ class PaperTradingEngine:
             "latest_timeframe_contexts": self.latest_timeframe_contexts,
             "positions": positions,
             "fills": [_fill_payload(fill) for fill in self.account.fills[-100:]],
-            "daily_pnl": _daily_pnl_payload(self.account.daily_pnl_baselines, total_pnl),
+            "daily_pnl": _daily_pnl_payload(self.account.daily_pnl_baselines, total_pnl, now=now),
+            "pnl_history": pnl_history,
             "last_error": self.last_error,
             "market_updated_at": self.last_market_update_at.isoformat() if self.last_market_update_at else None,
-            "updated_at": datetime.now(UTC).isoformat(),
+            "updated_at": now.isoformat(),
         }
 
     async def _run_loop(self, *, poll_seconds: int) -> None:
@@ -1723,3 +1727,29 @@ def _daily_pnl_payload(baselines: dict[str, float], total_pnl: float, now: datet
             "fees": 0.0,
         },
     }
+
+
+def _quarter_hour_start(timestamp: datetime) -> datetime:
+    ts = timestamp.astimezone(UTC)
+    minute = (ts.minute // 15) * 15
+    return ts.replace(minute=minute, second=0, microsecond=0)
+
+
+def _pnl_history_payload(
+    samples: dict[str, float],
+    total_pnl: float,
+    now: datetime | None = None,
+) -> list[dict[str, object]]:
+    current_time = now or datetime.now(UTC)
+    sample_time = _quarter_hour_start(current_time)
+    key = sample_time.isoformat()
+    if key not in samples:
+        samples[key] = total_pnl
+
+    return [
+        {
+            "timestamp": timestamp,
+            "total_pnl": samples[timestamp],
+        }
+        for timestamp in sorted(samples)
+    ]
