@@ -446,7 +446,8 @@ PAPER_DASHBOARD_HTML = """
     </section>
   </main>
   <script>
-    const pnlHistory = [];
+    const pnlSamples = new Map();
+    let latestTotalPnl = 0;
     let fillsPage = 1;
     const fillsPageSize = 7;
     let dailyMonthKey = null;
@@ -1021,37 +1022,27 @@ PAPER_DASHBOARD_HTML = """
     function updatePnlHistory(data) {
       const value = Number(data.total_pnl || 0);
       const ts = data.updated_at || new Date().toISOString();
-      const last = pnlHistory[pnlHistory.length - 1];
-      if (!last || last.ts !== ts || Math.abs(last.value - value) > 0.000001) {
-        pnlHistory.push({ ts, value });
+      latestTotalPnl = value;
+      const headline = document.getElementById('pnlHeaderValue');
+      if (headline) {
+        headline.textContent = `${signedMoney(latestTotalPnl)}U`;
+        headline.className = latestTotalPnl >= 0 ? 'positive' : 'negative';
       }
-      if (pnlHistory.length > 240) pnlHistory.shift();
+      const sampleTime = quarterHourBucketStart(new Date(ts));
+      const key = sampleTime.toISOString();
+      if (!pnlSamples.has(key)) {
+        pnlSamples.set(key, { date: sampleTime, value });
+      }
+      const todayStart = tradingDayStart(new Date());
+      const oldest = todayStart.getTime() - 24 * 60 * 60 * 1000;
+      for (const [sampleKey, point] of pnlSamples.entries()) {
+        if (point.date.getTime() < oldest) pnlSamples.delete(sampleKey);
+      }
     }
-    function quarterHourSeries(points, dayStart, dayEnd, now) {
-      const sorted = [...points].sort((a, b) => a.date - b.date);
-      if (!sorted.length) return [];
-      const endTime = Math.min(now.getTime(), dayEnd.getTime());
-      const step = 15 * 60 * 1000;
-      const series = [];
-      let cursor = dayStart.getTime();
-      let index = 0;
-      while (cursor <= endTime) {
-        while (index < sorted.length - 1 && sorted[index + 1].date.getTime() <= cursor) index += 1;
-        const prev = sorted[index];
-        const next = sorted[index + 1];
-        let value = prev.value;
-        if (next && next.date.getTime() > prev.date.getTime() && cursor > prev.date.getTime()) {
-          const ratio = (cursor - prev.date.getTime()) / (next.date.getTime() - prev.date.getTime());
-          value = prev.value + (next.value - prev.value) * Math.max(0, Math.min(1, ratio));
-        }
-        series.push({ date: new Date(cursor), value });
-        cursor += step;
-      }
-      const last = sorted[sorted.length - 1];
-      if (!series.length || series[series.length - 1].date.getTime() !== last.date.getTime()) {
-        series.push(last);
-      }
-      return series;
+    function quarterHourBucketStart(date) {
+      const d = new Date(date);
+      d.setMinutes(Math.floor(d.getMinutes() / 15) * 15, 0, 0);
+      return d;
     }
     function drawPnlChart() {
       const canvas = document.getElementById('pnlChart');
@@ -1075,14 +1066,10 @@ PAPER_DASHBOARD_HTML = """
       const now = new Date();
       const dayStart = tradingDayStart(now);
       const dayEnd = new Date(dayStart.getTime() + 24 * 60 * 60 * 1000);
-      const dayPoints = pnlHistory
-        .map(point => ({ ...point, date: new Date(point.ts), value: Number(point.value || 0) }))
-        .filter(point => point.date >= dayStart && point.date <= dayEnd);
-      if (!dayPoints.length) {
-        dayPoints.push({ ts: now.toISOString(), date: now, value: Number(pnlHistory[pnlHistory.length - 1]?.value || 0) });
-      }
-      const chartPoints = quarterHourSeries(dayPoints, dayStart, dayEnd, now);
-      const values = chartPoints.map(point => point.value);
+      const chartPoints = [...pnlSamples.values()]
+        .filter(point => point.date >= dayStart && point.date <= dayEnd)
+        .sort((a, b) => a.date - b.date);
+      const values = chartPoints.length ? chartPoints.map(point => point.value) : [0];
       let min = Math.min(...values, 0);
       let max = Math.max(...values, 0);
       if (Math.abs(max - min) < 0.01) {
@@ -1155,12 +1142,6 @@ PAPER_DASHBOARD_HTML = """
         ctx.fillText(label, x, pad.top + plotH + 6 * dpr);
       }
 
-      const latest = values[values.length - 1] || 0;
-      const headline = document.getElementById('pnlHeaderValue');
-      if (headline) {
-        headline.textContent = `${signedMoney(latest)}U`;
-        headline.className = latest >= 0 ? 'positive' : 'negative';
-      }
     }
     load();
     setInterval(load, 3000);

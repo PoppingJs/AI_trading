@@ -60,6 +60,7 @@ class PaperAccount:
     fees_paid: float = 0.0
     positions: dict[str, Position] = field(default_factory=dict)
     fills: list[PaperFill] = field(default_factory=list)
+    daily_pnl_baselines: dict[str, float] = field(default_factory=dict)
 
 
 class PaperTradingEngine:
@@ -269,6 +270,7 @@ class PaperTradingEngine:
                 }
             )
         equity = self.account.wallet_balance + unrealized
+        total_pnl = equity - self.account.starting_balance
         return {
             "running": self.running,
             "auto_trade": self.auto_trade,
@@ -281,15 +283,15 @@ class PaperTradingEngine:
             "used_margin": used_margin,
             "realized_pnl": self.account.realized_pnl,
             "unrealized_pnl": unrealized,
-            "total_pnl": equity - self.account.starting_balance,
-            "total_pnl_pct": (equity - self.account.starting_balance) / self.account.starting_balance,
+            "total_pnl": total_pnl,
+            "total_pnl_pct": total_pnl / self.account.starting_balance,
             "fees_paid": self.account.fees_paid,
             "latest_prices": self.latest_prices,
             "latest_signals": self.latest_signals,
             "latest_timeframe_contexts": self.latest_timeframe_contexts,
             "positions": positions,
             "fills": [_fill_payload(fill) for fill in self.account.fills[-100:]],
-            "daily_pnl": _daily_pnl_payload(self.account.fills),
+            "daily_pnl": _daily_pnl_payload(self.account.daily_pnl_baselines, total_pnl),
             "last_error": self.last_error,
             "market_updated_at": self.last_market_update_at.isoformat() if self.last_market_update_at else None,
             "updated_at": datetime.now(UTC).isoformat(),
@@ -1679,51 +1681,45 @@ def _trading_day_key(timestamp: datetime) -> str:
     return local.date().isoformat()
 
 
-def _daily_pnl_payload(fills: list[PaperFill]) -> dict[str, object]:
-    days: dict[str, dict[str, object]] = {}
-    for fill in fills:
-        day = _trading_day_key(fill.closed_at or fill.timestamp)
-        bucket = days.setdefault(
-            day,
+def _next_trading_day_key(day: str) -> str:
+    return (datetime.fromisoformat(day).date() + timedelta(days=1)).isoformat()
+
+
+def _daily_pnl_payload(baselines: dict[str, float], total_pnl: float, now: datetime | None = None) -> dict[str, object]:
+    current_time = now or datetime.now(UTC)
+    today_key = _trading_day_key(current_time)
+    if today_key not in baselines:
+        baselines[today_key] = total_pnl
+
+    days: list[dict[str, object]] = []
+    for day in sorted(baselines):
+        next_day = _next_trading_day_key(day)
+        end_pnl = baselines.get(next_day, baselines[day])
+        net_pnl = end_pnl - baselines[day]
+        days.append(
             {
                 "date": day,
-                "profit": 0.0,
-                "loss": 0.0,
-                "net_pnl": 0.0,
+                "profit": max(net_pnl, 0.0),
+                "loss": min(net_pnl, 0.0),
+                "net_pnl": net_pnl,
                 "fees": 0.0,
                 "closed_trades": 0,
                 "open_orders": 0,
-            },
+            }
         )
-        bucket["fees"] = float(bucket["fees"]) + fill.fee
-        if fill.action in {"OPEN", "ADD"}:
-            bucket["open_orders"] = int(bucket["open_orders"]) + 1
-            bucket["net_pnl"] = float(bucket["net_pnl"]) - fill.fee
-            continue
-        if fill.action == "CLOSE":
-            pnl = fill.realized_pnl
-            if pnl >= 0:
-                bucket["profit"] = float(bucket["profit"]) + pnl
-            else:
-                bucket["loss"] = float(bucket["loss"]) + pnl
-            bucket["net_pnl"] = float(bucket["net_pnl"]) + pnl
-            bucket["closed_trades"] = int(bucket["closed_trades"]) + 1
 
-    ordered = [days[key] for key in sorted(days)]
-    total_profit = sum(float(day["profit"]) for day in ordered)
-    total_loss = sum(float(day["loss"]) for day in ordered)
-    total_fees = sum(float(day["fees"]) for day in ordered)
-    total_net = sum(float(day["net_pnl"]) for day in ordered)
-    today_key = _trading_day_key(datetime.now(UTC))
+    total_profit = sum(float(day["profit"]) for day in days)
+    total_loss = sum(float(day["loss"]) for day in days)
+    total_net = sum(float(day["net_pnl"]) for day in days)
     return {
         "timezone": "Asia/Shanghai",
         "day_start_hour": 8,
         "today": today_key,
-        "days": ordered,
+        "days": days,
         "summary": {
             "profit": total_profit,
             "loss": total_loss,
             "net_pnl": total_net,
-            "fees": total_fees,
+            "fees": 0.0,
         },
     }
