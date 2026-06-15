@@ -672,6 +672,11 @@ PAPER_DASHBOARD_HTML = """
       'manual close': '手动平仓',
       'stop loss': '止损',
       'take profit': '止盈',
+      'take profit 2': '止盈2',
+      'trend invalidation exit': '趋势失效平仓',
+      'floating profit trailing stop': '浮盈回撤止盈',
+      'structure break stop': '结构破位止损',
+      'ATR volatility stop': 'ATR波动止损',
       'crowded one-way exit': '单边行情散户拥挤，主动离场'
     };
     const riskExitReasonText = {

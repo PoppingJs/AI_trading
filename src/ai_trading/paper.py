@@ -16,12 +16,9 @@ from ai_trading.strategy import CompositeStrategy
 PaperSide = Literal["LONG", "SHORT"]
 AUTO_UNIVERSE_EXCLUDED_SYMBOLS = {"BTCUSDT", "BTCUSDC", "ETHUSDT", "SOLUSDT", "XAUUSDT"}
 BTC_EXTREME_4H_AMPLITUDE = 0.08
-ROTATION_MIN_SCORE = 90
-ROTATION_MIN_SCORE_GAP = 18
+ROTATION_MIN_SCORE_GAP = 20
 ROTATION_MIN_ATR_PCT = 0.008
 ROTATION_MIN_VOLUME_RATIO = 1.2
-ROTATION_MAX_PROFIT_TO_REPLACE = 0.01
-ROTATION_MIN_HOLD_SECONDS = 30 * 60
 PYRAMID_MIN_SCORE = 85
 PYRAMID_MARGIN_FRACTION = 0.35
 PYRAMID_MAX_ADDS = 1
@@ -310,7 +307,23 @@ class PaperTradingEngine:
                     await self._auto_trade_once()
             except Exception as exc:  # noqa: BLE001 - user-facing paper loop should keep running
                 self.last_error = str(exc)
+            self._record_account_snapshots()
             await asyncio.sleep(max(poll_seconds, 5))
+
+    def _record_account_snapshots(self, now: datetime | None = None) -> None:
+        total_pnl = self._current_total_pnl()
+        _pnl_history_payload(self.account.pnl_history, total_pnl, now=now)
+        _daily_pnl_payload(self.account.daily_pnl_baselines, total_pnl, now=now)
+
+    def _record_pnl_history_sample(self, now: datetime | None = None) -> None:
+        _pnl_history_payload(self.account.pnl_history, self._current_total_pnl(), now=now)
+
+    def _current_total_pnl(self) -> float:
+        unrealized = 0.0
+        for position in self.account.positions.values():
+            price = self.latest_prices.get(position.symbol, position.entry_price)
+            unrealized += _pnl(position.side, position.entry_price, price, position.quantity)
+        return self.account.wallet_balance + unrealized - self.account.starting_balance
 
     async def _refresh_symbol(self, symbol: str) -> bool:
         history_limit = max(240, self.settings.strategy.ma_trend + 40)
@@ -447,11 +460,19 @@ class PaperTradingEngine:
             margin *= _daily_bias_margin_factor(side, signal)
             margin = min(margin, available, remaining_total_margin)
             if margin >= 20:
-                leverage = min(_leverage_for_signal(score, self.settings.risk.leverage_max), int(signal.get("leverage_cap") or self.settings.risk.leverage_max))
                 indicators = self.latest_indicators.get(symbol, [])
                 precision = self.latest_timeframe_contexts.get(symbol, {}).get("m15_precision", {})
                 mtf_context = self.latest_timeframe_contexts.get(symbol, {})
                 trend_state = str(signal.get("trend_state") or "CHOP")
+                leverage = min(
+                    _leverage_for_signal(
+                        score,
+                        self.settings.risk.leverage_max,
+                        trend_state,
+                        _preferred_exit_indicator(self.latest_timeframe_indicators.get(symbol, {}), indicators),
+                    ),
+                    int(signal.get("leverage_cap") or self.settings.risk.leverage_max),
+                )
                 stop_loss, take_profit_1, take_profit_2 = _adaptive_exits(
                     PositionSide(side),
                     self.latest_prices.get(symbol) or await self._price(symbol),
@@ -486,39 +507,41 @@ class PaperTradingEngine:
             return
         best_symbol, best_signal = candidates[0]
         best_indicators = self.latest_indicators.get(best_symbol, [])
-        if not _rotation_candidate_allowed(best_signal, best_indicators[-1] if best_indicators else None):
+        best_indicator = best_indicators[-1] if best_indicators else None
+        if not _rotation_candidate_allowed(best_signal, best_indicator):
             return
-        weakest = self._weakest_position()
-        if weakest is None:
+        replace_target = self._rotation_replace_target(best_signal, best_indicator)
+        if replace_target is None:
             return
         best_score = int(best_signal.get("score") or 0)
-        weakest_symbol, weakest_score, weakest_pnl_pct, weakest_trend = weakest
-        score_gap = best_score - weakest_score
-        if score_gap < ROTATION_MIN_SCORE_GAP:
-            return
-        if weakest_pnl_pct > ROTATION_MAX_PROFIT_TO_REPLACE:
-            return
-        if weakest_trend in {"ONE_WAY_UP", "ONE_WAY_DOWN"} and weakest_score >= 78:
-            return
-        await self.close_position(weakest_symbol, reason=f"rotation exit: symbol={best_symbol} score={best_score}")
+        position, current_score = replace_target
+        await self.close_position(
+            position.symbol,
+            reason=f"rotation exit: symbol={best_symbol} score={best_score} current_score={current_score}",
+        )
 
-    def _weakest_position(self) -> tuple[str, int, float, str] | None:
-        weakest: tuple[str, int, float, str] | None = None
-        now = datetime.now(UTC)
+    def _rotation_replace_target(
+        self,
+        candidate_signal: dict[str, object],
+        candidate_indicator: IndicatorSnapshot | None,
+    ) -> tuple[Position, int] | None:
+        best_target: tuple[Position, int] | None = None
+        candidate_score = int(candidate_signal.get("score") or 0)
         for symbol, position in self.account.positions.items():
-            if (now - position.opened_at).total_seconds() < ROTATION_MIN_HOLD_SECONDS:
-                continue
             signal = self.latest_signals.get(symbol, {})
-            score = int(signal.get("score") or 0)
-            trend = str(signal.get("trend_state") or signal.get("regime") or "CHOP")
-            price = self.latest_prices.get(symbol, position.entry_price)
-            pnl = _pnl(position.side, position.entry_price, price, position.quantity)
-            margin = float(position.metadata.get("margin_usdt", 0.0))
-            pnl_pct = pnl / margin if margin else 0.0
-            candidate = (symbol, score, pnl_pct, trend)
-            if weakest is None or (score, pnl_pct) < (weakest[1], weakest[2]):
-                weakest = candidate
-        return weakest
+            current_score = int(signal.get("score") or 0)
+            current_indicators = self.latest_indicators.get(symbol, [])
+            current_indicator = current_indicators[-1] if current_indicators else None
+            if candidate_score - current_score < ROTATION_MIN_SCORE_GAP:
+                continue
+            if not _position_structure_failed(position, signal):
+                continue
+            if not _rotation_efficiency_better(candidate_indicator, current_indicator):
+                continue
+            target = (position, current_score)
+            if best_target is None or current_score < best_target[1]:
+                best_target = target
+        return best_target
 
     async def _btc_4h_extreme_volatility(self) -> bool:
         try:
@@ -546,19 +569,20 @@ class PaperTradingEngine:
             signal = self.latest_signals.get(position.symbol, {})
             if strong_trend:
                 _protect_confirmed_breakout_position(position, signal, _preferred_exit_indicator(tf_indicators, indicators))
+            _apply_profit_protection(position, price, signal, _preferred_exit_indicator(tf_indicators, indicators))
             self._update_trailing_stop(position, price, strong_trend, _preferred_exit_indicator(tf_indicators, indicators))
             if _stop_hit(position, price):
-                self._close_position_unlocked(position, price, "stop loss")
+                self._close_position_unlocked(position, price, _stop_exit_reason(position, signal))
                 continue
             if strong_trend and _strong_trend_invalidated(position, latest_indicator):
-                self._close_position_unlocked(position, price, "strong trend invalidated")
+                self._close_position_unlocked(position, price, "trend invalidation exit")
                 continue
             risk_exit_reason = _risk_exit_reason(position.side, trend_state, risk_state)
             if risk_exit_reason:
                 self._close_position_unlocked(position, price, risk_exit_reason)
                 continue
             if _take_profit_hit(position, price) and not strong_trend:
-                self._close_position_unlocked(position, price, "take profit")
+                self._close_position_unlocked(position, price, "take profit 2")
 
     def _update_trailing_stop(self, position: Position, price: float, strong_trend: bool, indicator: IndicatorSnapshot | None) -> None:
         stop_distance = float(position.metadata.get("initial_stop_distance") or abs(position.entry_price - position.stop_price))
@@ -732,6 +756,60 @@ def _strong_trend_invalidated(position: Position, indicator: IndicatorSnapshot |
     return indicator.close > indicator.ema50
 
 
+def _apply_profit_protection(
+    position: Position,
+    price: float,
+    signal: dict[str, object],
+    indicator: IndicatorSnapshot | None,
+) -> None:
+    stop_distance = float(position.metadata.get("initial_stop_distance") or abs(position.entry_price - position.stop_price))
+    if stop_distance <= 0:
+        return
+    profit_distance = price - position.entry_price if position.side == PositionSide.LONG else position.entry_price - price
+    if profit_distance <= 0:
+        return
+    risk_signal = _profit_risk_signal(signal, indicator)
+    if profit_distance >= stop_distance * 1.5:
+        lock_distance = stop_distance * (0.5 if risk_signal else 0.35)
+    elif profit_distance >= stop_distance:
+        lock_distance = stop_distance * (0.15 if risk_signal else 0.0)
+    elif profit_distance >= stop_distance * 0.6:
+        lock_distance = -stop_distance * (0.15 if risk_signal else 0.4)
+    else:
+        return
+    if position.side == PositionSide.LONG:
+        position.stop_price = max(position.stop_price, position.entry_price + lock_distance)
+    else:
+        position.stop_price = min(position.stop_price, position.entry_price - lock_distance)
+
+
+def _profit_risk_signal(signal: dict[str, object], indicator: IndicatorSnapshot | None) -> bool:
+    risk_state = str(signal.get("risk_state") or "NORMAL")
+    if risk_state in {"LONG_CROWD", "SHORT_CROWD", "OI_ABNORMAL", "FUNDING_HOT"}:
+        return True
+    if indicator is None:
+        return False
+    if indicator.rsi14 is not None and (indicator.rsi14 >= 75 or indicator.rsi14 <= 25):
+        return True
+    if indicator.oi_change is not None and indicator.oi_change <= -0.03:
+        return True
+    if indicator.volume_ratio is not None and indicator.volume_ratio >= 2.8:
+        return True
+    return False
+
+
+def _stop_exit_reason(position: Position, signal: dict[str, object]) -> str:
+    stop_distance = float(position.metadata.get("initial_stop_distance") or abs(position.entry_price - position.stop_price))
+    if stop_distance > 0:
+        if position.side == PositionSide.LONG and position.stop_price >= position.entry_price:
+            return "floating profit trailing stop"
+        if position.side == PositionSide.SHORT and position.stop_price <= position.entry_price:
+            return "floating profit trailing stop"
+    if _position_structure_failed(position, signal):
+        return "structure break stop"
+    return "ATR volatility stop"
+
+
 def _pyramid_allowed(
     position: Position,
     price: float,
@@ -843,21 +921,21 @@ def _adaptive_exits(
     indicators: IndicatorSnapshot | None,
 ) -> tuple[float, float, float]:
     if trend_state == "CHOP":
-        stop_pct, tp1_r, tp2_r = 0.018, 0.5, 0.8
+        stop_pct, tp1_r, tp2_r = 0.018, 0.8, 1.2
     elif trend_state in {"ONE_WAY_UP", "ONE_WAY_DOWN"}:
-        stop_pct, tp1_r, tp2_r = 0.030, 0.8, 1.8
+        stop_pct, tp1_r, tp2_r = 0.030, 2.0, 3.4
     else:
-        stop_pct, tp1_r, tp2_r = 0.024, 0.7, 1.1
+        stop_pct, tp1_r, tp2_r = 0.024, 1.0, 1.8
 
     min_stop_pct, tp_boost = _volatility_exit_profile(indicators)
     stop_pct = max(stop_pct, min_stop_pct)
     tp1_r *= tp_boost
     tp2_r *= tp_boost
-    leverage_cap = _stop_pct_for_leverage(leverage) * 2.5
+    leverage_cap = _stop_pct_for_leverage(leverage) * 4.0
     stop_pct = min(stop_pct, leverage_cap)
     stop = _stop_from_pct(side, price, stop_pct)
     if indicators and indicators.atr14:
-        atr_stop = _stop_from_atr(side, price, indicators.atr14, 1.2)
+        atr_stop = _stop_from_atr(side, price, indicators.atr14, _atr_stop_multiple(indicators))
         if side == PositionSide.LONG:
             stop = min(stop, atr_stop)
         else:
@@ -872,12 +950,25 @@ def _volatility_exit_profile(indicator: IndicatorSnapshot | None) -> tuple[float
         return 0.0, 1.0
     atr_pct = indicator.atr14 / indicator.close
     if atr_pct < 0.008:
-        return 0.018, 0.9
+        return 0.015, 0.9
     if atr_pct < 0.02:
-        return 0.024, 1.0
+        return 0.025, 1.0
     if atr_pct < 0.04:
-        return 0.032, 1.25
+        return 0.040, 1.2
     return 0.045, 1.5
+
+
+def _atr_stop_multiple(indicator: IndicatorSnapshot) -> float:
+    if not indicator.close or not indicator.atr14:
+        return 1.2
+    atr_pct = indicator.atr14 / indicator.close
+    if atr_pct < 0.008:
+        return 1.4
+    if atr_pct < 0.02:
+        return 1.6
+    if atr_pct < 0.04:
+        return 1.8
+    return 2.0
 
 
 def _risk_exit_reason(side: PositionSide, trend_state: str, risk_state: str) -> str | None:
@@ -901,9 +992,6 @@ def _auto_signal_allowed(signal: dict[str, object]) -> bool:
 
 
 def _rotation_candidate_allowed(signal: dict[str, object], indicator: IndicatorSnapshot | None) -> bool:
-    score = int(signal.get("score") or 0)
-    if score < ROTATION_MIN_SCORE:
-        return False
     if str(signal.get("risk_state") or "NORMAL") != "NORMAL":
         return False
     action = str(signal.get("action") or "")
@@ -919,6 +1007,43 @@ def _rotation_candidate_allowed(signal: dict[str, object], indicator: IndicatorS
     atr_pct = indicator.atr14 / indicator.close
     volume_ratio = indicator.volume_ratio or 0.0
     return atr_pct >= ROTATION_MIN_ATR_PCT and volume_ratio >= ROTATION_MIN_VOLUME_RATIO
+
+
+def _position_structure_failed(position: Position, signal: dict[str, object]) -> bool:
+    action = str(signal.get("action") or "")
+    trend = str(signal.get("trend_state") or signal.get("regime") or "CHOP")
+    risk_state = str(signal.get("risk_state") or "NORMAL")
+    vetoes = tuple(signal.get("vetoes") or ())
+    if position.side == PositionSide.LONG:
+        opposite_signal = action == SignalAction.ENTRY_SHORT.value or trend == "ONE_WAY_DOWN"
+        trend_lost = trend not in {"TREND_LONG", "ONE_WAY_UP"} and int(signal.get("score") or 0) < 75
+        risk_break = risk_state in {"LONG_CROWD", "OI_ABNORMAL", "FUNDING_HOT"}
+    else:
+        opposite_signal = action == SignalAction.ENTRY_LONG.value or trend == "ONE_WAY_UP"
+        trend_lost = trend not in {"TREND_SHORT", "ONE_WAY_DOWN"} and int(signal.get("score") or 0) < 75
+        risk_break = risk_state in {"SHORT_CROWD", "OI_ABNORMAL", "FUNDING_HOT"}
+    return opposite_signal or trend_lost or risk_break or bool(vetoes)
+
+
+def _rotation_efficiency_better(candidate: IndicatorSnapshot | None, current: IndicatorSnapshot | None) -> bool:
+    if candidate is None or not candidate.close or not candidate.atr14:
+        return False
+    candidate_atr_pct = candidate.atr14 / candidate.close
+    candidate_volume = candidate.volume_ratio or 0.0
+    candidate_oi = candidate.oi_change or 0.0
+    if current is None or not current.close or not current.atr14:
+        return candidate_atr_pct >= ROTATION_MIN_ATR_PCT and candidate_volume >= ROTATION_MIN_VOLUME_RATIO
+    current_atr_pct = current.atr14 / current.close
+    current_volume = current.volume_ratio or 0.0
+    current_oi = current.oi_change or 0.0
+    advantages = 0
+    if candidate_atr_pct >= current_atr_pct * 1.15 and candidate_atr_pct >= ROTATION_MIN_ATR_PCT:
+        advantages += 1
+    if candidate_volume >= max(ROTATION_MIN_VOLUME_RATIO, current_volume + 0.25):
+        advantages += 1
+    if candidate_oi >= current_oi + 0.005:
+        advantages += 1
+    return advantages >= 2
 
 
 def _build_price_only_indicators(candles: list[Candle], settings: AppSettings) -> list[IndicatorSnapshot]:
@@ -1647,12 +1772,28 @@ def _stop_pct_for_leverage(leverage: int) -> float:
     return 0.02
 
 
-def _leverage_for_signal(score: int, leverage_max: int) -> int:
-    if score >= 85:
-        return min(10, leverage_max)
-    if score >= 78:
-        return min(7, leverage_max)
-    return min(5, leverage_max)
+def _leverage_for_signal(
+    score: int,
+    leverage_max: int,
+    trend_state: str = "CHOP",
+    indicator: IndicatorSnapshot | None = None,
+) -> int:
+    leverage = 5
+    if score >= 95 and trend_state in {"ONE_WAY_UP", "ONE_WAY_DOWN"}:
+        leverage = 10
+    elif score >= 85:
+        leverage = 7
+    if trend_state == "CHOP":
+        leverage = min(leverage, 5)
+    if _is_high_volatility(indicator):
+        leverage = min(leverage, 7)
+    return min(leverage, leverage_max)
+
+
+def _is_high_volatility(indicator: IndicatorSnapshot | None) -> bool:
+    if indicator is None or not indicator.close or not indicator.atr14:
+        return False
+    return indicator.atr14 / indicator.close >= 0.04
 
 
 def _bars_for_4h(interval: str) -> int:

@@ -62,7 +62,14 @@ class FakeMarketData:
         return [Symbol(symbol) for symbol in symbols]
 
 
-def indicator_snapshot(*, close: float = 100.0, atr: float = 1.0, volume_ratio: float = 1.5, ema20: float = 100.0) -> IndicatorSnapshot:
+def indicator_snapshot(
+    *,
+    close: float = 100.0,
+    atr: float = 1.0,
+    volume_ratio: float = 1.5,
+    ema20: float = 100.0,
+    oi_change: float | None = None,
+) -> IndicatorSnapshot:
     return IndicatorSnapshot(
         timestamp=datetime(2026, 1, 1, tzinfo=UTC),
         close=close,
@@ -78,6 +85,7 @@ def indicator_snapshot(*, close: float = 100.0, atr: float = 1.0, volume_ratio: 
         volume_sma20=1000.0,
         volume_ratio=volume_ratio,
         ema50_slope=0.1,
+        oi_change=oi_change,
     )
 
 
@@ -128,10 +136,12 @@ def test_paper_api_manual_order_with_fake_engine() -> None:
 
 
 def test_auto_leverage_scales_with_signal_score() -> None:
-    assert _leverage_for_signal(85, 10) == 10
-    assert _leverage_for_signal(78, 10) == 7
+    assert _leverage_for_signal(95, 10, "ONE_WAY_UP") == 10
+    assert _leverage_for_signal(85, 10, "TREND_LONG") == 7
+    assert _leverage_for_signal(85, 10, "CHOP") == 5
+    assert _leverage_for_signal(78, 10, "TREND_LONG") == 5
     assert _leverage_for_signal(75, 10) == 5
-    assert _leverage_for_signal(90, 7) == 7
+    assert _leverage_for_signal(95, 7, "ONE_WAY_DOWN") == 7
 
 
 def test_adaptive_exits_expand_profit_targets_by_trend_state() -> None:
@@ -474,7 +484,7 @@ def test_oi_deleverage_hold_long_caps_leverage_and_margin() -> None:
     assert adjusted["leverage_cap"] == 5
     assert adjusted["margin_factor"] == 0.5
     assert _daily_bias_margin_factor("LONG", adjusted) == 0.5
-    assert _leverage_for_signal(adjusted["score"], 10) == 10
+    assert min(_leverage_for_signal(adjusted["score"], 10, "ONE_WAY_UP"), adjusted["leverage_cap"]) == 5
 
 
 def test_oi_deleverage_with_long_short_ratio_rising_allows_tiny_long_only() -> None:
@@ -566,7 +576,7 @@ def test_rotation_candidate_requires_one_way_volatility_and_clean_risk() -> None
     good = {"action": "ENTRY_LONG", "score": 92, "trend_state": "ONE_WAY_UP", "risk_state": "NORMAL"}
 
     assert _rotation_candidate_allowed(good, indicator_snapshot(close=100.0, atr=1.0, volume_ratio=1.5))
-    assert not _rotation_candidate_allowed({**good, "score": 89}, indicator_snapshot())
+    assert _rotation_candidate_allowed({**good, "score": 89}, indicator_snapshot())
     assert not _rotation_candidate_allowed({**good, "trend_state": "TREND_LONG"}, indicator_snapshot())
     assert not _rotation_candidate_allowed({**good, "risk_state": "LONG_CROWD"}, indicator_snapshot())
     assert not _rotation_candidate_allowed(good, indicator_snapshot(close=100.0, atr=0.5, volume_ratio=1.5))
@@ -619,7 +629,13 @@ def test_auto_trade_rotates_weak_position_for_much_stronger_candidate() -> None:
     for idx in range(5):
         asyncio.run(engine.open_position(f"TEST{idx}USDT", "LONG", margin_usdt=100, leverage=5))
         engine.account.positions[f"TEST{idx}USDT"].opened_at = datetime.now(UTC) - timedelta(hours=1)
-        engine.latest_signals[f"TEST{idx}USDT"] = {"score": 75 + idx}
+        engine.latest_signals[f"TEST{idx}USDT"] = {
+            "score": 75 + idx,
+            "action": "ENTRY_SHORT" if idx == 0 else "WATCH",
+            "trend_state": "ONE_WAY_DOWN" if idx == 0 else "TREND_LONG",
+            "risk_state": "NORMAL",
+        }
+        engine.latest_indicators[f"TEST{idx}USDT"] = [indicator_snapshot(close=100.0, atr=0.6, volume_ratio=1.0, oi_change=0.0)]
     engine.latest_signals["TEST5USDT"] = {
         "action": "ENTRY_LONG",
         "score": 95,
@@ -633,7 +649,7 @@ def test_auto_trade_rotates_weak_position_for_much_stronger_candidate() -> None:
     assert "TEST0USDT" not in engine.account.positions
     assert "TEST5USDT" in engine.account.positions
     assert len(engine.account.positions) == 5
-    assert engine.account.fills[-2].reason == "rotation exit: symbol=TEST5USDT score=95"
+    assert engine.account.fills[-2].reason == "rotation exit: symbol=TEST5USDT score=95 current_score=75"
 
 
 def test_auto_trade_does_not_rotate_for_ordinary_high_score_candidate() -> None:
@@ -692,3 +708,25 @@ def test_pnl_history_keeps_first_value_per_15_minute_bucket() -> None:
         {"timestamp": "2026-06-11T01:00:00+00:00", "total_pnl": -1.2},
         {"timestamp": "2026-06-11T01:15:00+00:00", "total_pnl": 3.5},
     ]
+
+
+def test_background_pnl_sample_records_without_status_request() -> None:
+    engine = PaperTradingEngine(AppSettings(), starting_balance=1000, symbols=["BTCUSDT"], market_data=FakeMarketData())
+    engine.account.wallet_balance = 1037.01
+
+    engine._record_pnl_history_sample(now=datetime(2026, 6, 12, 1, 17, tzinfo=UTC))
+
+    assert round(engine.account.pnl_history["2026-06-12T01:15:00+00:00"], 2) == 37.01
+
+
+def test_background_daily_pnl_baseline_records_without_status_request() -> None:
+    engine = PaperTradingEngine(AppSettings(), starting_balance=1000, symbols=["BTCUSDT"], market_data=FakeMarketData())
+    engine.account.wallet_balance = 990.0
+    engine._record_account_snapshots(now=datetime(2026, 6, 11, 0, 1, tzinfo=UTC))
+
+    engine.account.wallet_balance = 1035.0
+    engine._record_account_snapshots(now=datetime(2026, 6, 12, 0, 1, tzinfo=UTC))
+
+    daily = _daily_pnl_payload(engine.account.daily_pnl_baselines, 35.0, now=datetime(2026, 6, 12, 1, 0, tzinfo=UTC))
+    assert daily["days"][0]["date"] == "2026-06-11"
+    assert round(float(daily["days"][0]["net_pnl"]), 2) == 45.0
