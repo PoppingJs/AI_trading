@@ -13,4 +13,4 @@ if ($LASTEXITCODE -ne 0) {
     & $Python -m pip install -e "$ProjectRoot"
 }
 
-& $Python -m uvicorn ai_trading.api:app --host 127.0.0.1 --port 8000
+& $Python -m uvicorn ai_trading.api:create_app --factory --host 127.0.0.1 --port 8000

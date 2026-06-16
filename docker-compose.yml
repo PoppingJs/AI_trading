@@ -5,4 +5,4 @@ services:
       - .env.example
     ports:
       - "8000:8000"
-    command: ["uvicorn", "ai_trading.api:app", "--host", "0.0.0.0", "--port", "8000"]
+    command: ["uvicorn", "ai_trading.api:create_app", "--factory", "--host", "0.0.0.0", "--port", "8000"]

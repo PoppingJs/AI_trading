@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from dataclasses import asdict, dataclass, field
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any
 from typing import Literal
 
 from ai_trading.binance import BinanceFuturesMarketData
@@ -76,9 +79,11 @@ class PaperTradingEngine:
         symbols: list[str] | None = None,
         interval: str = "15m",
         market_data: BinanceFuturesMarketData | None = None,
+        state_path: str | Path | None = None,
     ) -> None:
         self.settings = settings
-        self.account = PaperAccount(starting_balance=starting_balance, wallet_balance=starting_balance)
+        self.state_path = Path(state_path) if state_path else None
+        self.account = _load_paper_account(self.state_path) or PaperAccount(starting_balance=starting_balance, wallet_balance=starting_balance)
         self.symbols = [symbol.upper() for symbol in (symbols or ["AUTO_TOP30"])]
         self.interval = interval
         self.market_data = market_data or BinanceFuturesMarketData()
@@ -128,6 +133,13 @@ class PaperTradingEngine:
             self.last_error = None
             self.last_market_update_at = None
             self.auto_trade = False
+            self._save_state_unlocked()
+
+    async def close(self) -> None:
+        await self.stop()
+        close = getattr(self.market_data, "aclose", None)
+        if close is not None:
+            await close()
 
     async def refresh_once(self) -> None:
         await self.refresh_universe_if_needed()
@@ -227,6 +239,7 @@ class PaperTradingEngine:
                     opened_at=position.opened_at,
                 )
             )
+            self._save_state_unlocked()
             return position
 
     async def close_position(self, symbol: str, *, reason: str = "manual close") -> Trade:
@@ -238,12 +251,24 @@ class PaperTradingEngine:
                 raise ValueError(f"{symbol} has no open paper position")
             return self._close_position_unlocked(position, price, reason)
 
+    async def status_async(self) -> dict[str, object]:
+        async with self._lock:
+            return self._status_unlocked()
+
     def status(self) -> dict[str, object]:
+        return self._status_unlocked()
+
+    def _status_unlocked(self) -> dict[str, object]:
         positions = []
         unrealized = 0.0
         used_margin = 0.0
-        for position in self.account.positions.values():
-            price = self.latest_prices.get(position.symbol, position.entry_price)
+        latest_prices = dict(self.latest_prices)
+        latest_signals = {symbol: dict(signal) for symbol, signal in self.latest_signals.items()}
+        latest_timeframe_contexts = {symbol: dict(context) for symbol, context in self.latest_timeframe_contexts.items()}
+        positions_snapshot = list(self.account.positions.values())
+        fills_snapshot = list(self.account.fills[-100:])
+        for position in positions_snapshot:
+            price = latest_prices.get(position.symbol, position.entry_price)
             pnl = _pnl(position.side, position.entry_price, price, position.quantity)
             margin = float(position.metadata.get("margin_usdt", 0.0))
             unrealized += pnl
@@ -286,11 +311,11 @@ class PaperTradingEngine:
             "total_pnl": total_pnl,
             "total_pnl_pct": total_pnl / self.account.starting_balance,
             "fees_paid": self.account.fees_paid,
-            "latest_prices": self.latest_prices,
-            "latest_signals": self.latest_signals,
-            "latest_timeframe_contexts": self.latest_timeframe_contexts,
+            "latest_prices": latest_prices,
+            "latest_signals": latest_signals,
+            "latest_timeframe_contexts": latest_timeframe_contexts,
             "positions": positions,
-            "fills": [_fill_payload(fill) for fill in self.account.fills[-100:]],
+            "fills": [_fill_payload(fill) for fill in fills_snapshot],
             "daily_pnl": _daily_pnl_payload(self.account.daily_pnl_baselines, total_pnl, now=now),
             "pnl_history": pnl_history,
             "last_error": self.last_error,
@@ -314,6 +339,7 @@ class PaperTradingEngine:
         total_pnl = self._current_total_pnl()
         _pnl_history_payload(self.account.pnl_history, total_pnl, now=now)
         _daily_pnl_payload(self.account.daily_pnl_baselines, total_pnl, now=now)
+        self._save_state_unlocked()
 
     def _record_pnl_history_sample(self, now: datetime | None = None) -> None:
         _pnl_history_payload(self.account.pnl_history, self._current_total_pnl(), now=now)
@@ -480,7 +506,8 @@ class PaperTradingEngine:
                     trend_state,
                     _preferred_exit_indicator(self.latest_timeframe_indicators.get(symbol, {}), indicators),
                 )
-                stop_loss = _refine_stop_with_precision(PositionSide(side), stop_loss, precision)
+                if _precision_stop_allowed(PositionSide(side), trend_state, str(signal.get("risk_state") or "NORMAL"), score, precision):
+                    stop_loss = _refine_stop_with_precision(PositionSide(side), stop_loss, precision)
                 stop_loss = _refine_stop_with_ma_cluster(PositionSide(side), stop_loss, mtf_context)
                 take_profit_1, take_profit_2 = _refine_take_profit_with_ma_cluster(
                     PositionSide(side),
@@ -571,18 +598,22 @@ class PaperTradingEngine:
                 _protect_confirmed_breakout_position(position, signal, _preferred_exit_indicator(tf_indicators, indicators))
             _apply_profit_protection(position, price, signal, _preferred_exit_indicator(tf_indicators, indicators))
             self._update_trailing_stop(position, price, strong_trend, _preferred_exit_indicator(tf_indicators, indicators))
+            structure_exit_reason = _confirmed_structure_exit_reason(position, price, signal)
+            if structure_exit_reason:
+                self._close_position_unlocked(position, price, structure_exit_reason)
+                continue
             if _stop_hit(position, price):
                 self._close_position_unlocked(position, price, _stop_exit_reason(position, signal))
                 continue
             if strong_trend and _strong_trend_invalidated(position, latest_indicator):
-                self._close_position_unlocked(position, price, "trend invalidation exit")
+                self._close_position_unlocked(position, price, _outcome_exit_reason(position, price, "strong trend EMA50 structure invalidated"))
                 continue
             risk_exit_reason = _risk_exit_reason(position.side, trend_state, risk_state)
             if risk_exit_reason:
-                self._close_position_unlocked(position, price, risk_exit_reason)
+                self._close_position_unlocked(position, price, _risk_outcome_exit_reason(position, price, risk_exit_reason))
                 continue
             if _take_profit_hit(position, price) and not strong_trend:
-                self._close_position_unlocked(position, price, "take profit 2")
+                self._close_position_unlocked(position, price, "take profit: target 2 reached")
 
     def _update_trailing_stop(self, position: Position, price: float, strong_trend: bool, indicator: IndicatorSnapshot | None) -> None:
         stop_distance = float(position.metadata.get("initial_stop_distance") or abs(position.entry_price - position.stop_price))
@@ -668,6 +699,7 @@ class PaperTradingEngine:
                     opened_at=position.opened_at,
                 )
             )
+            self._save_state_unlocked()
             break
 
     def _close_position_unlocked(self, position: Position, price: float, reason: str) -> Trade:
@@ -715,17 +747,138 @@ class PaperTradingEngine:
                 return_pct=realized / margin_usdt if margin_usdt else 0.0,
             )
         )
+        self._save_state_unlocked()
         return trade
 
     def _available_balance_unlocked(self) -> float:
         status = self.status()
         return float(status["available_balance"])
 
+    def _save_state_unlocked(self) -> None:
+        if self.state_path is None:
+            return
+        payload = _paper_account_payload(self.account)
+        self.state_path.parent.mkdir(parents=True, exist_ok=True)
+        temp_path = self.state_path.with_name(f"{self.state_path.name}.tmp")
+        temp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        temp_path.replace(self.state_path)
+
 
 def _pnl(side: PositionSide, entry_price: float, mark_price: float, quantity: float) -> float:
     if side == PositionSide.LONG:
         return (mark_price - entry_price) * quantity
     return (entry_price - mark_price) * quantity
+
+
+def _paper_account_payload(account: PaperAccount) -> dict[str, Any]:
+    return {
+        "starting_balance": account.starting_balance,
+        "wallet_balance": account.wallet_balance,
+        "realized_pnl": account.realized_pnl,
+        "fees_paid": account.fees_paid,
+        "positions": {symbol: _position_payload(position) for symbol, position in account.positions.items()},
+        "fills": [_fill_state_payload(fill) for fill in account.fills],
+        "daily_pnl_baselines": account.daily_pnl_baselines,
+        "pnl_history": account.pnl_history,
+    }
+
+
+def _load_paper_account(path: Path | None) -> PaperAccount | None:
+    if path is None or not path.exists():
+        return None
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        return PaperAccount(
+            starting_balance=float(raw.get("starting_balance", PAPER_DEFAULT_BALANCE)),
+            wallet_balance=float(raw.get("wallet_balance", raw.get("starting_balance", PAPER_DEFAULT_BALANCE))),
+            realized_pnl=float(raw.get("realized_pnl", 0.0)),
+            fees_paid=float(raw.get("fees_paid", 0.0)),
+            positions={
+                symbol: _position_from_payload(payload)
+                for symbol, payload in dict(raw.get("positions") or {}).items()
+            },
+            fills=[_fill_from_payload(payload) for payload in list(raw.get("fills") or [])],
+            daily_pnl_baselines={str(key): float(value) for key, value in dict(raw.get("daily_pnl_baselines") or {}).items()},
+            pnl_history={str(key): float(value) for key, value in dict(raw.get("pnl_history") or {}).items()},
+        )
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+
+
+def _position_payload(position: Position) -> dict[str, Any]:
+    return {
+        "symbol": position.symbol,
+        "side": position.side.value,
+        "entry_price": position.entry_price,
+        "quantity": position.quantity,
+        "opened_at": position.opened_at.isoformat(),
+        "stop_price": position.stop_price,
+        "take_profit_1": position.take_profit_1,
+        "take_profit_2": position.take_profit_2,
+        "remaining_fraction": position.remaining_fraction,
+        "first_tp_done": position.first_tp_done,
+        "second_tp_done": position.second_tp_done,
+        "bars_held": position.bars_held,
+        "metadata": position.metadata,
+    }
+
+
+def _position_from_payload(payload: dict[str, Any]) -> Position:
+    return Position(
+        symbol=str(payload["symbol"]).upper(),
+        side=PositionSide(str(payload["side"])),
+        entry_price=float(payload["entry_price"]),
+        quantity=float(payload["quantity"]),
+        opened_at=_parse_datetime(payload["opened_at"]),
+        stop_price=float(payload["stop_price"]),
+        take_profit_1=float(payload["take_profit_1"]),
+        take_profit_2=float(payload["take_profit_2"]),
+        remaining_fraction=float(payload.get("remaining_fraction", 1.0)),
+        first_tp_done=bool(payload.get("first_tp_done", False)),
+        second_tp_done=bool(payload.get("second_tp_done", False)),
+        bars_held=int(payload.get("bars_held", 0)),
+        metadata=dict(payload.get("metadata") or {}),
+    )
+
+
+def _fill_state_payload(fill: PaperFill) -> dict[str, Any]:
+    payload = asdict(fill)
+    payload["side"] = fill.side.value
+    for key in ("timestamp", "opened_at", "closed_at"):
+        value = payload.get(key)
+        payload[key] = value.isoformat() if isinstance(value, datetime) else None
+    return payload
+
+
+def _fill_from_payload(payload: dict[str, Any]) -> PaperFill:
+    return PaperFill(
+        timestamp=_parse_datetime(payload["timestamp"]),
+        symbol=str(payload["symbol"]).upper(),
+        side=PositionSide(str(payload["side"])),
+        action=str(payload["action"]),
+        price=float(payload["price"]),
+        entry_price=float(payload["entry_price"]),
+        quantity=float(payload["quantity"]),
+        realized_pnl=float(payload["realized_pnl"]),
+        fee=float(payload["fee"]),
+        reason=str(payload.get("reason", "")),
+        leverage=int(payload.get("leverage", 1)),
+        margin_usdt=float(payload.get("margin_usdt", 0.0)),
+        stop_price=float(payload.get("stop_price", 0.0)),
+        take_profit_1=float(payload.get("take_profit_1", 0.0)),
+        take_profit_2=float(payload.get("take_profit_2", 0.0)),
+        opened_at=_parse_datetime(payload["opened_at"]),
+        closed_at=_parse_datetime(payload["closed_at"]) if payload.get("closed_at") else None,
+        return_pct=float(payload.get("return_pct", 0.0)),
+    )
+
+
+def _parse_datetime(value: str | datetime) -> datetime:
+    if isinstance(value, datetime):
+        parsed = value
+    else:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
 
 
 def _format_partial_market_errors(errors: list[str]) -> str | None:
@@ -802,12 +955,57 @@ def _stop_exit_reason(position: Position, signal: dict[str, object]) -> str:
     stop_distance = float(position.metadata.get("initial_stop_distance") or abs(position.entry_price - position.stop_price))
     if stop_distance > 0:
         if position.side == PositionSide.LONG and position.stop_price >= position.entry_price:
-            return "floating profit trailing stop"
+            return "take profit: floating profit trailing stop"
         if position.side == PositionSide.SHORT and position.stop_price <= position.entry_price:
-            return "floating profit trailing stop"
+            return "take profit: floating profit trailing stop"
     if _position_structure_failed(position, signal):
-        return "structure break stop"
-    return "ATR volatility stop"
+        return "stop loss: signal structure failed"
+    return "stop loss: ATR volatility hard stop"
+
+
+def _outcome_exit_reason(position: Position, price: float, detail: str) -> str:
+    prefix = "take profit" if _pnl(position.side, position.entry_price, price, position.quantity) > 0 else "stop loss"
+    return f"{prefix}: {detail}"
+
+
+def _risk_outcome_exit_reason(position: Position, price: float, risk_reason: str) -> str:
+    detail = risk_reason.replace("risk exit:", "").strip()
+    if detail == "LONG_CROWD":
+        text = "long crowd risk"
+    elif detail == "SHORT_CROWD":
+        text = "short crowd risk"
+    elif detail == "OI_ABNORMAL":
+        text = "OI abnormal risk"
+    elif detail == "FUNDING_HOT":
+        text = "funding overheated risk"
+    else:
+        text = detail or "risk exit"
+    return _outcome_exit_reason(position, price, text)
+
+
+def _confirmed_structure_exit_reason(position: Position, price: float, signal: dict[str, object]) -> str | None:
+    """Exit only when 1h/4h structure is lost by close/body, not by a single wick."""
+    h4 = signal.get("h4_structure") if isinstance(signal.get("h4_structure"), dict) else {}
+    h1 = signal.get("h1_trigger") if isinstance(signal.get("h1_trigger"), dict) else {}
+    h1_pullback = signal.get("h1_pullback") if isinstance(signal.get("h1_pullback"), dict) else {}
+    h4_state = str(h4.get("state") or "UNKNOWN")
+    h1_direction = str(h1.get("direction") or "NONE")
+    h1_state = str(h1.get("state") or "UNKNOWN")
+    pullback_direction = str(h1_pullback.get("direction") or "NONE")
+    pullback_state = str(h1_pullback.get("state") or "UNKNOWN")
+    if position.side == PositionSide.LONG:
+        h4_failed = h4_state == "BREAKDOWN_DOWN"
+        h1_failed = h1_direction == "SHORT" and h1_state in {"BREAKDOWN", "RETEST"}
+        ema_boll_lost = pullback_direction == "SHORT" and pullback_state == "HEALTHY_PULLBACK"
+        if h4_failed or h1_failed or ema_boll_lost:
+            return _outcome_exit_reason(position, price, "1h/4h body closed below support or EMA/BOLL zone")
+    else:
+        h4_failed = h4_state == "BREAKOUT_UP"
+        h1_failed = h1_direction == "LONG" and h1_state in {"BREAKOUT", "RETEST"}
+        ema_boll_reclaimed = pullback_direction == "LONG" and pullback_state == "HEALTHY_PULLBACK"
+        if h4_failed or h1_failed or ema_boll_reclaimed:
+            return _outcome_exit_reason(position, price, "1h/4h body closed above resistance or EMA/BOLL zone")
+    return None
 
 
 def _pyramid_allowed(
@@ -1129,6 +1327,10 @@ def _four_hour_structure(
         "state": state,
         "support": support,
         "resistance": resistance,
+        "support_zone_low": support - buffer,
+        "support_zone_high": support + buffer,
+        "resistance_zone_low": resistance - buffer,
+        "resistance_zone_high": resistance + buffer,
         "box_mid": mid,
         "box_width_pct": box_width_pct,
     }
@@ -1148,25 +1350,42 @@ def _one_hour_trigger(
     support = _float_or_none(h4.get("support"))
     resistance = _float_or_none(h4.get("resistance"))
     buffer = (indicator.atr14 or current.close * 0.004) * settings.strategy.structure_buffer_atr
+    support_zone_low = _float_or_none(h4.get("support_zone_low"))
+    support_zone_high = _float_or_none(h4.get("support_zone_high"))
+    resistance_zone_low = _float_or_none(h4.get("resistance_zone_low"))
+    resistance_zone_high = _float_or_none(h4.get("resistance_zone_high"))
+    if support is not None:
+        support_zone_low = support_zone_low if support_zone_low is not None else support - buffer
+        support_zone_high = support_zone_high if support_zone_high is not None else support + buffer
+    if resistance is not None:
+        resistance_zone_low = resistance_zone_low if resistance_zone_low is not None else resistance - buffer
+        resistance_zone_high = resistance_zone_high if resistance_zone_high is not None else resistance + buffer
     direction = "NONE"
     state = "WAIT"
-    if resistance is not None:
-        breakout = current.close > resistance + buffer
-        retest = previous.close > resistance and current.low <= resistance + buffer and current.close > resistance
-        fake_breakout = previous.high > resistance and current.close < resistance - buffer
+    if resistance is not None and resistance_zone_low is not None and resistance_zone_high is not None:
+        breakout = current.close > resistance_zone_high
+        retest = previous.close > resistance_zone_high and current.low <= resistance_zone_high and current.close > resistance_zone_low
+        fake_breakout = previous.high > resistance_zone_high and current.close < resistance_zone_low
         if breakout or retest:
             direction, state = "LONG", "BREAKOUT" if breakout else "RETEST"
         elif fake_breakout:
             direction, state = "SHORT", "FAKE_BREAKOUT"
-    if support is not None:
-        breakdown = current.close < support - buffer
-        retest = previous.close < support and current.high >= support - buffer and current.close < support
-        fake_breakdown = previous.low < support and current.close > support + buffer
+    if support is not None and support_zone_low is not None and support_zone_high is not None:
+        breakdown = current.close < support_zone_low
+        retest = previous.close < support_zone_low and current.high >= support_zone_low and current.close < support_zone_high
+        fake_breakdown = previous.low < support_zone_low and current.close > support_zone_high
         if breakdown or retest:
             direction, state = "SHORT", "BREAKDOWN" if breakdown else "RETEST"
         elif fake_breakdown:
             direction, state = "LONG", "FAKE_BREAKDOWN"
-    return {"direction": direction, "state": state}
+    return {
+        "direction": direction,
+        "state": state,
+        "support_zone_low": support_zone_low,
+        "support_zone_high": support_zone_high,
+        "resistance_zone_low": resistance_zone_low,
+        "resistance_zone_high": resistance_zone_high,
+    }
 
 
 def _moving_average_cluster(
@@ -1562,6 +1781,16 @@ def _strong_m15_pullback_allowed(
     if side == PositionSide.LONG:
         return trend_state == "ONE_WAY_UP" and pullback == "M15_LONG_PULLBACK"
     return trend_state == "ONE_WAY_DOWN" and pullback == "M15_SHORT_PULLBACK"
+
+
+def _precision_stop_allowed(
+    side: PositionSide,
+    trend_state: str,
+    risk_state: str,
+    score: int,
+    precision: dict[str, object],
+) -> bool:
+    return _strong_m15_pullback_allowed(side, trend_state, risk_state, score, precision)
 
 
 def _deleverage_short_failure_confirmed(

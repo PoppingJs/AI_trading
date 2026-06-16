@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 from fastapi.testclient import TestClient
 
@@ -13,6 +14,7 @@ from ai_trading.paper import (
     _adaptive_exits,
     _apply_multi_timeframe_context,
     _auto_signal_allowed,
+    _confirmed_structure_exit_reason,
     _daily_bias_margin_factor,
     _daily_pnl_payload,
     _leverage_for_signal,
@@ -20,12 +22,14 @@ from ai_trading.paper import (
     _ma_cluster_signal_adjustment,
     _pnl_history_payload,
     _protect_confirmed_breakout_position,
+    _precision_stop_allowed,
     _refine_stop_with_ma_cluster,
     _refine_stop_with_precision,
     _refine_take_profit_with_ma_cluster,
     _pyramid_allowed,
     _rotation_candidate_allowed,
     _risk_exit_reason,
+    _stop_exit_reason,
 )
 
 
@@ -118,8 +122,8 @@ def test_paper_engine_manual_long_close_profit() -> None:
     assert engine.status()["equity"] > 1000
 
 
-def test_paper_api_manual_order_with_fake_engine() -> None:
-    app = create_app()
+def test_paper_api_manual_order_with_fake_engine(tmp_path: Path) -> None:
+    app = create_app(state_path=tmp_path / "paper_state.json")
     app.state.paper_engine = PaperTradingEngine(AppSettings(), starting_balance=1000, market_data=FakeMarketData())
     client = TestClient(app)
 
@@ -133,6 +137,27 @@ def test_paper_api_manual_order_with_fake_engine() -> None:
     closed = client.post("/api/paper/order/close", json={"symbol": "ETHUSDT"})
     assert closed.status_code == 200
     assert closed.json()["positions"] == []
+
+
+def test_paper_engine_persists_positions_and_fills(tmp_path: Path) -> None:
+    state_path = tmp_path / "paper_state.json"
+    market = FakeMarketData()
+    engine = PaperTradingEngine(AppSettings(), starting_balance=1000, market_data=market, state_path=state_path)
+
+    asyncio.run(engine.open_position("BTCUSDT", "LONG", margin_usdt=100, leverage=5))
+    assert state_path.exists()
+
+    restored = PaperTradingEngine(AppSettings(), starting_balance=500, market_data=FakeMarketData(), state_path=state_path)
+    status = restored.status()
+    assert status["starting_balance"] == 1000
+    assert status["positions"][0]["symbol"] == "BTCUSDT"
+    assert status["fills"][0]["action"] == "OPEN"
+
+    restored.latest_prices["BTCUSDT"] = 110.0
+    asyncio.run(restored.close_position("BTCUSDT", reason="test close"))
+    restored_again = PaperTradingEngine(AppSettings(), starting_balance=500, market_data=FakeMarketData(), state_path=state_path)
+    assert restored_again.status()["positions"] == []
+    assert restored_again.status()["fills"][-1]["action"] == "CLOSE"
 
 
 def test_auto_leverage_scales_with_signal_score() -> None:
@@ -242,6 +267,48 @@ def test_confirmed_breakout_moves_long_stop_to_structure_protection() -> None:
 
     assert position.stop_price >= 102.4
     assert position.metadata["breakout_protected"] is True
+
+
+def test_confirmed_structure_exit_uses_1h_4h_body_break_not_m15_noise() -> None:
+    position = asyncio.run(PaperTradingEngine(AppSettings(), starting_balance=1000, market_data=FakeMarketData()).open_position("TESTUSDT", "LONG", margin_usdt=100, leverage=5))
+    position.entry_price = 100.0
+    position.quantity = 5.0
+
+    wick_only_signal = {
+        "h4_structure": {"state": "BOX_UPPER_HALF"},
+        "h1_trigger": {"direction": "NONE", "state": "WAIT"},
+        "h1_pullback": {"direction": "NONE", "state": "WAIT"},
+    }
+    failed_signal = {
+        "h4_structure": {"state": "BREAKDOWN_DOWN"},
+        "h1_trigger": {"direction": "SHORT", "state": "BREAKDOWN"},
+        "h1_pullback": {"direction": "NONE", "state": "WAIT"},
+    }
+
+    assert _confirmed_structure_exit_reason(position, 99.0, wick_only_signal) is None
+    assert _confirmed_structure_exit_reason(position, 97.0, failed_signal) == "stop loss: 1h/4h body closed below support or EMA/BOLL zone"
+    assert _confirmed_structure_exit_reason(position, 102.0, failed_signal) == "take profit: 1h/4h body closed below support or EMA/BOLL zone"
+
+
+def test_precision_stop_only_allowed_for_strong_m15_tactical_pullback() -> None:
+    precision = {"pullback": "M15_LONG_PULLBACK", "long_stop_anchor": 97.2}
+
+    assert _precision_stop_allowed(PositionSide.LONG, "ONE_WAY_UP", "NORMAL", 90, precision)
+    assert not _precision_stop_allowed(PositionSide.LONG, "TREND_LONG", "NORMAL", 90, precision)
+    assert not _precision_stop_allowed(PositionSide.LONG, "ONE_WAY_UP", "LONG_CROWD", 90, precision)
+    assert not _precision_stop_allowed(PositionSide.LONG, "ONE_WAY_UP", "NORMAL", 80, precision)
+
+
+def test_stop_exit_reason_explicitly_marks_stop_or_take_profit() -> None:
+    position = asyncio.run(PaperTradingEngine(AppSettings(), starting_balance=1000, market_data=FakeMarketData()).open_position("TESTUSDT", "LONG", margin_usdt=100, leverage=5))
+    position.entry_price = 100.0
+    position.stop_price = 100.4
+
+    assert _stop_exit_reason(position, {}) == "take profit: floating profit trailing stop"
+
+    position.stop_price = 96.0
+    assert _stop_exit_reason(position, {"action": "ENTRY_SHORT", "trend_state": "ONE_WAY_DOWN"}) == "stop loss: signal structure failed"
+    assert _stop_exit_reason(position, {"action": "WATCH", "trend_state": "TREND_LONG", "score": 80}) == "stop loss: ATR volatility hard stop"
 
 
 def test_risk_exit_reason_is_specific_to_one_way_position_risk() -> None:

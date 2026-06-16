@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 from dataclasses import asdict
+import os
 from pathlib import Path
 
 import uvicorn
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 
@@ -47,15 +49,27 @@ class PaperCloseRequest(BaseModel):
     symbol: str = "BTCUSDT"
 
 
-def create_app(settings_path: str | Path = "config/strategy.yaml") -> FastAPI:
+def create_app(settings_path: str | Path = "config/strategy.yaml", state_path: str | Path | None = None) -> FastAPI:
     settings = load_settings(settings_path)
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        yield
+        await app.state.paper_engine.close()
+
     app = FastAPI(
         title="AI Trading Strategy API",
         version="0.1.0",
         summary="Paper-trading-first Binance USDT-M futures strategy service.",
+        lifespan=lifespan,
     )
     app.state.settings = settings
-    app.state.paper_engine = PaperTradingEngine(settings, starting_balance=PAPER_DEFAULT_BALANCE)
+    resolved_state_path = state_path if state_path is not None else os.getenv("AI_TRADING_PAPER_STATE", "data/paper_state.json")
+    app.state.paper_engine = PaperTradingEngine(
+        settings,
+        starting_balance=PAPER_DEFAULT_BALANCE,
+        state_path=resolved_state_path,
+    )
 
     @app.get("/", response_class=HTMLResponse)
     def paper_dashboard() -> str:
@@ -79,7 +93,10 @@ def create_app(settings_path: str | Path = "config/strategy.yaml") -> FastAPI:
     @app.get("/api/markets/top30")
     async def top30_markets() -> dict[str, object]:
         client = BinanceFuturesMarketData()
-        symbols = await client.top_usdt_perpetuals(limit=30)
+        try:
+            symbols = await client.top_usdt_perpetuals(limit=30)
+        finally:
+            await client.aclose()
         return {
             "rank_by": settings.symbol_rank_by,
             "symbols": [asdict(symbol) for symbol in symbols],
@@ -93,7 +110,7 @@ def create_app(settings_path: str | Path = "config/strategy.yaml") -> FastAPI:
         signal = CompositeStrategy(settings.strategy).generate_signal("DEMOUSDT", candles, indicators)
         return _signal_payload(signal)
 
-    @app.post("/api/backtests/run")
+    @app.post("/api/backtests/run", dependencies=[Depends(_require_api_token)])
     def run_backtest(request: BacktestRequest) -> dict[str, object]:
         if not request.use_demo_data:
             raise HTTPException(
@@ -121,10 +138,10 @@ def create_app(settings_path: str | Path = "config/strategy.yaml") -> FastAPI:
         }
 
     @app.get("/api/paper/status")
-    def paper_status() -> dict[str, object]:
-        return app.state.paper_engine.status()
+    async def paper_status() -> dict[str, object]:
+        return await app.state.paper_engine.status_async()
 
-    @app.post("/api/paper/start")
+    @app.post("/api/paper/start", dependencies=[Depends(_require_api_token)])
     async def paper_start(request: PaperStartRequest) -> dict[str, object]:
         engine: PaperTradingEngine = app.state.paper_engine
         requested_symbols = [symbol.upper() for symbol in request.symbols or []]
@@ -138,30 +155,30 @@ def create_app(settings_path: str | Path = "config/strategy.yaml") -> FastAPI:
         elif request.starting_balance is not None and not engine.account.fills and not engine.account.positions:
             await engine.reset(starting_balance=request.starting_balance)
         await engine.start(auto_trade=request.auto_trade, poll_seconds=request.poll_seconds)
-        return engine.status()
+        return await engine.status_async()
 
-    @app.post("/api/paper/stop")
+    @app.post("/api/paper/stop", dependencies=[Depends(_require_api_token)])
     async def paper_stop() -> dict[str, object]:
         engine: PaperTradingEngine = app.state.paper_engine
         await engine.stop()
-        return engine.status()
+        return await engine.status_async()
 
-    @app.post("/api/paper/reset")
+    @app.post("/api/paper/reset", dependencies=[Depends(_require_api_token)])
     async def paper_reset(starting_balance: float = PAPER_DEFAULT_BALANCE) -> dict[str, object]:
         engine: PaperTradingEngine = app.state.paper_engine
         await engine.reset(starting_balance=starting_balance)
-        return engine.status()
+        return await engine.status_async()
 
-    @app.post("/api/paper/refresh")
+    @app.post("/api/paper/refresh", dependencies=[Depends(_require_api_token)])
     async def paper_refresh() -> dict[str, object]:
         engine: PaperTradingEngine = app.state.paper_engine
         try:
             await engine.refresh_once()
         except Exception as exc:  # noqa: BLE001
             raise HTTPException(status_code=502, detail=f"币安行情刷新失败：{exc}") from exc
-        return engine.status()
+        return await engine.status_async()
 
-    @app.post("/api/paper/order/open")
+    @app.post("/api/paper/order/open", dependencies=[Depends(_require_api_token)])
     async def paper_open_order(request: PaperOrderRequest) -> dict[str, object]:
         engine: PaperTradingEngine = app.state.paper_engine
         try:
@@ -179,9 +196,9 @@ def create_app(settings_path: str | Path = "config/strategy.yaml") -> FastAPI:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except Exception as exc:  # noqa: BLE001
             raise HTTPException(status_code=502, detail=f"币安价格获取失败：{exc}") from exc
-        return engine.status()
+        return await engine.status_async()
 
-    @app.post("/api/paper/order/close")
+    @app.post("/api/paper/order/close", dependencies=[Depends(_require_api_token)])
     async def paper_close_order(request: PaperCloseRequest) -> dict[str, object]:
         engine: PaperTradingEngine = app.state.paper_engine
         try:
@@ -190,7 +207,7 @@ def create_app(settings_path: str | Path = "config/strategy.yaml") -> FastAPI:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except Exception as exc:  # noqa: BLE001
             raise HTTPException(status_code=502, detail=f"币安价格获取失败：{exc}") from exc
-        return engine.status()
+        return await engine.status_async()
 
     return app
 
@@ -230,6 +247,12 @@ def _signal_payload(signal) -> dict[str, object]:
 def _uses_default_symbol_pool(symbols: list[str]) -> bool:
     cleaned = {symbol.replace("/", "").replace("-", "").upper() for symbol in symbols if symbol}
     return not cleaned or cleaned == {"BTCUSDT", "ETHUSDT", "SOLUSDT"} or cleaned == {"AUTO_TOP30"}
+
+
+def _require_api_token(x_api_token: str | None = Header(default=None)) -> None:
+    expected = os.getenv("AI_TRADING_API_TOKEN", "").strip()
+    if expected and x_api_token != expected:
+        raise HTTPException(status_code=401, detail="missing or invalid API token")
 
 
 PAPER_DASHBOARD_HTML = """
@@ -453,7 +476,10 @@ PAPER_DASHBOARD_HTML = """
     let dailyMonthKey = null;
     let latestDailyPnl = null;
     async function api(path, options = {}) {
-      const response = await fetch(path, { headers: { 'Content-Type': 'application/json' }, ...options });
+      const headers = { 'Content-Type': 'application/json', ...(options.headers || {}) };
+      const apiToken = localStorage.getItem('AI_TRADING_API_TOKEN');
+      if (apiToken) headers['X-API-Token'] = apiToken;
+      const response = await fetch(path, { ...options, headers });
       if (!response.ok) {
         const body = await response.json().catch(() => ({}));
         throw new Error(body.detail || response.statusText);
@@ -677,6 +703,24 @@ PAPER_DASHBOARD_HTML = """
       'floating profit trailing stop': '浮盈回撤止盈',
       'structure break stop': '结构破位止损',
       'ATR volatility stop': 'ATR波动止损',
+      'take profit: target 2 reached': '止盈：达到第二止盈目标',
+      'take profit: floating profit trailing stop': '止盈：浮盈回撤触发保护',
+      'stop loss: signal structure failed': '止损：信号结构失效',
+      'stop loss: ATR volatility hard stop': '止损：ATR波动硬止损',
+      'take profit: 1h/4h body closed below support or EMA/BOLL zone': '止盈：1小时/4小时实体跌破支撑或EMA/BOLL区域，保护利润',
+      'stop loss: 1h/4h body closed below support or EMA/BOLL zone': '止损：1小时/4小时实体跌破支撑或EMA/BOLL区域',
+      'take profit: 1h/4h body closed above resistance or EMA/BOLL zone': '止盈：1小时/4小时实体突破压力或EMA/BOLL区域，保护利润',
+      'stop loss: 1h/4h body closed above resistance or EMA/BOLL zone': '止损：1小时/4小时实体突破压力或EMA/BOLL区域',
+      'take profit: strong trend EMA50 structure invalidated': '止盈：强趋势EMA50结构失效，保护利润',
+      'stop loss: strong trend EMA50 structure invalidated': '止损：强趋势EMA50结构失效',
+      'take profit: long crowd risk': '止盈：多头拥挤风险，保护利润',
+      'stop loss: long crowd risk': '止损：多头拥挤风险',
+      'take profit: short crowd risk': '止盈：空头拥挤风险，保护利润',
+      'stop loss: short crowd risk': '止损：空头拥挤风险',
+      'take profit: OI abnormal risk': '止盈：OI异常风险，保护利润',
+      'stop loss: OI abnormal risk': '止损：OI异常风险',
+      'take profit: funding overheated risk': '止盈：资金费率过热风险，保护利润',
+      'stop loss: funding overheated risk': '止损：资金费率过热风险',
       'crowded one-way exit': '单边行情散户拥挤，主动离场'
     };
     const riskExitReasonText = {
@@ -743,6 +787,8 @@ PAPER_DASHBOARD_HTML = """
         const key = String(value).replace('risk exit:', '').trim();
         return riskExitReasonText[key] || `风险：${key}平仓`;
       }
+      if (String(value).startsWith('take profit:')) return String(value).replace('take profit:', '止盈：');
+      if (String(value).startsWith('stop loss:')) return String(value).replace('stop loss:', '止损：');
       if (String(value).startsWith('rotation exit:')) {
         const text = String(value);
         const symbol = (text.match(/symbol=([^\\s]+)/) || [])[1] || '';
