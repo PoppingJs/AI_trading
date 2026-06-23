@@ -1240,8 +1240,7 @@ PAPER_DASHBOARD_HTML = """
       if (signal.entry_timing) {
         const timingText = { GOOD: '优秀', WAIT: '等待', BLOCK: '禁止' };
         const timingClass = signal.entry_timing === 'GOOD' ? 'pos' : signal.entry_timing === 'BLOCK' ? 'neg' : 'muted';
-        const reasonText = signal.entry_timing_reason ? `<br><span class="muted">${tEntryTimingReason(signal.entry_timing_reason)}</span>` : '';
-        return `<span class="${timingClass}">${timingText[signal.entry_timing] || signal.entry_timing}</span>${reasonText}`;
+        return `<span class="${timingClass}">${timingText[signal.entry_timing] || signal.entry_timing}</span>`;
       }
       const vetoes = reasonList(signal.vetoes || []);
       if (vetoes.length) return '禁止';
