@@ -311,13 +311,14 @@ def test_stop_exit_reason_explicitly_marks_stop_or_take_profit() -> None:
     position.entry_price = 100.0
     position.stop_price = 100.4
 
-    assert _stop_exit_reason(position, {}) == "take profit: protected stop after profit lock"
+    assert _stop_exit_reason(position, {}, 100.4, 0.0004) == "take profit: protected stop after profit lock"
+    assert _stop_exit_reason(position, {}, 99.8, 0.0004) == "stop loss: protected stop slipped below entry"
 
     position.stop_price = 96.0
-    assert _stop_exit_reason(position, {"action": "ENTRY_SHORT", "trend_state": "ONE_WAY_DOWN"}) == "stop loss: signal direction or structure failed"
-    assert _stop_exit_reason(position, {"action": "WATCH", "trend_state": "TREND_LONG", "score": 80}) == "stop loss: ATR volatility hard stop"
+    assert _stop_exit_reason(position, {"action": "ENTRY_SHORT", "trend_state": "ONE_WAY_DOWN"}, 96.0, 0.0004) == "stop loss: signal direction or structure failed"
+    assert _stop_exit_reason(position, {"action": "WATCH", "trend_state": "TREND_LONG", "score": 80}, 96.0, 0.0004) == "stop loss: ATR volatility hard stop"
     position.metadata["entry_context"] = {"stop_basis": "15m_precision_structure"}
-    assert _stop_exit_reason(position, {"action": "WATCH", "trend_state": "TREND_LONG", "score": 80}) == "stop loss: 15m entry structure stop"
+    assert _stop_exit_reason(position, {"action": "WATCH", "trend_state": "TREND_LONG", "score": 80}, 96.0, 0.0004) == "stop loss: 15m entry structure stop"
 
 
 def test_profit_drawdown_exit_protects_winning_position_with_risk_signal() -> None:
@@ -378,7 +379,11 @@ def test_auto_top30_universe_refreshes_symbols() -> None:
 
 
 def test_auto_signal_score_tiers_and_margins() -> None:
-    base_signal = {"action": SignalAction.ENTRY_LONG.value}
+    base_signal = {
+        "action": SignalAction.ENTRY_LONG.value,
+        "price": 100.0,
+        "entry_levels": {"long": {"h1_support": {"low": 99.0, "high": 101.0, "price": 100.0}}},
+    }
     assert not _auto_signal_allowed({**base_signal, "score": 85, "risk_state": "LONG_CROWD"})
     assert _auto_signal_allowed({**base_signal, "score": 82, "risk_state": "NORMAL"})
     assert not _auto_signal_allowed({**base_signal, "score": 78, "risk_state": "FUNDING_HOT"})
@@ -498,12 +503,17 @@ def test_auto_signal_allows_strong_one_way_15m_tactical_short() -> None:
         "risk_state": "NORMAL",
         "price": 254.0,
         "m15_precision": {"pullback": "M15_SHORT_PULLBACK", "short_stop_anchor": 263.0},
-        "entry_levels": {"short": {"h1_resistance": {"low": 260.0, "high": 262.0, "price": 261.0}}},
+        "entry_levels": {
+            "short": {
+                "h1_resistance": {"low": 260.0, "high": 262.0, "price": 261.0},
+                "m15_ema20_ema60": {"low": 253.5, "high": 254.5, "price": 254.0},
+            }
+        },
     }
     timing, reason = _signal_entry_timing(signal)
 
     assert timing == "GOOD"
-    assert "15m" in reason
+    assert "entry zone" in reason
     assert _auto_signal_allowed(signal)
 
 
@@ -579,6 +589,7 @@ def test_high_area_long_allows_retest_confirmation() -> None:
         "action": "ENTRY_LONG",
         "score": 90,
         "risk_state": "NORMAL",
+        "price": 100.0,
         "reasons": (),
         "vetoes": (),
     }
@@ -587,6 +598,7 @@ def test_high_area_long_allows_retest_confirmation() -> None:
         "h4_structure": {"state": "BOX_UPPER_HALF"},
         "h1_trigger": {"direction": "LONG", "state": "RETEST"},
         "h1_pullback": {"direction": "NONE", "state": "WAIT"},
+        "entry_levels": {"long": {"h1_support": {"low": 99.0, "high": 101.0, "price": 100.0}}},
         "summary": "MTF: test",
     }
 
@@ -602,6 +614,7 @@ def test_one_way_high_area_allows_15m_boll_ema9_pullback() -> None:
         "score": 90,
         "trend_state": "ONE_WAY_UP",
         "risk_state": "NORMAL",
+        "price": 97.2,
         "reasons": (),
         "vetoes": (),
     }
@@ -611,6 +624,7 @@ def test_one_way_high_area_allows_15m_boll_ema9_pullback() -> None:
         "h1_trigger": {"direction": "NONE", "state": "WAIT"},
         "h1_pullback": {"direction": "NONE", "state": "WAIT"},
         "m15_precision": {"pullback": "M15_LONG_PULLBACK", "long_stop_anchor": 97.2},
+        "entry_levels": {"long": {"m15_ema20_ema60": {"low": 96.8, "high": 97.6, "price": 97.2}}},
         "summary": "MTF: test",
     }
 
@@ -666,7 +680,9 @@ def test_one_way_hot_rsi_requires_1h_or_15m_pullback() -> None:
     pullback_context = {
         **no_pullback_context,
         "m15_precision": {"pullback": "M15_LONG_PULLBACK", "long_stop_anchor": 97.2},
+        "entry_levels": {"long": {"m15_ema20_ema60": {"low": 96.8, "high": 97.6, "price": 97.2}}},
     }
+    signal = {**signal, "price": 97.2}
 
     blocked = _apply_multi_timeframe_context(signal, no_pullback_context)
     allowed = _apply_multi_timeframe_context(signal, pullback_context)
@@ -888,7 +904,14 @@ def test_preferred_exit_indicator_uses_1h_4h_not_15m_for_targets() -> None:
 
 
 def test_rotation_candidate_requires_one_way_volatility_and_clean_risk() -> None:
-    good = {"action": "ENTRY_LONG", "score": 92, "trend_state": "ONE_WAY_UP", "risk_state": "NORMAL"}
+    good = {
+        "action": "ENTRY_LONG",
+        "score": 92,
+        "trend_state": "ONE_WAY_UP",
+        "risk_state": "NORMAL",
+        "price": 100.0,
+        "entry_levels": {"long": {"h1_support": {"low": 99.0, "high": 101.0, "price": 100.0}}},
+    }
 
     assert _rotation_candidate_allowed(good, indicator_snapshot(close=100.0, atr=1.0, volume_ratio=1.5))
     assert _rotation_candidate_allowed({**good, "score": 89}, indicator_snapshot())
@@ -912,6 +935,8 @@ def test_auto_trade_caps_positions_and_prefers_highest_scores() -> None:
             "action": "ENTRY_LONG",
             "score": score,
             "trend_state": "TREND_LONG",
+            "price": 100.0,
+            "entry_levels": {"long": {"h1_support": {"low": 99.0, "high": 101.0, "price": 100.0}}},
         }
 
     import asyncio
@@ -932,7 +957,13 @@ def test_auto_trade_pauses_altcoin_entries_when_btc_4h_is_extreme() -> None:
     market.btc_4h_extreme = True
     engine = PaperTradingEngine(AppSettings(), starting_balance=1000, market_data=market)
     engine.latest_prices = {"TESTUSDT": 100.0}
-    engine.latest_signals["TESTUSDT"] = {"action": "ENTRY_LONG", "score": 95, "trend_state": "ONE_WAY_UP"}
+    engine.latest_signals["TESTUSDT"] = {
+        "action": "ENTRY_LONG",
+        "score": 95,
+        "trend_state": "ONE_WAY_UP",
+        "price": 100.0,
+        "entry_levels": {"long": {"h1_support": {"low": 99.0, "high": 101.0, "price": 100.0}}},
+    }
 
     import asyncio
 
@@ -962,6 +993,8 @@ def test_auto_trade_rotates_weak_position_for_much_stronger_candidate() -> None:
         "score": 95,
         "trend_state": "ONE_WAY_UP",
         "risk_state": "NORMAL",
+        "price": 100.0,
+        "entry_levels": {"long": {"h1_support": {"low": 99.0, "high": 101.0, "price": 100.0}}},
     }
     engine.latest_indicators["TEST5USDT"] = [indicator_snapshot(close=100.0, atr=1.0, volume_ratio=1.5)]
 

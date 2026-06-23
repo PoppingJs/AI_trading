@@ -44,6 +44,7 @@ TREND_STAGE_MID = "MID"
 TREND_STAGE_LATE = "LATE"
 TREND_STAGE_NEUTRAL = "NEUTRAL"
 MIN_ENTRY_REWARD_R = 1.2
+PROFIT_LOCK_SLIPPAGE_PCT = 0.0008
 
 
 @dataclass(frozen=True)
@@ -661,17 +662,17 @@ class PaperTradingEngine:
             _update_position_excursions(position, price)
             if strong_trend:
                 _protect_confirmed_breakout_position(position, signal, exit_indicator)
-            _apply_profit_protection(position, price, signal, exit_indicator)
+            _apply_profit_protection(position, price, signal, exit_indicator, self.settings.execution.taker_fee_rate)
             self._update_trailing_stop(position, price, strong_trend, exit_indicator)
             structure_exit_reason = _confirmed_structure_exit_reason(position, price, signal)
             if structure_exit_reason:
                 self._close_position_unlocked(position, price, structure_exit_reason)
                 continue
             if _stop_hit(position, price):
-                self._close_position_unlocked(position, price, _stop_exit_reason(position, signal))
+                self._close_position_unlocked(position, price, _stop_exit_reason(position, signal, price, self.settings.execution.taker_fee_rate))
                 continue
             if strong_trend and _strong_trend_invalidated(position, latest_indicator):
-                self._close_position_unlocked(position, price, _outcome_exit_reason(position, price, "strong trend EMA50 structure invalidated"))
+                self._close_position_unlocked(position, price, _outcome_exit_reason(position, price, "strong trend EMA50 structure invalidated", self.settings.execution.taker_fee_rate))
                 continue
             drawdown_exit_reason = _profit_drawdown_exit_reason(position, price, signal, exit_indicator)
             if drawdown_exit_reason:
@@ -683,7 +684,7 @@ class PaperTradingEngine:
                 continue
             risk_exit_reason = _risk_exit_reason(position.side, trend_state, risk_state)
             if risk_exit_reason:
-                self._close_position_unlocked(position, price, _risk_outcome_exit_reason(position, price, risk_exit_reason))
+                self._close_position_unlocked(position, price, _risk_outcome_exit_reason(position, price, risk_exit_reason, self.settings.execution.taker_fee_rate))
                 continue
             if _take_profit_hit(position, price) and not strong_trend:
                 self._close_position_unlocked(position, price, "take profit: target 2 reached")
@@ -1041,6 +1042,7 @@ def _apply_profit_protection(
     price: float,
     signal: dict[str, object],
     indicator: IndicatorSnapshot | None,
+    fee_rate: float = 0.0,
 ) -> None:
     stop_distance = float(position.metadata.get("initial_stop_distance") or abs(position.entry_price - position.stop_price))
     if stop_distance <= 0:
@@ -1051,16 +1053,28 @@ def _apply_profit_protection(
     risk_signal = _profit_risk_signal(signal, indicator)
     if profit_distance >= stop_distance * 1.5:
         lock_distance = stop_distance * (0.55 if risk_signal else 0.4)
+        lock_distance = max(lock_distance, _profit_lock_price_buffer(position, fee_rate))
     elif profit_distance >= stop_distance:
         lock_distance = stop_distance * (0.25 if risk_signal else 0.05)
+        lock_distance = max(lock_distance, _profit_lock_price_buffer(position, fee_rate))
     elif profit_distance >= stop_distance * 0.6:
         lock_distance = -stop_distance * (0.1 if risk_signal else 0.25)
     else:
         return
+    if lock_distance > 0:
+        min_lock = _profit_lock_price_buffer(position, fee_rate)
+        max_lock = profit_distance * 0.85
+        if max_lock < min_lock:
+            return
+        lock_distance = min(max(lock_distance, min_lock), max_lock)
     if position.side == PositionSide.LONG:
         position.stop_price = max(position.stop_price, position.entry_price + lock_distance)
     else:
         position.stop_price = min(position.stop_price, position.entry_price - lock_distance)
+
+
+def _profit_lock_price_buffer(position: Position, fee_rate: float) -> float:
+    return position.entry_price * (max(fee_rate, 0.0) * 2 + PROFIT_LOCK_SLIPPAGE_PCT)
 
 
 def _profit_risk_signal(signal: dict[str, object], indicator: IndicatorSnapshot | None) -> bool:
@@ -1102,29 +1116,46 @@ def _update_position_excursions(position: Position, price: float) -> None:
     position.metadata["max_adverse_distance"] = max(float(position.metadata.get("max_adverse_distance") or 0.0), adverse)
 
 
-def _stop_exit_reason(position: Position, signal: dict[str, object]) -> str:
+def _stop_exit_reason(
+    position: Position,
+    signal: dict[str, object],
+    exit_price: float | None = None,
+    fee_rate: float = 0.0,
+) -> str:
+    reference_price = position.stop_price if exit_price is None else exit_price
     stop_distance = float(position.metadata.get("initial_stop_distance") or abs(position.entry_price - position.stop_price))
     if stop_distance > 0:
         if position.side == PositionSide.LONG and position.stop_price >= position.entry_price:
-            return "take profit: protected stop after profit lock"
+            if _estimated_exit_net_pnl(position, reference_price, fee_rate) > 0:
+                return "take profit: protected stop after profit lock"
+            return "stop loss: protected stop slipped below entry"
         if position.side == PositionSide.SHORT and position.stop_price <= position.entry_price:
-            return "take profit: protected stop after profit lock"
+            if _estimated_exit_net_pnl(position, reference_price, fee_rate) > 0:
+                return "take profit: protected stop after profit lock"
+            return "stop loss: protected stop slipped below entry"
     entry_context = position.metadata.get("entry_context") if isinstance(position.metadata.get("entry_context"), dict) else {}
     if str(entry_context.get("stop_basis") or "") == "15m_precision_structure":
         return "stop loss: 15m entry structure stop"
     if position.metadata.get("breakout_protected"):
-        return _outcome_exit_reason(position, position.stop_price, "breakout protection stop")
+        return _outcome_exit_reason(position, reference_price, "breakout protection stop", fee_rate)
     if _position_structure_failed(position, signal):
         return "stop loss: signal direction or structure failed"
     return "stop loss: ATR volatility hard stop"
 
 
-def _outcome_exit_reason(position: Position, price: float, detail: str) -> str:
-    prefix = "take profit" if _pnl(position.side, position.entry_price, price, position.quantity) > 0 else "stop loss"
+def _outcome_exit_reason(position: Position, price: float, detail: str, fee_rate: float = 0.0) -> str:
+    prefix = "take profit" if _estimated_exit_net_pnl(position, price, fee_rate) > 0 else "stop loss"
     return f"{prefix}: {detail}"
 
 
-def _risk_outcome_exit_reason(position: Position, price: float, risk_reason: str) -> str:
+def _estimated_exit_net_pnl(position: Position, price: float, fee_rate: float = 0.0) -> float:
+    gross = _pnl(position.side, position.entry_price, price, position.quantity)
+    fees = (position.entry_price + price) * abs(position.quantity) * max(fee_rate, 0.0)
+    slippage = price * abs(position.quantity) * PROFIT_LOCK_SLIPPAGE_PCT
+    return gross - fees - slippage
+
+
+def _risk_outcome_exit_reason(position: Position, price: float, risk_reason: str, fee_rate: float = 0.0) -> str:
     detail = risk_reason.replace("risk exit:", "").strip()
     if detail == "LONG_CROWD":
         text = "long crowd risk"
@@ -1136,7 +1167,7 @@ def _risk_outcome_exit_reason(position: Position, price: float, risk_reason: str
         text = "funding overheated risk"
     else:
         text = detail or "risk exit"
-    return _outcome_exit_reason(position, price, text)
+    return _outcome_exit_reason(position, price, text, fee_rate)
 
 
 def _profit_drawdown_exit_reason(
@@ -1569,8 +1600,8 @@ def _signal_entry_timing(signal: dict[str, object]) -> tuple[str, str]:
         return ENTRY_TIMING_BLOCK, "entry timing blocked: not an entry signal"
     price = _float_or_none(signal.get("price"))
     entry_levels = signal.get("entry_levels") if isinstance(signal.get("entry_levels"), dict) else {}
-    if price is None and not entry_levels:
-        return ENTRY_TIMING_GOOD, "legacy signal without entry levels"
+    if not entry_levels:
+        return ENTRY_TIMING_WAIT, "entry timing wait: suggested entry zone unavailable"
     if price is None:
         return ENTRY_TIMING_WAIT, "entry timing wait: latest price unavailable"
     side = PositionSide.LONG if action == SignalAction.ENTRY_LONG.value else PositionSide.SHORT
@@ -1582,30 +1613,19 @@ def _side_entry_timing(side: PositionSide, price: float, signal: dict[str, objec
     risk_state = str(signal.get("risk_state") or "NORMAL")
     trend_state = str(signal.get("trend_state") or signal.get("regime") or "")
     h1 = signal.get("h1_trigger") if isinstance(signal.get("h1_trigger"), dict) else {}
-    h1_pullback = signal.get("h1_pullback") if isinstance(signal.get("h1_pullback"), dict) else {}
     m15_precision = signal.get("m15_precision") if isinstance(signal.get("m15_precision"), dict) else {}
     h1_direction = str(h1.get("direction") or "NONE")
     h1_state = str(h1.get("state") or "UNKNOWN")
-    pullback_direction = str(h1_pullback.get("direction") or "NONE")
-    pullback_state = str(h1_pullback.get("state") or "UNKNOWN")
     if _trend_stage_from_signal(signal) == TREND_STAGE_LATE:
         return ENTRY_TIMING_BLOCK, "entry timing blocked: late trend stage needs a new pullback"
-    if _strong_m15_pullback_allowed(side, trend_state, risk_state, score, m15_precision):
-        return (
-            ENTRY_TIMING_GOOD,
-            "entry timing good: strong one-way 15m pullback/rejection confirmed",
-        )
-    if _entry_level_group_hit(signal, price, side, include_m15=False):
-        return ENTRY_TIMING_GOOD, _entry_zone_reason(side)
-    expected_direction = "LONG" if side == PositionSide.LONG else "SHORT"
-    if pullback_direction == expected_direction and pullback_state in {"HEALTHY_PULLBACK", "HIGH_PULLBACK", "LOW_PULLBACK"}:
-        return ENTRY_TIMING_GOOD, _pullback_reason(side)
-    if h1_direction == expected_direction and h1_state in {"RETEST", "FAKE_BREAKDOWN", "FAKE_BREAKOUT"}:
-        return ENTRY_TIMING_GOOD, _trigger_reason(side)
-    if h1_direction == expected_direction and h1_state in {"BREAKOUT", "BREAKDOWN"}:
-        return ENTRY_TIMING_WAIT, _breakout_wait_reason(side)
     if risk_state in {"LONG_CROWD", "SHORT_CROWD", "OI_ABNORMAL", "FUNDING_HOT"}:
         return ENTRY_TIMING_BLOCK, "entry timing blocked: crowding/OI/funding risk not clean"
+    include_m15 = _strong_m15_pullback_allowed(side, trend_state, risk_state, score, m15_precision)
+    if _entry_level_group_hit(signal, price, side, include_m15=include_m15):
+        return ENTRY_TIMING_GOOD, _entry_zone_reason(side)
+    expected_direction = "LONG" if side == PositionSide.LONG else "SHORT"
+    if h1_direction == expected_direction and h1_state in {"BREAKOUT", "BREAKDOWN"}:
+        return ENTRY_TIMING_WAIT, _breakout_wait_reason(side)
     return ENTRY_TIMING_WAIT, _wait_retest_reason(side)
 
 

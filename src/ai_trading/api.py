@@ -743,6 +743,7 @@ PAPER_DASHBOARD_HTML = """
       'take profit: target 2 reached': '止盈：达到第二止盈目标',
       'take profit: floating profit trailing stop': '止盈：浮盈回撤触发保护',
       'take profit: protected stop after profit lock': '止盈：盈利后保护止损触发',
+      'stop loss: protected stop slipped below entry': '止损：保护止损成交后仍低于开仓价',
       'take profit: breakout protection stop': '止盈：突破保护止损触发',
       'stop loss: breakout protection stop': '止损：突破保护止损触发',
       'stop loss: signal structure failed': '止损：信号结构失效',
