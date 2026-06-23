@@ -352,7 +352,36 @@ PAPER_DASHBOARD_HTML = """
     .center-table th.reason-col { text-align: center; }
     .status { font-size: 12px; color: #6b7280; }
     .pill { display: inline-block; padding: 3px 7px; border-radius: 999px; background: #eef2ff; color: #3730a3; font-size: 12px; }
-    .error { color: #b91c1c; font-size: 13px; min-height: 0; margin: 2px 0 0; }
+    .error { display: none; }
+    .error-ticker {
+      position: fixed;
+      top: 60px;
+      left: 0;
+      right: 0;
+      z-index: 50;
+      display: none;
+      height: 26px;
+      overflow: hidden;
+      pointer-events: none;
+      background: rgba(254, 242, 242, 0.96);
+      border-top: 1px solid #fecaca;
+      border-bottom: 1px solid #fecaca;
+      color: #b91c1c;
+      font-size: 13px;
+      line-height: 26px;
+    }
+    .error-ticker.show { display: block; }
+    .error-ticker-text {
+      display: inline-block;
+      min-width: 100%;
+      padding-left: 100%;
+      white-space: nowrap;
+      animation: error-marquee 15s linear infinite;
+    }
+    @keyframes error-marquee {
+      from { transform: translateX(0); }
+      to { transform: translateX(-100%); }
+    }
     .left-main { flex: 0 0 auto; }
     .left-main label { margin: 6px 0 3px; }
     .left-main input, .left-main select { padding: 7px 10px; }
@@ -412,6 +441,9 @@ PAPER_DASHBOARD_HTML = """
     </div>
     <div class="status" id="updated">loading...</div>
   </header>
+  <div class="error-ticker" id="errorTicker" aria-live="polite">
+    <span class="error-ticker-text" id="errorTickerText"></span>
+  </div>
   <main>
     <section class="grid metrics" id="metrics"></section>
     <section class="grid layout" style="margin-top:14px;">
@@ -1319,12 +1351,36 @@ PAPER_DASHBOARD_HTML = """
     async function closePosition(symbol) {
       await call(() => api('/api/paper/order/close', { method: 'POST', body: JSON.stringify({ symbol: apiSymbol(symbol) }) }));
     }
+    function showError(message) {
+      const text = String(message || '').trim();
+      const ticker = document.getElementById('errorTicker');
+      const tickerText = document.getElementById('errorTickerText');
+      if (!ticker || !tickerText) return;
+      if (!text) {
+        hideError();
+        return;
+      }
+      if (tickerText.textContent !== text) {
+        tickerText.textContent = text;
+        tickerText.style.animation = 'none';
+        void tickerText.offsetWidth;
+        tickerText.style.animation = '';
+      }
+      ticker.classList.add('show');
+    }
+    function hideError() {
+      const ticker = document.getElementById('errorTicker');
+      const tickerText = document.getElementById('errorTickerText');
+      if (!ticker || !tickerText) return;
+      ticker.classList.remove('show');
+      tickerText.textContent = '';
+    }
     async function call(fn) {
-      document.getElementById('error').textContent = '';
-      try { render(await fn()); } catch (err) { document.getElementById('error').textContent = err.message; }
+      hideError();
+      try { render(await fn()); } catch (err) { showError(err.message); }
     }
     async function load() {
-      try { render(await api('/api/paper/status')); } catch (err) { document.getElementById('error').textContent = err.message; }
+      try { render(await api('/api/paper/status')); } catch (err) { showError(err.message); }
     }
     function render(data) {
       const marketAge = data.market_updated_at ? (Date.now() - new Date(data.market_updated_at).getTime()) / 1000 : Infinity;
@@ -1388,7 +1444,8 @@ PAPER_DASHBOARD_HTML = """
       document.getElementById('fills').innerHTML = fillsTable(['币种','方向','杠杆','开仓均价','平仓均价','数量','止损','止盈','收益率','实现盈亏','手续费','开仓时间','平仓时间','出场原因'], fills);
       renderFillsPager(totalFillPages);
       renderDailyPnl(data.daily_pnl);
-      if (data.last_error) document.getElementById('error').textContent = data.last_error;
+      if (data.last_error) showError(data.last_error);
+      else hideError();
       updatePnlHistory(data);
       drawPnlChart();
     }

@@ -418,18 +418,19 @@ class PaperTradingEngine:
         signal_side = "LONG" if signal.action == SignalAction.ENTRY_LONG else "SHORT" if signal.action == SignalAction.ENTRY_SHORT else None
         trend_state = strategy.trend_state(signal_side, indicators)
         risk_state = strategy.risk_state(indicators)
+        current = indicators[-1] if indicators else None
         payload = {
             "timestamp": signal.timestamp.isoformat(),
             "action": signal.action.value,
             "regime": signal.regime.value,
             "trend_state": trend_state,
             "risk_state": risk_state,
-            "rsi14": current.rsi14,
-            "volume_ratio": current.volume_ratio,
-            "oi_change": current.oi_change,
-            "long_short_ratio": current.long_short_ratio,
-            "funding_rate": current.funding_rate,
-            "price": current.close,
+            "rsi14": current.rsi14 if current else None,
+            "volume_ratio": current.volume_ratio if current else None,
+            "oi_change": current.oi_change if current else None,
+            "long_short_ratio": current.long_short_ratio if current else None,
+            "funding_rate": current.funding_rate if current else None,
+            "price": current.close if current else price,
             "score": signal.score,
             "reasons": signal.reasons,
             "vetoes": signal.vetoes,
