@@ -37,6 +37,11 @@ class StrategySettings:
     structure_buffer_atr: float = 0.4
     structure_grind_bars: int = 4
     structure_grind_tolerance_atr: float = 0.8
+    vwap_near_atr: float = 0.45
+    vwap_extension_atr: float = 2.6
+    volume_breakout_ratio: float = 1.3
+    volume_pullback_ratio: float = 0.75
+    volume_restart_ratio: float = 1.15
     sweep_wick_atr: float = 0.9
     wash_oi_drop_min: float = 0.003
     extreme_atr_pct: float = 0.06

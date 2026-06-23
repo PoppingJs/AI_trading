@@ -288,6 +288,15 @@ class CompositeStrategy:
                 score += 15
                 reasons.append("close confirmed near EMA20/BOLL mid without chasing upper band")
 
+        latest_candle = candles[-1]
+        if current.vwap is not None and current.atr14 is not None and current.atr14 > 0:
+            if latest_candle.low <= current.vwap + current.atr14 * self.settings.vwap_near_atr and current.close >= current.vwap:
+                score += 6
+                reasons.append("VWAP pullback held; average cost support favors long")
+            elif current.close > current.vwap + current.atr14 * self.settings.vwap_extension_atr:
+                score -= 6
+                reasons.append("price extended far above VWAP; chasing long risk")
+
         if structure.long_confirmed:
             score += 12
             reasons.append("market structure confirms long: breakout or retest held")
@@ -295,6 +304,11 @@ class CompositeStrategy:
         if structure.long_breakout_after_grind:
             score += 10
             reasons.append("market structure: resistance grind broke upward, shorts may be squeezed")
+
+        volume_score, volume_reason = _volume_breakout_retest_confirmation(candles, indicators, structure, "LONG", self.settings)
+        if volume_reason:
+            score += volume_score
+            reasons.append(volume_reason)
 
         if _long_washout_confirmed(candles[-1], current, structure, self.settings):
             score += 14
@@ -369,6 +383,15 @@ class CompositeStrategy:
                 score += 15
                 reasons.append("close confirmed failed retest near EMA20/BOLL mid")
 
+        latest_candle = candles[-1]
+        if current.vwap is not None and current.atr14 is not None and current.atr14 > 0:
+            if latest_candle.high >= current.vwap - current.atr14 * self.settings.vwap_near_atr and current.close <= current.vwap:
+                score += 6
+                reasons.append("VWAP retest rejected; average cost resistance favors short")
+            elif current.close < current.vwap - current.atr14 * self.settings.vwap_extension_atr:
+                score -= 6
+                reasons.append("price extended far below VWAP; chasing short risk")
+
         if structure.short_confirmed:
             score += 12
             reasons.append("market structure confirms short: breakdown or retest failed")
@@ -376,6 +399,11 @@ class CompositeStrategy:
         if structure.short_breakdown_after_grind:
             score += 10
             reasons.append("market structure: support grind broke downward, longs may be liquidated")
+
+        volume_score, volume_reason = _volume_breakout_retest_confirmation(candles, indicators, structure, "SHORT", self.settings)
+        if volume_reason:
+            score += volume_score
+            reasons.append(volume_reason)
 
         if _short_washout_confirmed(candles[-1], current, structure, self.settings):
             score += 14
@@ -425,8 +453,6 @@ class CompositeStrategy:
         vetoes: list[str] = []
         if _atr_pct(current) >= self.settings.extreme_atr_pct:
             vetoes.append("extreme volatility: skip new long entry")
-        if current.rsi14 is not None and current.rsi14 > 75:
-            vetoes.append("RSI overheated for long entry")
         if current.long_short_ratio is not None and current.long_short_ratio >= self.settings.long_short_overcrowded_long:
             vetoes.append("long side overcrowded")
         if current.funding_rate is not None and current.funding_rate >= self.settings.funding_hot_long:
@@ -466,8 +492,6 @@ class CompositeStrategy:
         vetoes: list[str] = []
         if _atr_pct(current) >= self.settings.extreme_atr_pct:
             vetoes.append("extreme volatility: skip new short entry")
-        if current.rsi14 is not None and current.rsi14 < 25:
-            vetoes.append("RSI oversold for short entry")
         if current.long_short_ratio is not None and current.long_short_ratio <= self.settings.long_short_overcrowded_short:
             vetoes.append("short side overcrowded")
         if current.funding_rate is not None and current.funding_rate <= self.settings.funding_hot_short:
@@ -574,6 +598,92 @@ def _grinding_near_support(candles: Sequence[Candle], support: float, tolerance:
     touches = sum(1 for candle in candles if support - tolerance <= candle.low <= support + tolerance or support - tolerance <= candle.close <= support + tolerance)
     closes_above = sum(1 for candle in candles if candle.close >= support - tolerance)
     return touches >= max(2, len(candles) // 2) and closes_above >= len(candles) - 1
+
+
+def _volume_breakout_retest_confirmation(
+    candles: Sequence[Candle],
+    indicators: Sequence[IndicatorSnapshot],
+    structure: MarketStructure,
+    side: str,
+    settings: StrategySettings,
+) -> tuple[int, str | None]:
+    if len(candles) < 8 or len(indicators) < 8:
+        return 0, None
+    current = candles[-1]
+    previous = candles[-2]
+    current_indicator = indicators[-1]
+    atr = current_indicator.atr14
+    if atr is None or atr <= 0:
+        return 0, None
+    buffer = atr * settings.structure_buffer_atr
+    recent_start = max(1, len(candles) - 8)
+
+    if side == "LONG":
+        breakout: tuple[int, float, float] | None = None
+        for idx in range(recent_start, len(candles) - 1):
+            prior_window = candles[max(0, idx - settings.structure_lookback) : idx]
+            if not prior_window:
+                continue
+            level = max(item.high for item in prior_window)
+            ratio = indicators[idx].volume_ratio or 0.0
+            if candles[idx].close > level + buffer and ratio >= settings.volume_breakout_ratio:
+                breakout = (idx, ratio, level)
+        if breakout is None:
+            level = structure.resistance
+            if (
+                level is not None
+                and current.close > level + buffer
+                and (current_indicator.volume_ratio or 0.0) >= settings.volume_breakout_ratio
+            ):
+                return 6, "volume breakout above resistance; retest confirmation preferred"
+            return 0, None
+        breakout_idx, breakout_ratio, level = breakout
+        pullback_held = any(
+            candles[idx].low <= level + buffer * 1.25
+            and candles[idx].close >= level - buffer
+            and (indicators[idx].volume_ratio or 0.0) <= breakout_ratio * settings.volume_pullback_ratio
+            for idx in range(breakout_idx + 1, len(candles) - 1)
+        )
+        restart_volume = (current_indicator.volume_ratio or 0.0) >= settings.volume_restart_ratio
+        restart_up = current.close > max(previous.close, level)
+        if pullback_held and restart_volume and restart_up:
+            return 14, "volume pattern confirms long: breakout volume, quiet retest, renewed buying"
+        if pullback_held:
+            return 0, "breakout retest held quietly; waiting renewed buying volume"
+        return 0, None
+
+    breakdown: tuple[int, float, float] | None = None
+    for idx in range(recent_start, len(candles) - 1):
+        prior_window = candles[max(0, idx - settings.structure_lookback) : idx]
+        if not prior_window:
+            continue
+        level = min(item.low for item in prior_window)
+        ratio = indicators[idx].volume_ratio or 0.0
+        if candles[idx].close < level - buffer and ratio >= settings.volume_breakout_ratio:
+            breakdown = (idx, ratio, level)
+    if breakdown is None:
+        level = structure.support
+        if (
+            level is not None
+            and current.close < level - buffer
+            and (current_indicator.volume_ratio or 0.0) >= settings.volume_breakout_ratio
+        ):
+            return 6, "volume breakdown below support; retest confirmation preferred"
+        return 0, None
+    breakdown_idx, breakdown_ratio, level = breakdown
+    retest_rejected = any(
+        candles[idx].high >= level - buffer * 1.25
+        and candles[idx].close <= level + buffer
+        and (indicators[idx].volume_ratio or 0.0) <= breakdown_ratio * settings.volume_pullback_ratio
+        for idx in range(breakdown_idx + 1, len(candles) - 1)
+    )
+    restart_volume = (current_indicator.volume_ratio or 0.0) >= settings.volume_restart_ratio
+    restart_down = current.close < min(previous.close, level)
+    if retest_rejected and restart_volume and restart_down:
+        return 14, "volume pattern confirms short: breakdown volume, quiet retest, renewed selling"
+    if retest_rejected:
+        return 0, "breakdown retest rejected quietly; waiting renewed selling volume"
+    return 0, None
 
 
 def _sweep_veto(candle: Candle, indicator: IndicatorSnapshot, *, side: str, settings: StrategySettings) -> str | None:

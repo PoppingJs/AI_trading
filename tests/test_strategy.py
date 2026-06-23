@@ -6,10 +6,10 @@ from datetime import UTC, datetime, timedelta
 from ai_trading.config import StrategySettings
 from ai_trading.indicators import build_indicators
 from ai_trading.models import Candle, DerivativesSnapshot, SignalAction
-from ai_trading.strategy import CompositeStrategy
+from ai_trading.strategy import CompositeStrategy, MarketStructure, _volume_breakout_retest_confirmation
 
 
-def test_strategy_blocks_overheated_long() -> None:
+def test_strategy_defers_overheated_rsi_to_multi_timeframe_context() -> None:
     candles, derivatives = _trending_market()
     indicators = build_indicators(candles, derivatives)
     current = indicators[-1]
@@ -24,7 +24,7 @@ def test_strategy_blocks_overheated_long() -> None:
     signal = CompositeStrategy().generate_signal("BTCUSDT", candles, indicators)
 
     assert signal.action == SignalAction.NO_TRADE
-    assert "RSI overheated for long entry" in signal.vetoes
+    assert "RSI overheated for long entry" not in signal.vetoes
     assert "long side overcrowded" in signal.vetoes
 
 
@@ -95,6 +95,30 @@ def test_strategy_rewards_market_structure_breakout() -> None:
     assert "market structure confirms long: breakout or retest held" in signal.reasons
 
 
+def test_strategy_rewards_vwap_pullback_as_score_not_filter() -> None:
+    candles, derivatives = _trending_market()
+    indicators = build_indicators(candles, derivatives)
+    settings = StrategySettings(score_threshold=999, watch_threshold=1, strict_trend_entry=False)
+    previous_score = CompositeStrategy(settings).generate_signal("BTCUSDT", candles, indicators).score
+    candles[-1] = replace(candles[-1], low=118.8, close=120.0)
+    current = indicators[-1]
+    indicators[-1] = replace(
+        current,
+        close=120.0,
+        vwap=119.1,
+        atr14=2.0,
+        rsi14=58,
+        long_short_ratio=1.2,
+        funding_rate=0.0001,
+    )
+
+    score, reasons, vetoes = CompositeStrategy(settings)._score_long(candles, indicators)
+
+    assert score > 0
+    assert "VWAP pullback held; average cost support favors long" in reasons
+    assert "VWAP pullback held; average cost support favors long" not in vetoes
+
+
 def test_strategy_rewards_resistance_grind_breakout_short_squeeze() -> None:
     candles, derivatives = _trending_market()
     indicators = build_indicators(candles, derivatives)
@@ -118,6 +142,44 @@ def test_strategy_rewards_resistance_grind_breakout_short_squeeze() -> None:
     signal = CompositeStrategy(settings).generate_signal("BTCUSDT", candles, indicators)
 
     assert "market structure: resistance grind broke upward, shorts may be squeezed" in signal.reasons
+
+
+def test_strategy_rewards_volume_breakout_quiet_retest_and_restart() -> None:
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    candles: list[Candle] = []
+    derivatives: list[DerivativesSnapshot] = []
+    oi = 10_000.0
+    for idx in range(60):
+        timestamp = start + timedelta(minutes=15 * idx)
+        candles.append(Candle(timestamp=timestamp, open=100.0, high=100.5, low=99.5, close=100.0, volume=1_000))
+        oi += 10
+        derivatives.append(DerivativesSnapshot(timestamp=timestamp, open_interest=oi, long_short_ratio=1.1, funding_rate=0.0001))
+
+    breakout_idx = len(candles) - 8
+    candles[breakout_idx] = replace(candles[breakout_idx], open=100.2, high=102.2, low=100.1, close=101.6, volume=3_000)
+    for offset in range(7, 1, -1):
+        idx = len(candles) - offset
+        candles[idx] = replace(candles[idx], open=101.2, high=101.5, low=100.7, close=101.0, volume=800)
+    candles[-1] = replace(candles[-1], open=101.0, high=102.5, low=100.8, close=102.1, volume=3_200)
+    indicators = build_indicators(candles, derivatives)
+    settings = StrategySettings(score_threshold=999, watch_threshold=1, strict_trend_entry=False)
+    indicators = list(indicators)
+    indicators[breakout_idx] = replace(indicators[breakout_idx], atr14=1.0, volume_ratio=1.6)
+    for offset in range(7, 1, -1):
+        idx = len(candles) - offset
+        indicators[idx] = replace(indicators[idx], atr14=1.0, volume_ratio=0.7)
+    indicators[-1] = replace(indicators[-1], atr14=1.0, volume_ratio=1.3)
+
+    score, reason = _volume_breakout_retest_confirmation(
+        candles,
+        indicators,
+        MarketStructure(resistance=100.5),
+        "LONG",
+        settings,
+    )
+
+    assert score == 14
+    assert reason == "volume pattern confirms long: breakout volume, quiet retest, renewed buying"
 
 
 def test_strategy_rewards_washout_with_oi_drop_and_key_level_reclaim() -> None:

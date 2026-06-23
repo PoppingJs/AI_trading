@@ -17,10 +17,13 @@ from ai_trading.paper import (
     _confirmed_structure_exit_reason,
     _daily_bias_margin_factor,
     _daily_pnl_payload,
+    _entry_reward_r,
     _leverage_for_signal,
     _margin_for_signal,
     _ma_cluster_signal_adjustment,
     _pnl_history_payload,
+    _profit_drawdown_exit_reason,
+    _preferred_exit_indicator,
     _protect_confirmed_breakout_position,
     _precision_stop_allowed,
     _refine_stop_with_ma_cluster,
@@ -29,7 +32,10 @@ from ai_trading.paper import (
     _pyramid_allowed,
     _rotation_candidate_allowed,
     _risk_exit_reason,
+    _signal_entry_timing,
     _stop_exit_reason,
+    _structure_take_profit_reason,
+    _update_position_excursions,
 )
 
 
@@ -167,6 +173,7 @@ def test_auto_leverage_scales_with_signal_score() -> None:
     assert _leverage_for_signal(78, 10, "TREND_LONG") == 5
     assert _leverage_for_signal(75, 10) == 5
     assert _leverage_for_signal(95, 7, "ONE_WAY_DOWN") == 7
+    assert _leverage_for_signal(110, 10, "ONE_WAY_UP", trend_stage="LATE") == 5
 
 
 def test_adaptive_exits_expand_profit_targets_by_trend_state() -> None:
@@ -304,11 +311,47 @@ def test_stop_exit_reason_explicitly_marks_stop_or_take_profit() -> None:
     position.entry_price = 100.0
     position.stop_price = 100.4
 
-    assert _stop_exit_reason(position, {}) == "take profit: floating profit trailing stop"
+    assert _stop_exit_reason(position, {}) == "take profit: protected stop after profit lock"
 
     position.stop_price = 96.0
-    assert _stop_exit_reason(position, {"action": "ENTRY_SHORT", "trend_state": "ONE_WAY_DOWN"}) == "stop loss: signal structure failed"
+    assert _stop_exit_reason(position, {"action": "ENTRY_SHORT", "trend_state": "ONE_WAY_DOWN"}) == "stop loss: signal direction or structure failed"
     assert _stop_exit_reason(position, {"action": "WATCH", "trend_state": "TREND_LONG", "score": 80}) == "stop loss: ATR volatility hard stop"
+    position.metadata["entry_context"] = {"stop_basis": "15m_precision_structure"}
+    assert _stop_exit_reason(position, {"action": "WATCH", "trend_state": "TREND_LONG", "score": 80}) == "stop loss: 15m entry structure stop"
+
+
+def test_profit_drawdown_exit_protects_winning_position_with_risk_signal() -> None:
+    position = asyncio.run(PaperTradingEngine(AppSettings(), starting_balance=1000, market_data=FakeMarketData()).open_position("TESTUSDT", "LONG", margin_usdt=100, leverage=5))
+    position.entry_price = 100.0
+    position.stop_price = 96.0
+    position.metadata["initial_stop_distance"] = 4.0
+    _update_position_excursions(position, 108.0)
+    _update_position_excursions(position, 104.5)
+
+    reason = _profit_drawdown_exit_reason(
+        position,
+        104.5,
+        {"risk_state": "OI_ABNORMAL", "trend_state": "ONE_WAY_UP"},
+        indicator_snapshot(close=104.5, atr=1.0),
+    )
+
+    assert reason == "take profit: profit drawdown after OI abnormal risk"
+
+
+def test_structure_take_profit_near_4h_level() -> None:
+    position = asyncio.run(PaperTradingEngine(AppSettings(), starting_balance=1000, market_data=FakeMarketData()).open_position("TESTUSDT", "LONG", margin_usdt=100, leverage=5))
+    position.entry_price = 100.0
+    position.stop_price = 96.0
+    position.metadata["initial_stop_distance"] = 4.0
+
+    reason = _structure_take_profit_reason(
+        position,
+        104.9,
+        {"h4_structure": {"resistance": 105.0}, "risk_state": "NORMAL"},
+        indicator_snapshot(close=104.9, atr=0.5),
+    )
+
+    assert reason == "take profit: near 4h resistance with profit protection"
 
 
 def test_risk_exit_reason_is_specific_to_one_way_position_risk() -> None:
@@ -336,9 +379,9 @@ def test_auto_top30_universe_refreshes_symbols() -> None:
 
 def test_auto_signal_score_tiers_and_margins() -> None:
     assert _auto_signal_allowed({"score": 85, "risk_state": "LONG_CROWD"})
-    assert _auto_signal_allowed({"score": 78, "risk_state": "FUNDING_HOT"})
-    assert _auto_signal_allowed({"score": 76, "risk_state": "NORMAL"})
-    assert not _auto_signal_allowed({"score": 76, "risk_state": "LONG_CROWD"})
+    assert _auto_signal_allowed({"score": 82, "risk_state": "NORMAL"})
+    assert not _auto_signal_allowed({"score": 78, "risk_state": "FUNDING_HOT"})
+    assert not _auto_signal_allowed({"score": 81, "risk_state": "NORMAL"})
     assert not _auto_signal_allowed({"score": 74, "risk_state": "NORMAL"})
     assert not _auto_signal_allowed({"score": 90, "risk_state": "NORMAL", "vetoes": ("1h trigger opposes long entry",)})
 
@@ -347,6 +390,82 @@ def test_auto_signal_score_tiers_and_margins() -> None:
     assert _margin_for_signal(76, 1000) == 180
     assert _margin_for_signal(90, 1000, 950, 5) == 190
     assert _margin_for_signal(76, 1000, 950, 5) == 180
+
+
+def test_auto_signal_requires_real_entry_zone_for_ordinary_short() -> None:
+    mid_zone_short = {
+        "action": "ENTRY_SHORT",
+        "score": 108,
+        "trend_state": "TREND_SHORT",
+        "risk_state": "NORMAL",
+        "price": 254.0,
+        "entry_levels": {
+            "short": {
+                "h1_resistance": {"low": 260.0, "high": 262.0, "price": 261.0},
+                "h1_ema20_ema60": {"low": 260.0, "high": 262.0, "price": 261.0},
+            }
+        },
+    }
+    timing, reason = _signal_entry_timing(mid_zone_short)
+
+    assert timing == "WAIT"
+    assert "resistance" in reason
+    assert not _auto_signal_allowed(mid_zone_short)
+
+    resistance_retest = {**mid_zone_short, "price": 261.0}
+    timing, reason = _signal_entry_timing(resistance_retest)
+
+    assert timing == "GOOD"
+    assert "resistance" in reason
+    assert _auto_signal_allowed(resistance_retest)
+
+
+def test_auto_signal_blocks_late_stage_fresh_entry() -> None:
+    late_long = {
+        "action": "ENTRY_LONG",
+        "score": 120,
+        "trend_state": "ONE_WAY_UP",
+        "risk_state": "NORMAL",
+        "price": 100.0,
+        "rsi14": 93.0,
+        "entry_levels": {"long": {"h1_support": {"low": 99.0, "high": 101.0, "price": 100.0}}},
+    }
+
+    timing, reason = _signal_entry_timing(late_long)
+
+    assert timing == "BLOCK"
+    assert "late trend" in reason
+    assert not _auto_signal_allowed(late_long)
+
+
+def test_entry_reward_r_requires_enough_target_space() -> None:
+    signal = {
+        "h1_structure": {
+            "resistance_zone_low": 101.0,
+            "resistance": 101.2,
+            "resistance_zone_high": 101.4,
+        }
+    }
+
+    assert _entry_reward_r(signal, PositionSide.LONG, price=100.0, stop=99.0) == 1.0
+    assert _entry_reward_r(signal, PositionSide.LONG, price=100.0, stop=99.5) == 2.0
+
+
+def test_auto_signal_allows_strong_one_way_15m_tactical_short() -> None:
+    signal = {
+        "action": "ENTRY_SHORT",
+        "score": 96,
+        "trend_state": "ONE_WAY_DOWN",
+        "risk_state": "NORMAL",
+        "price": 254.0,
+        "m15_precision": {"pullback": "M15_SHORT_PULLBACK", "short_stop_anchor": 263.0},
+        "entry_levels": {"short": {"h1_resistance": {"low": 260.0, "high": 262.0, "price": 261.0}}},
+    }
+    timing, reason = _signal_entry_timing(signal)
+
+    assert timing == "GOOD"
+    assert "15m" in reason
+    assert _auto_signal_allowed(signal)
 
 
 def test_multi_timeframe_context_adjusts_score_veto_and_margin() -> None:
@@ -462,6 +581,85 @@ def test_one_way_high_area_allows_15m_boll_ema9_pullback() -> None:
     assert "one-way uptrend 15m BOLL/EMA9 pullback confirmed; allow tactical long" in adjusted["reasons"]
     assert adjusted["m15_precision"]["long_stop_anchor"] == 97.2
     assert _auto_signal_allowed(adjusted)
+
+
+def test_normal_rsi_overheated_waits_for_1h_4h_pullback() -> None:
+    signal = {
+        "action": "ENTRY_LONG",
+        "score": 95,
+        "trend_state": "TREND_LONG",
+        "risk_state": "NORMAL",
+        "rsi14": 82,
+        "reasons": (),
+        "vetoes": (),
+    }
+    context = {
+        "daily_bias": "BULL",
+        "h4_structure": {"state": "BOX_LOWER_HALF"},
+        "h1_trigger": {"direction": "NONE", "state": "WAIT"},
+        "h1_pullback": {"direction": "NONE", "state": "WAIT"},
+        "summary": "MTF: test",
+    }
+
+    adjusted = _apply_multi_timeframe_context(signal, context)
+
+    assert "normal/chop trend RSI overheated; wait for 1h/4h pullback before long" in adjusted["vetoes"]
+    assert not _auto_signal_allowed(adjusted)
+
+
+def test_one_way_hot_rsi_requires_1h_or_15m_pullback() -> None:
+    signal = {
+        "action": "ENTRY_LONG",
+        "score": 96,
+        "trend_state": "ONE_WAY_UP",
+        "risk_state": "NORMAL",
+        "rsi14": 88,
+        "reasons": (),
+        "vetoes": (),
+    }
+    no_pullback_context = {
+        "daily_bias": "BULL",
+        "h4_structure": {"state": "BOX_LOWER_HALF"},
+        "h1_trigger": {"direction": "NONE", "state": "WAIT"},
+        "h1_pullback": {"direction": "NONE", "state": "WAIT"},
+        "summary": "MTF: test",
+    }
+    pullback_context = {
+        **no_pullback_context,
+        "m15_precision": {"pullback": "M15_LONG_PULLBACK", "long_stop_anchor": 97.2},
+    }
+
+    blocked = _apply_multi_timeframe_context(signal, no_pullback_context)
+    allowed = _apply_multi_timeframe_context(signal, pullback_context)
+
+    assert "one-way uptrend RSI hot without 1h/15m pullback; wait before long" in blocked["vetoes"]
+    assert not _auto_signal_allowed(blocked)
+    assert "one-way uptrend RSI hot, but 1h/15m pullback confirmed" in allowed["reasons"]
+    assert _auto_signal_allowed(allowed)
+
+
+def test_one_way_extreme_rsi_blocks_fresh_continuation_entry() -> None:
+    signal = {
+        "action": "ENTRY_SHORT",
+        "score": 105,
+        "trend_state": "ONE_WAY_DOWN",
+        "risk_state": "NORMAL",
+        "rsi14": 7,
+        "reasons": (),
+        "vetoes": (),
+    }
+    context = {
+        "daily_bias": "BEAR",
+        "h4_structure": {"state": "BOX_UPPER_HALF"},
+        "h1_trigger": {"direction": "NONE", "state": "WAIT"},
+        "h1_pullback": {"direction": "SHORT", "state": "HEALTHY_PULLBACK"},
+        "summary": "MTF: test",
+    }
+
+    adjusted = _apply_multi_timeframe_context(signal, context)
+
+    assert "one-way downtrend RSI below 8; skip fresh short and protect existing profit" in adjusted["vetoes"]
+    assert not _auto_signal_allowed(adjusted)
 
 
 def test_ma_cluster_breakout_scores_and_dense_waits() -> None:
@@ -636,7 +834,18 @@ def test_oi_deleverage_breakdown_improves_short_after_failed_bounce() -> None:
 
 def test_fifteen_minute_precision_refines_stop_outside_anchor() -> None:
     assert _refine_stop_with_precision(PositionSide.LONG, 98.0, {"long_stop_anchor": 97.2}) == 97.2
+    assert _refine_stop_with_precision(PositionSide.LONG, 95.0, {"long_stop_anchor": 97.2}) == 97.2
     assert _refine_stop_with_precision(PositionSide.SHORT, 102.0, {"short_stop_anchor": 103.1}) == 103.1
+    assert _refine_stop_with_precision(PositionSide.SHORT, 105.0, {"short_stop_anchor": 103.1}) == 103.1
+
+
+def test_preferred_exit_indicator_uses_1h_4h_not_15m_for_targets() -> None:
+    m15 = indicator_snapshot(close=99.0, atr=0.4)
+    h1 = indicator_snapshot(close=100.0, atr=1.2)
+    h4 = indicator_snapshot(close=101.0, atr=2.0)
+
+    assert _preferred_exit_indicator({"15m": [m15], "1h": [h1], "4h": [h4]}, [m15]) is h1
+    assert _preferred_exit_indicator({"15m": [m15], "4h": [h4]}, [m15]) is h4
 
 
 def test_rotation_candidate_requires_one_way_volatility_and_clean_risk() -> None:
@@ -648,12 +857,18 @@ def test_rotation_candidate_requires_one_way_volatility_and_clean_risk() -> None
     assert not _rotation_candidate_allowed({**good, "risk_state": "LONG_CROWD"}, indicator_snapshot())
     assert not _rotation_candidate_allowed(good, indicator_snapshot(close=100.0, atr=0.5, volume_ratio=1.5))
     assert not _rotation_candidate_allowed(good, indicator_snapshot(close=100.0, atr=1.0, volume_ratio=1.0))
+    wait_for_pullback = {
+        **good,
+        "price": 110.0,
+        "entry_levels": {"long": {"h1_support": {"low": 99.0, "high": 101.0, "price": 100.0}}},
+    }
+    assert not _rotation_candidate_allowed(wait_for_pullback, indicator_snapshot(close=100.0, atr=1.0, volume_ratio=1.5))
 
 
 def test_auto_trade_caps_positions_and_prefers_highest_scores() -> None:
     engine = PaperTradingEngine(AppSettings(), starting_balance=1000, market_data=FakeMarketData())
     engine.latest_prices = {f"TEST{idx}USDT": 100.0 for idx in range(6)}
-    for idx, score in enumerate([75, 92, 81, 88, 79, 95]):
+    for idx, score in enumerate([81, 92, 82, 88, 83, 95]):
         engine.latest_signals[f"TEST{idx}USDT"] = {
             "action": "ENTRY_LONG",
             "score": score,

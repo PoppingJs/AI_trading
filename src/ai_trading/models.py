@@ -62,6 +62,7 @@ class IndicatorSnapshot:
     volume_sma20: float | None
     volume_ratio: float | None
     ema50_slope: float | None
+    vwap: float | None = None
     open_interest: float | None = None
     oi_change: float | None = None
     long_short_ratio: float | None = None

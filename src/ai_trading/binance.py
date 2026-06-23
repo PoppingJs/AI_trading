@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 from datetime import UTC, datetime
+import os
 from typing import Any
 
 import httpx
@@ -10,7 +11,7 @@ import httpx
 from ai_trading.models import Candle, DerivativesSnapshot
 
 
-FAPI_BASE_URL = "https://fapi.binance.com"
+FAPI_BASE_URL = os.getenv("BINANCE_BASE_URL", "https://fapi.binance.com")
 
 
 class BinanceMarketDataError(RuntimeError):

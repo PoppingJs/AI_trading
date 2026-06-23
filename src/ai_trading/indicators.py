@@ -132,9 +132,21 @@ def build_indicators(
 
     derivatives_by_time = {item.timestamp: item for item in derivatives or []}
     previous_oi: float | None = None
+    vwap_day = None
+    vwap_price_volume = 0.0
+    vwap_volume = 0.0
     out: list[IndicatorSnapshot] = []
 
     for idx, candle in enumerate(candles):
+        candle_day = candle.timestamp.date()
+        if candle_day != vwap_day:
+            vwap_day = candle_day
+            vwap_price_volume = 0.0
+            vwap_volume = 0.0
+        typical_price = (candle.high + candle.low + candle.close) / 3
+        vwap_price_volume += typical_price * candle.volume
+        vwap_volume += candle.volume
+        vwap_value = vwap_price_volume / vwap_volume if vwap_volume else None
         volume_average = volume_sma[idx]
         volume_ratio = candle.volume / volume_average if volume_average else None
         ema_slow_value = ema_slow_values[idx]
@@ -172,6 +184,7 @@ def build_indicators(
                 volume_sma20=volume_average,
                 volume_ratio=volume_ratio,
                 ema50_slope=ema_slope,
+                vwap=vwap_value,
                 open_interest=open_interest,
                 oi_change=oi_change,
                 long_short_ratio=long_short_ratio,
