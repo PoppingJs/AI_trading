@@ -1561,8 +1561,12 @@ def _signal_entry_timing(signal: dict[str, object]) -> tuple[str, str]:
     if stored in {ENTRY_TIMING_GOOD, ENTRY_TIMING_WAIT, ENTRY_TIMING_BLOCK}:
         return stored, str(signal.get("entry_timing_reason") or "")
     action = str(signal.get("action") or "")
+    if action == SignalAction.WATCH.value:
+        return ENTRY_TIMING_WAIT, "entry timing wait: watch signal needs entry confirmation"
+    if action == SignalAction.NO_TRADE.value:
+        return ENTRY_TIMING_BLOCK, "entry timing blocked: no trade signal"
     if action not in {SignalAction.ENTRY_LONG.value, SignalAction.ENTRY_SHORT.value}:
-        return ENTRY_TIMING_GOOD, "entry timing not required"
+        return ENTRY_TIMING_BLOCK, "entry timing blocked: not an entry signal"
     price = _float_or_none(signal.get("price"))
     entry_levels = signal.get("entry_levels") if isinstance(signal.get("entry_levels"), dict) else {}
     if price is None and not entry_levels:

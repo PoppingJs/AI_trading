@@ -8,7 +8,7 @@ from fastapi.testclient import TestClient
 
 from ai_trading.api import create_app
 from ai_trading.config import AppSettings
-from ai_trading.models import Candle, IndicatorSnapshot, PositionSide
+from ai_trading.models import Candle, IndicatorSnapshot, PositionSide, SignalAction
 from ai_trading.paper import (
     PaperTradingEngine,
     _adaptive_exits,
@@ -378,12 +378,14 @@ def test_auto_top30_universe_refreshes_symbols() -> None:
 
 
 def test_auto_signal_score_tiers_and_margins() -> None:
-    assert _auto_signal_allowed({"score": 85, "risk_state": "LONG_CROWD"})
-    assert _auto_signal_allowed({"score": 82, "risk_state": "NORMAL"})
-    assert not _auto_signal_allowed({"score": 78, "risk_state": "FUNDING_HOT"})
-    assert not _auto_signal_allowed({"score": 81, "risk_state": "NORMAL"})
-    assert not _auto_signal_allowed({"score": 74, "risk_state": "NORMAL"})
-    assert not _auto_signal_allowed({"score": 90, "risk_state": "NORMAL", "vetoes": ("1h trigger opposes long entry",)})
+    base_signal = {"action": SignalAction.ENTRY_LONG.value}
+    assert not _auto_signal_allowed({**base_signal, "score": 85, "risk_state": "LONG_CROWD"})
+    assert _auto_signal_allowed({**base_signal, "score": 82, "risk_state": "NORMAL"})
+    assert not _auto_signal_allowed({**base_signal, "score": 78, "risk_state": "FUNDING_HOT"})
+    assert not _auto_signal_allowed({**base_signal, "score": 81, "risk_state": "NORMAL"})
+    assert not _auto_signal_allowed({**base_signal, "score": 74, "risk_state": "NORMAL"})
+    assert not _auto_signal_allowed({**base_signal, "score": 90, "risk_state": "NORMAL", "vetoes": ("1h trigger opposes long entry",)})
+    assert not _auto_signal_allowed({"score": 90, "risk_state": "NORMAL"})
 
     assert _margin_for_signal(90, 1000) == 280
     assert _margin_for_signal(80, 1000) == 230
@@ -418,6 +420,43 @@ def test_auto_signal_requires_real_entry_zone_for_ordinary_short() -> None:
     assert timing == "GOOD"
     assert "resistance" in reason
     assert _auto_signal_allowed(resistance_retest)
+
+
+def test_entry_timing_turns_good_when_price_reaches_suggested_zone() -> None:
+    signal = {
+        "action": SignalAction.ENTRY_LONG.value,
+        "score": 96,
+        "trend_state": "TREND_LONG",
+        "risk_state": "NORMAL",
+        "price": 106.0,
+        "entry_levels": {
+            "long": {
+                "h1_support": {"low": 99.0, "high": 101.0, "price": 100.0},
+                "h1_boll_mid": {"low": 99.5, "high": 100.5, "price": 100.0},
+            }
+        },
+    }
+
+    timing, reason = _signal_entry_timing(signal)
+    assert timing == "WAIT"
+    assert "support" in reason
+    assert not _auto_signal_allowed(signal)
+
+    signal["price"] = 100.2
+    timing, reason = _signal_entry_timing(signal)
+    assert timing == "GOOD"
+    assert "entry zone" in reason
+    assert _auto_signal_allowed(signal)
+
+
+def test_non_entry_signal_timing_is_not_excellent() -> None:
+    timing, reason = _signal_entry_timing({"action": SignalAction.WATCH.value, "score": 90})
+    assert timing == "WAIT"
+    assert "watch signal" in reason
+
+    timing, reason = _signal_entry_timing({"action": SignalAction.NO_TRADE.value, "score": 90})
+    assert timing == "BLOCK"
+    assert "no trade signal" in reason
 
 
 def test_auto_signal_blocks_late_stage_fresh_entry() -> None:
