@@ -298,12 +298,13 @@ def test_confirmed_structure_exit_uses_1h_4h_body_break_not_m15_noise() -> None:
 
 
 def test_precision_stop_only_allowed_for_strong_m15_tactical_pullback() -> None:
-    precision = {"pullback": "M15_LONG_PULLBACK", "long_stop_anchor": 97.2}
+    precision = {"pullback": "M15_LONG_PULLBACK", "long_stop_anchor": 97.2, "trend": "UP"}
 
     assert _precision_stop_allowed(PositionSide.LONG, "ONE_WAY_UP", "NORMAL", 90, precision)
     assert not _precision_stop_allowed(PositionSide.LONG, "TREND_LONG", "NORMAL", 90, precision)
     assert not _precision_stop_allowed(PositionSide.LONG, "ONE_WAY_UP", "LONG_CROWD", 90, precision)
     assert not _precision_stop_allowed(PositionSide.LONG, "ONE_WAY_UP", "NORMAL", 80, precision)
+    assert not _precision_stop_allowed(PositionSide.LONG, "ONE_WAY_UP", "NORMAL", 90, {**precision, "trend": "CHOP"})
 
 
 def test_stop_exit_reason_explicitly_marks_stop_or_take_profit() -> None:
@@ -502,7 +503,7 @@ def test_auto_signal_allows_strong_one_way_15m_tactical_short() -> None:
         "trend_state": "ONE_WAY_DOWN",
         "risk_state": "NORMAL",
         "price": 254.0,
-        "m15_precision": {"pullback": "M15_SHORT_PULLBACK", "short_stop_anchor": 263.0},
+        "m15_precision": {"pullback": "M15_SHORT_PULLBACK", "short_stop_anchor": 263.0, "trend": "DOWN"},
         "entry_levels": {
             "short": {
                 "h1_resistance": {"low": 260.0, "high": 262.0, "price": 261.0},
@@ -515,6 +516,58 @@ def test_auto_signal_allows_strong_one_way_15m_tactical_short() -> None:
     assert timing == "GOOD"
     assert "entry zone" in reason
     assert _auto_signal_allowed(signal)
+
+
+def test_auto_signal_waits_when_m15_tactical_stop_is_noise_close() -> None:
+    signal = {
+        "action": "ENTRY_LONG",
+        "score": 96,
+        "trend_state": "ONE_WAY_UP",
+        "risk_state": "NORMAL",
+        "price": 100.0,
+        "m15_precision": {"pullback": "M15_LONG_PULLBACK", "long_stop_anchor": 99.6, "trend": "UP"},
+        "entry_levels": {
+            "long": {
+                "m15_ema20_ema60": {"low": 99.5, "high": 100.5, "price": 100.0},
+            }
+        },
+    }
+
+    timing, reason = _signal_entry_timing(signal)
+
+    assert timing == "WAIT"
+    assert "support" in reason
+    assert not _auto_signal_allowed(signal)
+
+
+def test_auto_trade_skips_m15_entry_when_stop_would_fall_back_to_wider_timeframe() -> None:
+    engine = PaperTradingEngine(AppSettings(), starting_balance=1000, market_data=FakeMarketData())
+    symbol = "TESTUSDT"
+    engine.latest_prices[symbol] = 100.0
+    engine.latest_indicators[symbol] = [indicator_snapshot(close=100.0, atr=3.0)]
+    engine.latest_timeframe_indicators[symbol] = {"1h": [indicator_snapshot(close=100.0, atr=3.0)]}
+    engine.latest_timeframe_contexts[symbol] = {
+        "m15_precision": {"pullback": "M15_LONG_PULLBACK", "long_stop_anchor": 98.5, "trend": "UP"}
+    }
+    engine.latest_signals[symbol] = {
+        "action": "ENTRY_LONG",
+        "score": 96,
+        "trend_state": "ONE_WAY_UP",
+        "risk_state": "NORMAL",
+        "price": 100.0,
+        "m15_precision": {"pullback": "M15_LONG_PULLBACK", "long_stop_anchor": 98.5, "trend": "UP"},
+        "entry_levels": {
+            "long": {
+                "m15_ema20_ema60": {"low": 99.5, "high": 100.5, "price": 100.0},
+            }
+        },
+    }
+
+    import asyncio
+
+    asyncio.run(engine._auto_trade_once())
+
+    assert not engine.account.positions
 
 
 def test_multi_timeframe_context_adjusts_score_veto_and_margin() -> None:
@@ -623,7 +676,7 @@ def test_one_way_high_area_allows_15m_boll_ema9_pullback() -> None:
         "h4_structure": {"state": "BOX_UPPER_HALF"},
         "h1_trigger": {"direction": "NONE", "state": "WAIT"},
         "h1_pullback": {"direction": "NONE", "state": "WAIT"},
-        "m15_precision": {"pullback": "M15_LONG_PULLBACK", "long_stop_anchor": 97.2},
+        "m15_precision": {"pullback": "M15_LONG_PULLBACK", "long_stop_anchor": 95.8, "trend": "UP"},
         "entry_levels": {"long": {"m15_ema20_ema60": {"low": 96.8, "high": 97.6, "price": 97.2}}},
         "summary": "MTF: test",
     }
@@ -632,7 +685,7 @@ def test_one_way_high_area_allows_15m_boll_ema9_pullback() -> None:
 
     assert "high area without pullback confirmation; wait for 1h/4h pullback before long" not in adjusted["vetoes"]
     assert "one-way uptrend 15m BOLL/EMA9 pullback confirmed; allow tactical long" in adjusted["reasons"]
-    assert adjusted["m15_precision"]["long_stop_anchor"] == 97.2
+    assert adjusted["m15_precision"]["long_stop_anchor"] == 95.8
     assert _auto_signal_allowed(adjusted)
 
 
@@ -679,7 +732,7 @@ def test_one_way_hot_rsi_requires_1h_or_15m_pullback() -> None:
     }
     pullback_context = {
         **no_pullback_context,
-        "m15_precision": {"pullback": "M15_LONG_PULLBACK", "long_stop_anchor": 97.2},
+        "m15_precision": {"pullback": "M15_LONG_PULLBACK", "long_stop_anchor": 95.8, "trend": "UP"},
         "entry_levels": {"long": {"m15_ema20_ema60": {"low": 96.8, "high": 97.6, "price": 97.2}}},
     }
     signal = {**signal, "price": 97.2}
@@ -892,6 +945,15 @@ def test_fifteen_minute_precision_refines_stop_outside_anchor() -> None:
     assert _refine_stop_with_precision(PositionSide.LONG, 95.0, {"long_stop_anchor": 97.2}) == 97.2
     assert _refine_stop_with_precision(PositionSide.SHORT, 102.0, {"short_stop_anchor": 103.1}) == 103.1
     assert _refine_stop_with_precision(PositionSide.SHORT, 105.0, {"short_stop_anchor": 103.1}) == 103.1
+
+
+def test_fifteen_minute_precision_keeps_wider_stop_when_anchor_too_close() -> None:
+    indicator = indicator_snapshot(close=100.0, atr=1.0)
+
+    assert _refine_stop_with_precision(PositionSide.LONG, 96.0, {"long_stop_anchor": 99.6}, 100.0, indicator) == 96.0
+    assert _refine_stop_with_precision(PositionSide.SHORT, 104.0, {"short_stop_anchor": 100.4}, 100.0, indicator) == 104.0
+    assert _refine_stop_with_precision(PositionSide.LONG, 96.0, {"long_stop_anchor": 98.4}, 100.0, indicator) == 98.4
+    assert _refine_stop_with_precision(PositionSide.SHORT, 104.0, {"short_stop_anchor": 101.6}, 100.0, indicator) == 101.6
 
 
 def test_preferred_exit_indicator_uses_1h_4h_not_15m_for_targets() -> None:

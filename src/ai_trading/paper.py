@@ -45,6 +45,8 @@ TREND_STAGE_LATE = "LATE"
 TREND_STAGE_NEUTRAL = "NEUTRAL"
 MIN_ENTRY_REWARD_R = 1.2
 PROFIT_LOCK_SLIPPAGE_PCT = 0.0008
+MIN_PRECISION_STOP_PCT = 0.012
+MIN_PRECISION_STOP_ATR_MULTIPLE = 0.65
 
 
 @dataclass(frozen=True)
@@ -559,9 +561,25 @@ class PaperTradingEngine:
                 )
                 stop_basis = "volatility_structure"
                 stop_loss = _refine_stop_with_ma_cluster(PositionSide(side), stop_loss, mtf_context)
+                precision_entry_only = (
+                    _entry_level_group_hit(signal, entry_price, PositionSide(side), include_m15=True)
+                    and not _entry_level_group_hit(signal, entry_price, PositionSide(side), include_m15=False)
+                )
                 if _precision_stop_allowed(PositionSide(side), trend_state, str(signal.get("risk_state") or "NORMAL"), score, precision):
-                    stop_loss = _refine_stop_with_precision(PositionSide(side), stop_loss, precision)
-                    stop_basis = "15m_precision_structure"
+                    refined_stop = _refine_stop_with_precision(
+                        PositionSide(side),
+                        stop_loss,
+                        precision,
+                        entry_price,
+                        preferred_indicator,
+                    )
+                    if refined_stop != stop_loss:
+                        stop_loss = refined_stop
+                        stop_basis = "15m_precision_structure"
+                    elif precision_entry_only:
+                        signal["entry_timing"] = ENTRY_TIMING_WAIT
+                        signal["entry_timing_reason"] = "entry timing wait: 15m tactical entry needs a valid 15m structure stop or 1h/4h entry zone"
+                        continue
                 take_profit_1, take_profit_2 = _refine_take_profit_with_ma_cluster(
                     PositionSide(side),
                     entry_price,
@@ -1620,7 +1638,13 @@ def _side_entry_timing(side: PositionSide, price: float, signal: dict[str, objec
         return ENTRY_TIMING_BLOCK, "entry timing blocked: late trend stage needs a new pullback"
     if risk_state in {"LONG_CROWD", "SHORT_CROWD", "OI_ABNORMAL", "FUNDING_HOT"}:
         return ENTRY_TIMING_BLOCK, "entry timing blocked: crowding/OI/funding risk not clean"
-    include_m15 = _strong_m15_pullback_allowed(side, trend_state, risk_state, score, m15_precision)
+    include_m15 = _strong_m15_pullback_allowed(
+        side,
+        trend_state,
+        risk_state,
+        score,
+        m15_precision,
+    ) and _m15_precision_stop_distance_ok(side, price, m15_precision)
     if _entry_level_group_hit(signal, price, side, include_m15=include_m15):
         return ENTRY_TIMING_GOOD, _entry_zone_reason(side)
     expected_direction = "LONG" if side == PositionSide.LONG else "SHORT"
@@ -1697,6 +1721,14 @@ def _entry_level_group_hit(signal: dict[str, object], price: float, side: Positi
     if include_m15:
         keys = (*keys, "m15_ema20_ema60")
     return any(_entry_level_hit(price, side_levels.get(key)) for key in keys)
+
+
+def _m15_precision_stop_distance_ok(side: PositionSide, price: float, precision: dict[str, object]) -> bool:
+    if side == PositionSide.LONG:
+        anchor = _float_or_none(precision.get("long_stop_anchor"))
+        return anchor is not None and anchor < price and price - anchor >= price * MIN_PRECISION_STOP_PCT
+    anchor = _float_or_none(precision.get("short_stop_anchor"))
+    return anchor is not None and anchor > price and anchor - price >= price * MIN_PRECISION_STOP_PCT
 
 
 def _entry_level_hit(price: float, level: object) -> bool:
@@ -2097,7 +2129,7 @@ def _fifteen_minute_precision(
 ) -> dict[str, object]:
     lookback = min(8, len(candles), len(indicators))
     if lookback < 3:
-        return {"long_stop_anchor": None, "short_stop_anchor": None, "pullback": "UNKNOWN"}
+        return {"long_stop_anchor": None, "short_stop_anchor": None, "pullback": "UNKNOWN", "trend": "UNKNOWN"}
     recent = candles[-lookback:]
     indicator = indicators[-1]
     buffer = (indicator.atr14 or recent[-1].close * 0.004) * settings.strategy.structure_buffer_atr
@@ -2107,12 +2139,29 @@ def _fifteen_minute_precision(
     ema60_value = ema60_values[-1] if ema60_values else None
     current = candles[-1]
     mid = indicator.boll_mid
+    strong_up = (
+        ema9_value is not None
+        and indicator.ema20 is not None
+        and ema60_value is not None
+        and ema9_value > indicator.ema20 > ema60_value
+        and current.close >= indicator.ema20
+        and sum(1 for candle in recent[-5:] if candle.close >= ema60_value) >= 4
+    )
+    strong_down = (
+        ema9_value is not None
+        and indicator.ema20 is not None
+        and ema60_value is not None
+        and ema9_value < indicator.ema20 < ema60_value
+        and current.close <= indicator.ema20
+        and sum(1 for candle in recent[-5:] if candle.close <= ema60_value) >= 4
+    )
+    m15_trend = "UP" if strong_up else "DOWN" if strong_down else "CHOP"
     long_ref = max(value for value in (ema9_value, mid) if value is not None) if ema9_value is not None or mid is not None else None
     short_ref = min(value for value in (ema9_value, mid) if value is not None) if ema9_value is not None or mid is not None else None
     pullback = "WAIT"
-    if long_ref is not None and current.low <= long_ref + buffer and current.close >= long_ref - buffer * 0.25:
+    if strong_up and long_ref is not None and current.low <= long_ref + buffer and current.close >= long_ref - buffer * 0.25:
         pullback = "M15_LONG_PULLBACK"
-    elif short_ref is not None and current.high >= short_ref - buffer and current.close <= short_ref + buffer * 0.25:
+    elif strong_down and short_ref is not None and current.high >= short_ref - buffer and current.close <= short_ref + buffer * 0.25:
         pullback = "M15_SHORT_PULLBACK"
     return {
         "long_stop_anchor": min(candle.low for candle in recent) - buffer,
@@ -2121,6 +2170,7 @@ def _fifteen_minute_precision(
         "ema20": indicator.ema20,
         "ema60": ema60_value,
         "boll_mid": mid,
+        "trend": m15_trend,
         "long_pullback_zone": _range_around_values([indicator.ema20, ema60_value, mid], buffer),
         "short_retest_zone": _range_around_values([indicator.ema20, ema60_value, mid], buffer),
         "pullback": pullback,
@@ -2570,9 +2620,10 @@ def _strong_m15_pullback_allowed(
     if score < 85 or risk_state != "NORMAL":
         return False
     pullback = str(precision.get("pullback") or "")
+    m15_trend = str(precision.get("trend") or "")
     if side == PositionSide.LONG:
-        return trend_state == "ONE_WAY_UP" and pullback == "M15_LONG_PULLBACK"
-    return trend_state == "ONE_WAY_DOWN" and pullback == "M15_SHORT_PULLBACK"
+        return trend_state == "ONE_WAY_UP" and m15_trend == "UP" and pullback == "M15_LONG_PULLBACK"
+    return trend_state == "ONE_WAY_DOWN" and m15_trend == "DOWN" and pullback == "M15_SHORT_PULLBACK"
 
 
 def _precision_stop_allowed(
@@ -2626,14 +2677,45 @@ def _preferred_exit_indicator(
     return fallback[-1] if fallback else None
 
 
-def _refine_stop_with_precision(side: PositionSide, stop: float, precision: object) -> float:
+def _refine_stop_with_precision(
+    side: PositionSide,
+    stop: float,
+    precision: object,
+    entry_price: float | None = None,
+    indicator: IndicatorSnapshot | None = None,
+) -> float:
     if not isinstance(precision, dict):
         return stop
     if side == PositionSide.LONG:
         anchor = _float_or_none(precision.get("long_stop_anchor"))
-        return anchor if anchor else stop
+        if anchor is None:
+            return stop
+        if entry_price is not None:
+            if anchor >= entry_price:
+                return stop
+            min_distance = _minimum_precision_stop_distance(entry_price, indicator)
+            if entry_price - anchor < min_distance:
+                return stop
+            return max(stop, anchor)
+        return anchor
     anchor = _float_or_none(precision.get("short_stop_anchor"))
-    return anchor if anchor else stop
+    if anchor is None:
+        return stop
+    if entry_price is not None:
+        if anchor <= entry_price:
+            return stop
+        min_distance = _minimum_precision_stop_distance(entry_price, indicator)
+        if anchor - entry_price < min_distance:
+            return stop
+        return min(stop, anchor)
+    return anchor
+
+
+def _minimum_precision_stop_distance(entry_price: float, indicator: IndicatorSnapshot | None = None) -> float:
+    distance = entry_price * MIN_PRECISION_STOP_PCT
+    if indicator is not None and indicator.atr14:
+        distance = max(distance, indicator.atr14 * MIN_PRECISION_STOP_ATR_MULTIPLE)
+    return distance
 
 
 def _refine_stop_with_ma_cluster(side: PositionSide, stop: float, context: dict[str, object]) -> float:
