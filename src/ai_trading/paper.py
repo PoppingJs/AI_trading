@@ -561,6 +561,16 @@ class PaperTradingEngine:
                 )
                 stop_basis = "volatility_structure"
                 stop_loss = _refine_stop_with_ma_cluster(PositionSide(side), stop_loss, mtf_context)
+                structure_stop = _refine_stop_with_retest_structure(
+                    PositionSide(side),
+                    stop_loss,
+                    entry_price,
+                    mtf_context,
+                    preferred_indicator,
+                )
+                if structure_stop != stop_loss:
+                    stop_loss = structure_stop
+                    stop_basis = "1h_4h_retest_structure"
                 precision_entry_only = (
                     _entry_level_group_hit(signal, entry_price, PositionSide(side), include_m15=True)
                     and not _entry_level_group_hit(signal, entry_price, PositionSide(side), include_m15=False)
@@ -671,7 +681,6 @@ class PaperTradingEngine:
                 continue
             indicators = self.latest_indicators.get(position.symbol, [])
             tf_indicators = self.latest_timeframe_indicators.get(position.symbol, {})
-            latest_indicator = indicators[-1] if indicators else None
             trend_state = self.strategy.trend_state(position.side.value, indicators) if indicators else "CHOP"
             risk_state = self.strategy.risk_state(indicators) if indicators else "NORMAL"
             strong_trend = trend_state in {"ONE_WAY_UP", "ONE_WAY_DOWN"}
@@ -679,7 +688,7 @@ class PaperTradingEngine:
             exit_indicator = _preferred_exit_indicator(tf_indicators, indicators)
             _update_position_excursions(position, price)
             if strong_trend:
-                _protect_confirmed_breakout_position(position, signal, exit_indicator)
+                _protect_confirmed_breakout_position(position, price, signal, exit_indicator)
             _apply_profit_protection(position, price, signal, exit_indicator, self.settings.execution.taker_fee_rate)
             self._update_trailing_stop(position, price, strong_trend, exit_indicator)
             structure_exit_reason = _confirmed_structure_exit_reason(position, price, signal)
@@ -689,7 +698,7 @@ class PaperTradingEngine:
             if _stop_hit(position, price):
                 self._close_position_unlocked(position, price, _stop_exit_reason(position, signal, price, self.settings.execution.taker_fee_rate))
                 continue
-            if strong_trend and _strong_trend_invalidated(position, latest_indicator):
+            if strong_trend and _strong_trend_invalidated(position, exit_indicator):
                 self._close_position_unlocked(position, price, _outcome_exit_reason(position, price, "strong trend EMA50 structure invalidated", self.settings.execution.taker_fee_rate))
                 continue
             drawdown_exit_reason = _profit_drawdown_exit_reason(position, price, signal, exit_indicator)
@@ -1270,23 +1279,18 @@ def _confirmed_structure_exit_reason(position: Position, price: float, signal: d
     """Exit only when 1h/4h structure is lost by close/body, not by a single wick."""
     h4 = signal.get("h4_structure") if isinstance(signal.get("h4_structure"), dict) else {}
     h1 = signal.get("h1_trigger") if isinstance(signal.get("h1_trigger"), dict) else {}
-    h1_pullback = signal.get("h1_pullback") if isinstance(signal.get("h1_pullback"), dict) else {}
     h4_state = str(h4.get("state") or "UNKNOWN")
     h1_direction = str(h1.get("direction") or "NONE")
     h1_state = str(h1.get("state") or "UNKNOWN")
-    pullback_direction = str(h1_pullback.get("direction") or "NONE")
-    pullback_state = str(h1_pullback.get("state") or "UNKNOWN")
     if position.side == PositionSide.LONG:
         h4_failed = h4_state == "BREAKDOWN_DOWN"
         h1_failed = h1_direction == "SHORT" and h1_state in {"BREAKDOWN", "RETEST"}
-        ema_boll_lost = pullback_direction == "SHORT" and pullback_state == "HEALTHY_PULLBACK"
-        if h4_failed or h1_failed or ema_boll_lost:
+        if h4_failed or h1_failed:
             return _outcome_exit_reason(position, price, "1h/4h body closed below support or EMA/BOLL zone")
     else:
         h4_failed = h4_state == "BREAKOUT_UP"
         h1_failed = h1_direction == "LONG" and h1_state in {"BREAKOUT", "RETEST"}
-        ema_boll_reclaimed = pullback_direction == "LONG" and pullback_state == "HEALTHY_PULLBACK"
-        if h4_failed or h1_failed or ema_boll_reclaimed:
+        if h4_failed or h1_failed:
             return _outcome_exit_reason(position, price, "1h/4h body closed above resistance or EMA/BOLL zone")
     return None
 
@@ -1355,8 +1359,14 @@ def _pyramid_structure_confirmed(side: PositionSide, signal: dict[str, object]) 
     return (pullback_ok or washout_ok or failed_retest_ok) and deleverage_ok
 
 
-def _protect_confirmed_breakout_position(position: Position, signal: dict[str, object], indicator: IndicatorSnapshot | None) -> None:
+def _protect_confirmed_breakout_position(position: Position, price: float, signal: dict[str, object], indicator: IndicatorSnapshot | None) -> None:
     if indicator is None or indicator.atr14 is None or indicator.atr14 <= 0:
+        return
+    stop_distance = float(position.metadata.get("initial_stop_distance") or abs(position.entry_price - position.stop_price))
+    if stop_distance <= 0:
+        return
+    profit_distance = price - position.entry_price if position.side == PositionSide.LONG else position.entry_price - price
+    if profit_distance < stop_distance * 0.6:
         return
     h4 = signal.get("h4_structure") if isinstance(signal.get("h4_structure"), dict) else {}
     h1 = signal.get("h1_trigger") if isinstance(signal.get("h1_trigger"), dict) else {}
@@ -2311,6 +2321,55 @@ def _recovery_band(indicator: IndicatorSnapshot | None) -> dict[str, float] | No
     return _indicator_band(indicator, indicator.close)
 
 
+def _weak_deleverage_rebound(
+    signal: dict[str, object],
+    h4_oi: dict[str, object],
+    h1_pullback: dict[str, object],
+) -> bool:
+    """OI flushes need volume/OI recovery before a rebound can be trusted as long support."""
+    state = str(h4_oi.get("state") or "UNKNOWN")
+    drop_from_high = _float_or_none(h4_oi.get("drop_from_high_pct")) or 0.0
+    rebound = _float_or_none(h4_oi.get("rebound_pct")) or 0.0
+    volume_ratio = _float_or_none(signal.get("volume_ratio"))
+    current_oi_change = _float_or_none(signal.get("oi_change"))
+
+    deleveraged = state in {
+        "DELEVERAGE_HOLD_LONG",
+        "DELEVERAGE_CROWD_HOLD_LONG",
+        "DELEVERAGE_WAIT",
+        "DELEVERAGE_CROWD_WAIT",
+    } or drop_from_high <= -0.16
+    if not deleveraged:
+        return False
+    oi_not_recovered = rebound < 0.003 and (current_oi_change is None or current_oi_change < 0.01)
+    volume_weak = volume_ratio is not None and volume_ratio < 1.0
+    return oi_not_recovered and volume_weak
+
+
+def _distribution_short_retest_setup(
+    signal: dict[str, object],
+    h4_oi: dict[str, object],
+    h1: dict[str, object],
+    h1_pullback: dict[str, object],
+    h1_ma_cluster: dict[str, object],
+    h4_ma_cluster: dict[str, object],
+) -> bool:
+    if not _weak_deleverage_rebound(signal, h4_oi, h1_pullback):
+        return False
+    h1_direction = str(h1.get("direction") or "NONE")
+    h1_state = str(h1.get("state") or "UNKNOWN")
+    pullback_direction = str(h1_pullback.get("direction") or "NONE")
+    pullback_state = str(h1_pullback.get("state") or "UNKNOWN")
+    cluster_states = {
+        str(h1_ma_cluster.get("state") or "UNKNOWN"),
+        str(h4_ma_cluster.get("state") or "UNKNOWN"),
+    }
+    resistance_rejected = h1_direction == "SHORT" and h1_state in {"RETEST", "FAKE_BREAKOUT"}
+    rebound_failed = pullback_direction == "SHORT" and pullback_state == "HEALTHY_PULLBACK"
+    ma_pressure_rejected = bool(cluster_states & {"RETEST_DOWN", "BREAKDOWN_DOWN"})
+    return resistance_rejected or rebound_failed or ma_pressure_rejected
+
+
 def _apply_multi_timeframe_context(signal: dict[str, object], context: dict[str, object]) -> dict[str, object]:
     out = dict(signal)
     reasons = list(out.get("reasons") or [])
@@ -2336,6 +2395,15 @@ def _apply_multi_timeframe_context(signal: dict[str, object], context: dict[str,
     risk_state = str(out.get("risk_state") or "NORMAL")
     trend_state = str(out.get("trend_state") or "")
     rsi14 = _float_or_none(out.get("rsi14"))
+    weak_deleverage_rebound = _weak_deleverage_rebound(out, h4_oi, h1_pullback)
+    distribution_short_retest_setup = _distribution_short_retest_setup(
+        out,
+        h4_oi,
+        h1,
+        h1_pullback,
+        h1_ma_cluster,
+        h4_ma_cluster,
+    )
     if action == SignalAction.ENTRY_LONG.value:
         if daily_bias == "BEAR":
             score -= 10
@@ -2356,7 +2424,12 @@ def _apply_multi_timeframe_context(signal: dict[str, object], context: dict[str,
         elif h1_direction == "SHORT":
             vetoes.append("1h trigger opposes long entry")
         if pullback_direction == "LONG":
-            if pullback_state == "HEALTHY_PULLBACK" and risk_state == "NORMAL":
+            if weak_deleverage_rebound:
+                score -= 18
+                out["leverage_cap"] = min(int(out.get("leverage_cap") or 99), 3)
+                out["margin_factor"] = min(float(out.get("margin_factor") or 1.0), 0.3)
+                vetoes.append("4h OI drained and volume is weak; EMA/BOLL bounce is not a clean long pullback")
+            elif pullback_state == "HEALTHY_PULLBACK" and risk_state == "NORMAL":
                 score += 12
                 reasons.append("1h BOLL/EMA pullback held with clean risk")
             elif pullback_state == "HIGH_PULLBACK" and risk_state in {"LONG_CROWD", "OI_ABNORMAL", "FUNDING_HOT"}:
@@ -2372,6 +2445,8 @@ def _apply_multi_timeframe_context(signal: dict[str, object], context: dict[str,
         if h4_oi_state in {"DELEVERAGE_BREAKDOWN", "DELEVERAGE_CROWD_BREAKDOWN"}:
             score -= 25
             vetoes.append("4h OI deleverage with price breakdown; avoid long entry")
+        elif weak_deleverage_rebound:
+            reasons.append("wait for OI/volume recovery before treating the rebound as accumulation")
         elif h4_oi_state == "DELEVERAGE_CROWD_HOLD_LONG":
             score -= 8
             out["leverage_cap"] = min(int(out.get("leverage_cap") or 99), 3)
@@ -2439,7 +2514,18 @@ def _apply_multi_timeframe_context(signal: dict[str, object], context: dict[str,
                 score -= 8
                 vetoes.append("4h OI deleverage breakdown; wait for resistance retest or upper-wick rejection before short")
         elif h4_oi_state in {"DELEVERAGE_HOLD_LONG", "DELEVERAGE_CROWD_HOLD_LONG"}:
-            vetoes.append("4h OI deleveraged but 1h support held; avoid chasing short")
+            if distribution_short_retest_setup:
+                score += 8
+                reasons.append("OI drained with weak rebound and resistance rejection; short candidate improved")
+            else:
+                vetoes.append("4h OI deleveraged but 1h support held; avoid chasing short")
+        elif h4_oi_state in {"DELEVERAGE_WAIT", "DELEVERAGE_CROWD_WAIT"}:
+            if distribution_short_retest_setup:
+                score += 8
+                reasons.append("OI drained, rebound volume weak, and 1h/MA resistance rejected; short candidate improved")
+            else:
+                score -= 6
+                vetoes.append("4h OI drained; wait for 1h resistance retest or upper-wick rejection before short")
         rsi_score, rsi_reasons, rsi_vetoes = _rsi_entry_adjustment(
             PositionSide.SHORT,
             rsi14,
@@ -2741,6 +2827,114 @@ def _refine_stop_with_ma_cluster(side: PositionSide, stop: float, context: dict[
         if state == "RETEST_DOWN" and ema20_value is not None:
             return max(stop, ema20_value + buffer)
     return stop
+
+
+def _refine_stop_with_retest_structure(
+    side: PositionSide,
+    stop: float,
+    entry: float,
+    context: dict[str, object],
+    indicator: IndicatorSnapshot | None,
+) -> float:
+    h1 = context.get("h1_structure") if isinstance(context.get("h1_structure"), dict) else {}
+    h4 = context.get("h4_structure") if isinstance(context.get("h4_structure"), dict) else {}
+    h1_trigger = context.get("h1_trigger") if isinstance(context.get("h1_trigger"), dict) else {}
+    h1_pullback = context.get("h1_pullback") if isinstance(context.get("h1_pullback"), dict) else {}
+    h1_cluster = context.get("h1_ma_cluster") if isinstance(context.get("h1_ma_cluster"), dict) else {}
+    h4_cluster = context.get("h4_ma_cluster") if isinstance(context.get("h4_ma_cluster"), dict) else {}
+    relevant = _retest_structure_stop_relevant(side, h1_trigger, h1_pullback, h1_cluster, h4_cluster)
+    if not relevant:
+        return stop
+    buffer = _structure_stop_buffer(entry, indicator)
+    min_distance = _minimum_precision_stop_distance(entry, indicator)
+    if side == PositionSide.SHORT:
+        candidates = _short_structure_stop_candidates(entry, h1, h4, h1_cluster, h4_cluster)
+        if not candidates:
+            return stop
+        structure_stop = min(candidates) + buffer
+        return max(stop, structure_stop, entry + min_distance)
+    candidates = _long_structure_stop_candidates(entry, h1, h4, h1_cluster, h4_cluster)
+    if not candidates:
+        return stop
+    structure_stop = max(candidates) - buffer
+    return min(stop, structure_stop, entry - min_distance)
+
+
+def _retest_structure_stop_relevant(
+    side: PositionSide,
+    h1: dict[str, object],
+    h1_pullback: dict[str, object],
+    h1_cluster: dict[str, object],
+    h4_cluster: dict[str, object],
+) -> bool:
+    h1_direction = str(h1.get("direction") or "NONE")
+    h1_state = str(h1.get("state") or "UNKNOWN")
+    pullback_direction = str(h1_pullback.get("direction") or "NONE")
+    pullback_state = str(h1_pullback.get("state") or "UNKNOWN")
+    cluster_states = {
+        str(h1_cluster.get("state") or "UNKNOWN"),
+        str(h4_cluster.get("state") or "UNKNOWN"),
+    }
+    if side == PositionSide.SHORT:
+        return (
+            (h1_direction == "SHORT" and h1_state in {"RETEST", "FAKE_BREAKOUT", "BREAKDOWN"})
+            or (pullback_direction == "SHORT" and pullback_state == "HEALTHY_PULLBACK")
+            or bool(cluster_states & {"RETEST_DOWN", "BREAKDOWN_DOWN"})
+        )
+    return (
+        (h1_direction == "LONG" and h1_state in {"RETEST", "FAKE_BREAKDOWN", "BREAKOUT"})
+        or (pullback_direction == "LONG" and pullback_state == "HEALTHY_PULLBACK")
+        or bool(cluster_states & {"RETEST_UP", "BREAKOUT_UP"})
+    )
+
+
+def _structure_stop_buffer(entry: float, indicator: IndicatorSnapshot | None) -> float:
+    atr_buffer = indicator.atr14 * 0.35 if indicator is not None and indicator.atr14 else 0.0
+    return max(entry * 0.003, atr_buffer)
+
+
+def _short_structure_stop_candidates(
+    entry: float,
+    h1: dict[str, object],
+    h4: dict[str, object],
+    h1_cluster: dict[str, object],
+    h4_cluster: dict[str, object],
+) -> list[float]:
+    candidates = [
+        _max_above(entry, h1.get("resistance_zone_high"), h1.get("resistance")),
+        _max_above(entry, h4.get("resistance_zone_high"), h4.get("resistance")),
+        _max_above(entry, h1_cluster.get("upper"), h1_cluster.get("ema60")),
+        _max_above(entry, h4_cluster.get("upper"), h4_cluster.get("ema60")),
+    ]
+    return [value for value in candidates if value is not None and value > entry]
+
+
+def _long_structure_stop_candidates(
+    entry: float,
+    h1: dict[str, object],
+    h4: dict[str, object],
+    h1_cluster: dict[str, object],
+    h4_cluster: dict[str, object],
+) -> list[float]:
+    candidates = [
+        _min_below(entry, h1.get("support_zone_low"), h1.get("support")),
+        _min_below(entry, h4.get("support_zone_low"), h4.get("support")),
+        _min_below(entry, h1_cluster.get("lower"), h1_cluster.get("ema60")),
+        _min_below(entry, h4_cluster.get("lower"), h4_cluster.get("ema60")),
+    ]
+    return [value for value in candidates if value is not None and value < entry]
+
+
+def _max_above(entry: float, *values: object) -> float | None:
+    candidates = [_float_or_none(value) for value in values]
+    above = [value for value in candidates if value is not None and value > entry]
+    return max(above) if above else None
+
+
+def _min_below(entry: float, *values: object) -> float | None:
+    candidates = [_float_or_none(value) for value in values]
+    below = [value for value in candidates if value is not None and value < entry]
+    return min(below) if below else None
 
 
 def _refine_take_profit_with_ma_cluster(

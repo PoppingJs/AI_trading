@@ -28,6 +28,7 @@ from ai_trading.paper import (
     _precision_stop_allowed,
     _refine_stop_with_ma_cluster,
     _refine_stop_with_precision,
+    _refine_stop_with_retest_structure,
     _refine_take_profit_with_ma_cluster,
     _pyramid_allowed,
     _rotation_candidate_allowed,
@@ -270,7 +271,7 @@ def test_confirmed_breakout_moves_long_stop_to_structure_protection() -> None:
         "reasons": ("market structure: resistance grind broke upward, shorts may be squeezed",),
     }
 
-    _protect_confirmed_breakout_position(position, signal, indicator_snapshot(close=105.0, atr=1.0, ema20=104.0))
+    _protect_confirmed_breakout_position(position, 105.0, signal, indicator_snapshot(close=105.0, atr=1.0, ema20=104.0))
 
     assert position.stop_price >= 102.4
     assert position.metadata["breakout_protected"] is True
@@ -295,6 +296,34 @@ def test_confirmed_structure_exit_uses_1h_4h_body_break_not_m15_noise() -> None:
     assert _confirmed_structure_exit_reason(position, 99.0, wick_only_signal) is None
     assert _confirmed_structure_exit_reason(position, 97.0, failed_signal) == "stop loss: 1h/4h body closed below support or EMA/BOLL zone"
     assert _confirmed_structure_exit_reason(position, 102.0, failed_signal) == "take profit: 1h/4h body closed below support or EMA/BOLL zone"
+
+
+def test_confirmed_structure_exit_does_not_close_short_on_healthy_bounce_only() -> None:
+    position = asyncio.run(PaperTradingEngine(AppSettings(), starting_balance=1000, market_data=FakeMarketData()).open_position("BCHUSDT", "SHORT", margin_usdt=100, leverage=10))
+    position.entry_price = 190.3
+    position.stop_price = 196.6
+    signal = {
+        "h4_structure": {"state": "BOX_LOWER_HALF"},
+        "h1_trigger": {"direction": "NONE", "state": "WAIT"},
+        "h1_pullback": {"direction": "LONG", "state": "HEALTHY_PULLBACK"},
+    }
+
+    assert _confirmed_structure_exit_reason(position, 192.6, signal) is None
+
+
+def test_breakout_protection_waits_for_real_profit_before_tightening_stop() -> None:
+    position = asyncio.run(PaperTradingEngine(AppSettings(), starting_balance=1000, market_data=FakeMarketData()).open_position("BCHUSDT", "SHORT", margin_usdt=100, leverage=10))
+    position.entry_price = 190.3
+    position.stop_price = 196.6
+    position.metadata["initial_stop_distance"] = 6.3
+    signal = {
+        "h4_structure": {"state": "BREAKDOWN_DOWN", "support": 180.0},
+        "h1_trigger": {"direction": "SHORT", "state": "BREAKDOWN"},
+    }
+
+    _protect_confirmed_breakout_position(position, 192.6, signal, indicator_snapshot(close=192.6, atr=1.0, ema20=193.0))
+
+    assert position.stop_price == 196.6
 
 
 def test_precision_stop_only_allowed_for_strong_m15_tactical_pullback() -> None:
@@ -884,6 +913,57 @@ def test_oi_deleverage_with_long_short_ratio_rising_allows_tiny_long_only() -> N
     assert "4h OI deleveraged while long/short ratio rose; 1h support held, only tiny long allowed" in adjusted["reasons"]
 
 
+def test_weak_oi_rebound_vetoes_long_pullback() -> None:
+    signal = {
+        "action": "ENTRY_LONG",
+        "score": 98,
+        "risk_state": "NORMAL",
+        "volume_ratio": 0.7,
+        "oi_change": -0.01,
+        "reasons": (),
+        "vetoes": (),
+    }
+    context = {
+        "daily_bias": "BULL",
+        "h4_structure": {"state": "BOX_UPPER_HALF"},
+        "h4_oi": {"state": "DELEVERAGE_HOLD_LONG", "drop_from_high_pct": -0.22, "rebound_pct": 0.0},
+        "h1_trigger": {"direction": "NONE", "state": "WAIT"},
+        "h1_pullback": {"direction": "LONG", "state": "HEALTHY_PULLBACK"},
+        "summary": "MTF: test",
+    }
+
+    adjusted = _apply_multi_timeframe_context(signal, context)
+
+    assert "4h OI drained and volume is weak; EMA/BOLL bounce is not a clean long pullback" in adjusted["vetoes"]
+    assert not _auto_signal_allowed(adjusted)
+
+
+def test_weak_oi_rebound_with_ma_pressure_improves_short() -> None:
+    signal = {
+        "action": "ENTRY_SHORT",
+        "score": 82,
+        "risk_state": "NORMAL",
+        "volume_ratio": 0.7,
+        "oi_change": -0.01,
+        "reasons": (),
+        "vetoes": (),
+    }
+    context = {
+        "daily_bias": "BEAR",
+        "h4_structure": {"state": "BOX_LOWER_HALF"},
+        "h4_oi": {"state": "DELEVERAGE_WAIT", "drop_from_high_pct": -0.22, "rebound_pct": 0.0},
+        "h1_trigger": {"direction": "NONE", "state": "WAIT"},
+        "h1_pullback": {"direction": "NONE", "state": "WAIT"},
+        "h1_ma_cluster": {"state": "RETEST_DOWN", "price": 198.6},
+        "summary": "MTF: test",
+    }
+
+    adjusted = _apply_multi_timeframe_context(signal, context)
+
+    assert "OI drained, rebound volume weak, and 1h/MA resistance rejected; short candidate improved" in adjusted["reasons"]
+    assert adjusted["score"] > signal["score"]
+
+
 def test_oi_deleverage_breakdown_vetoes_long_and_waits_for_short_retest() -> None:
     long_signal = {
         "action": "ENTRY_LONG",
@@ -954,6 +1034,36 @@ def test_fifteen_minute_precision_keeps_wider_stop_when_anchor_too_close() -> No
     assert _refine_stop_with_precision(PositionSide.SHORT, 104.0, {"short_stop_anchor": 100.4}, 100.0, indicator) == 104.0
     assert _refine_stop_with_precision(PositionSide.LONG, 96.0, {"long_stop_anchor": 98.4}, 100.0, indicator) == 98.4
     assert _refine_stop_with_precision(PositionSide.SHORT, 104.0, {"short_stop_anchor": 101.6}, 100.0, indicator) == 101.6
+
+
+def test_retest_structure_refines_short_stop_outside_resistance_and_ema60() -> None:
+    context = {
+        "h1_structure": {"resistance_zone_high": 198.6, "resistance": 198.0},
+        "h4_structure": {"resistance": 205.0},
+        "h1_trigger": {"direction": "SHORT", "state": "RETEST"},
+        "h1_pullback": {"direction": "SHORT", "state": "HEALTHY_PULLBACK"},
+        "h1_ma_cluster": {"state": "RETEST_DOWN", "upper": 197.8, "ema60": 198.6},
+    }
+    indicator = indicator_snapshot(close=190.3, atr=2.0)
+
+    stop = _refine_stop_with_retest_structure(PositionSide.SHORT, 196.6, 190.3, context, indicator)
+
+    assert stop >= 198.6
+
+
+def test_retest_structure_refines_long_stop_outside_support_and_ema60() -> None:
+    context = {
+        "h1_structure": {"support_zone_low": 95.0, "support": 95.4},
+        "h4_structure": {"support": 92.0},
+        "h1_trigger": {"direction": "LONG", "state": "RETEST"},
+        "h1_pullback": {"direction": "LONG", "state": "HEALTHY_PULLBACK"},
+        "h1_ma_cluster": {"state": "RETEST_UP", "lower": 95.2, "ema60": 95.0},
+    }
+    indicator = indicator_snapshot(close=100.0, atr=2.0)
+
+    stop = _refine_stop_with_retest_structure(PositionSide.LONG, 98.8, 100.0, context, indicator)
+
+    assert stop <= 95.0
 
 
 def test_preferred_exit_indicator_uses_1h_4h_not_15m_for_targets() -> None:
