@@ -267,6 +267,7 @@ class PaperTradingEngine:
             stop_loss = stop_loss or _default_stop(side_enum, price, leverage)
             take_profit_1 = take_profit_1 or _default_take_profit(side_enum, price, stop_loss, 1)
             take_profit_2 = take_profit_2 or _default_take_profit(side_enum, price, stop_loss, 2)
+            normalized_entry_context = _normalize_entry_context(entry_context)
             position = Position(
                 symbol=symbol,
                 side=side_enum,
@@ -283,7 +284,7 @@ class PaperTradingEngine:
                     "entry_score": _score_from_reason(reason),
                     "entry_reason": _entry_reason_text(reason, entry_reasons),
                     "entry_reasons": list(entry_reasons or ()),
-                    "entry_context": dict(entry_context or {}),
+                    "entry_context": normalized_entry_context,
                     "adds": 0,
                     "initial_stop_distance": abs(price - stop_loss),
                 },
@@ -718,6 +719,7 @@ class PaperTradingEngine:
             efficiency_stalled = (
                 candidate_is_strong
                 and price is not None
+                and _position_h4_allows_efficiency_rotation(position, signal)
                 and _position_efficiency_stalled(position, signal, current_indicator, price)
             )
             if not trend_failed and not efficiency_stalled:
@@ -753,8 +755,14 @@ class PaperTradingEngine:
             risk_state = self.strategy.risk_state(indicators) if indicators else "NORMAL"
             strong_trend = trend_state in {"ONE_WAY_UP", "ONE_WAY_DOWN"}
             signal = self.latest_signals.get(position.symbol, {})
-            exit_indicator = _preferred_exit_indicator(tf_indicators, indicators)
+            exit_indicator = _preferred_exit_indicator(tf_indicators, indicators, position)
             _update_position_excursions(position, price)
+            short_support_hold = (
+                _short_near_h4_support(position, price, signal, exit_indicator)
+                and _short_support_trend_should_hold(position, price, signal, exit_indicator, trend_state)
+            )
+            if short_support_hold:
+                _tighten_short_support_stop(position, price, signal, exit_indicator)
             if strong_trend:
                 _protect_confirmed_breakout_position(position, price, signal, exit_indicator)
             _apply_profit_protection(position, price, signal, exit_indicator, self.settings.execution.taker_fee_rate)
@@ -769,7 +777,7 @@ class PaperTradingEngine:
             if strong_trend and _strong_trend_invalidated(position, exit_indicator):
                 self._close_position_unlocked(position, price, _outcome_exit_reason(position, price, "strong trend EMA50 structure invalidated", self.settings.execution.taker_fee_rate))
                 continue
-            drawdown_exit_reason = _profit_drawdown_exit_reason(position, price, signal, exit_indicator)
+            drawdown_exit_reason = None if short_support_hold else _profit_drawdown_exit_reason(position, price, signal, exit_indicator)
             if drawdown_exit_reason:
                 self._close_position_unlocked(position, price, drawdown_exit_reason)
                 continue
@@ -968,6 +976,57 @@ def _entry_reason_text(reason: str, entry_reasons: list[str] | tuple[str, ...] |
     score_text = str(score if score is not None else _score_from_reason(reason)).strip()
     prefix = f"自动，评分：{score_text}" if score_text else "自动"
     return f"{prefix}；{'；'.join(reasons)}" if reasons else prefix
+
+
+def _normalize_entry_context(entry_context: dict[str, object] | None) -> dict[str, object]:
+    context = dict(entry_context or {})
+    context.setdefault("entry_setup", _entry_setup_from_context(context))
+    context.setdefault("stop_timeframe", _stop_timeframe_from_context(context))
+    return context
+
+
+def _entry_setup_from_context(context: dict[str, object]) -> str:
+    stop_basis = str(context.get("stop_basis") or "")
+    if stop_basis == "15m_precision_structure":
+        return "m15_precision_pullback"
+    h1_cluster = context.get("h1_ma_cluster") if isinstance(context.get("h1_ma_cluster"), dict) else {}
+    h4_cluster = context.get("h4_ma_cluster") if isinstance(context.get("h4_ma_cluster"), dict) else {}
+    h1_cluster_state = str(h1_cluster.get("state") or "NONE")
+    h4_cluster_state = str(h4_cluster.get("state") or "NONE")
+    if h1_cluster_state in {"BREAKOUT_UP", "BREAKDOWN_DOWN", "RETEST_MA20_LONG", "RETEST_MA20_SHORT"}:
+        return "h1_ma_cluster"
+    if h4_cluster_state in {"BREAKOUT_UP", "BREAKDOWN_DOWN", "RETEST_MA20_LONG", "RETEST_MA20_SHORT"}:
+        return "h4_ma_cluster"
+    h1_trigger = context.get("h1_trigger") if isinstance(context.get("h1_trigger"), dict) else {}
+    h1_state = str(h1_trigger.get("state") or "NONE")
+    if h1_state in {"BREAKOUT", "BREAKDOWN", "RETEST", "FAKE_BREAKOUT", "FAKE_BREAKDOWN"}:
+        return "h1_structure"
+    h1_pullback = context.get("h1_pullback") if isinstance(context.get("h1_pullback"), dict) else {}
+    if str(h1_pullback.get("state") or "NONE") == "HEALTHY_PULLBACK":
+        return "h1_pullback"
+    if stop_basis == "1h_4h_retest_structure":
+        return "h1_4h_retest"
+    if stop_basis == "kc_atr_volatility":
+        return "kc_atr_volatility"
+    return "volatility_structure"
+
+
+def _stop_timeframe_from_context(context: dict[str, object]) -> str:
+    explicit = str(context.get("stop_timeframe") or "").lower()
+    if explicit in {"15m", "1h", "4h", "1d"}:
+        return explicit
+    stop_basis = str(context.get("stop_basis") or "")
+    if stop_basis == "15m_precision_structure":
+        return "15m"
+    setup = str(context.get("entry_setup") or _entry_setup_from_context(context))
+    if setup.startswith("h4_"):
+        return "4h"
+    if setup.startswith("h1_") or setup == "kc_atr_volatility":
+        return "1h"
+    h4_structure = context.get("h4_structure") if isinstance(context.get("h4_structure"), dict) else {}
+    if str(h4_structure.get("state") or "") in {"BREAKOUT_UP", "BREAKDOWN_DOWN"}:
+        return "4h"
+    return "1h"
 
 
 def _entry_context_from_signal(signal: dict[str, object]) -> dict[str, object]:
@@ -1237,7 +1296,7 @@ def _stop_exit_reason(
                 return "take profit: protected stop after profit lock"
             return "stop loss: protected stop slipped below entry"
     entry_context = position.metadata.get("entry_context") if isinstance(position.metadata.get("entry_context"), dict) else {}
-    if str(entry_context.get("stop_basis") or "") == "15m_precision_structure":
+    if position.side == PositionSide.LONG and str(entry_context.get("stop_basis") or "") == "15m_precision_structure":
         return "stop loss: 15m entry structure stop"
     if position.metadata.get("breakout_protected"):
         return _outcome_exit_reason(position, reference_price, "breakout protection stop", fee_rate)
@@ -1386,6 +1445,21 @@ def _short_support_trend_should_hold(
     if trend_state not in {"TREND_SHORT", "ONE_WAY_DOWN"}:
         return False
     return not _short_support_exhaustion_confirmed(price, signal, indicator)
+
+
+def _short_near_h4_support(
+    position: Position,
+    price: float,
+    signal: dict[str, object],
+    indicator: IndicatorSnapshot | None,
+) -> bool:
+    if position.side != PositionSide.SHORT:
+        return False
+    h4 = signal.get("h4_structure") if isinstance(signal.get("h4_structure"), dict) else {}
+    support = _float_or_none(h4.get("support"))
+    if support is None:
+        return False
+    return price <= support + _exit_structure_buffer(price, indicator)
 
 
 def _short_support_exhaustion_confirmed(
@@ -1976,6 +2050,24 @@ def _rotation_candidate_strong(signal: dict[str, object]) -> bool:
         and entry_timing == ENTRY_TIMING_GOOD
         and not signal.get("vetoes")
     )
+
+
+def _position_h4_allows_efficiency_rotation(position: Position, signal: dict[str, object]) -> bool:
+    h4 = signal.get("h4_structure") if isinstance(signal.get("h4_structure"), dict) else {}
+    h4_state = str(h4.get("state") or "UNKNOWN")
+    trend = str(signal.get("trend_state") or signal.get("regime") or "CHOP")
+    score = int(signal.get("score") or 0)
+    if position.side == PositionSide.LONG:
+        if h4_state == "BREAKOUT_UP" or trend == "ONE_WAY_UP":
+            return False
+        if trend == "TREND_LONG" and score >= 75 and h4_state in {"BOX_UPPER_HALF", "BOX_LOWER_HALF"}:
+            return False
+        return h4_state in {"UNKNOWN", "BREAKDOWN_DOWN", "RANGE_MID"} or trend not in {"TREND_LONG", "ONE_WAY_UP"}
+    if h4_state == "BREAKDOWN_DOWN" or trend == "ONE_WAY_DOWN":
+        return False
+    if trend == "TREND_SHORT" and score >= 75 and h4_state in {"BOX_UPPER_HALF", "BOX_LOWER_HALF"}:
+        return False
+    return h4_state in {"UNKNOWN", "BREAKOUT_UP", "RANGE_MID"} or trend not in {"TREND_SHORT", "ONE_WAY_DOWN"}
 
 
 def _position_efficiency_stalled(
@@ -2739,12 +2831,8 @@ def _apply_multi_timeframe_context(signal: dict[str, object], context: dict[str,
                 score -= 20
                 vetoes.append("low pullback with OI/funding/crowd risk; avoid short entry")
         elif _low_area_needs_short_pullback(h4_state, h1_direction, h1_state):
-            if _strong_m15_pullback_allowed(PositionSide.SHORT, trend_state, risk_state, score, m15_precision):
-                score += 6
-                reasons.append("one-way downtrend 15m BOLL/EMA9 bounce rejected; allow tactical short")
-            else:
-                score -= 12
-                vetoes.append("low area without bounce confirmation; wait for 1h/4h retest before short")
+            score -= 12
+            vetoes.append("low area without 1h/4h resistance retest; wait for higher-timeframe bounce before short")
         if h4_oi_state in {"DELEVERAGE_BREAKDOWN", "DELEVERAGE_CROWD_BREAKDOWN"}:
             if _deleverage_short_failure_confirmed(h1_direction, h1_state, pullback_direction, pullback_state, reasons):
                 score += 8
@@ -2853,9 +2941,9 @@ def _rsi_entry_adjustment(
             if not pullback_ok:
                 return -12, [], ["one-way downtrend RSI cold without 1h/15m bounce rejection; wait before short"]
             if rsi14 <= RSI_STRONG_SHORT_SEVERE:
-                reasons.append("one-way downtrend RSI below 10, but bounce rejection confirmed; use tight 15m structure stop")
+                reasons.append("one-way downtrend RSI below 10, but 1h/4h bounce rejection confirmed; use higher-timeframe structure stop")
                 return -6, reasons, vetoes
-            reasons.append("one-way downtrend RSI cold, but 1h/15m bounce rejection confirmed")
+            reasons.append("one-way downtrend RSI cold, but 1h/4h bounce rejection confirmed")
             return 0, reasons, vetoes
         return 0, reasons, vetoes
     if rsi14 < RSI_NORMAL_SHORT_MIN:
@@ -2881,7 +2969,7 @@ def _strong_rsi_pullback_ok(
     return (
         pullback_direction == "SHORT"
         and pullback_state == "HEALTHY_PULLBACK"
-    ) or _strong_m15_pullback_allowed(side, "ONE_WAY_DOWN", risk_state, score, m15_precision)
+    )
 
 
 def _ma_cluster_signal_adjustment(
@@ -2948,7 +3036,7 @@ def _strong_m15_pullback_allowed(
     m15_trend = str(precision.get("trend") or "")
     if side == PositionSide.LONG:
         return trend_state == "ONE_WAY_UP" and m15_trend == "UP" and pullback == "M15_LONG_PULLBACK"
-    return trend_state == "ONE_WAY_DOWN" and m15_trend == "DOWN" and pullback == "M15_SHORT_PULLBACK"
+    return False
 
 
 def _precision_stop_allowed(
@@ -2994,12 +3082,44 @@ def _daily_bias_margin_factor(side: str, signal: dict[str, object]) -> float:
 def _preferred_exit_indicator(
     timeframe_indicators: dict[str, list[IndicatorSnapshot]],
     fallback: list[IndicatorSnapshot],
+    position: Position | None = None,
 ) -> IndicatorSnapshot | None:
+    preferred_timeframe = _exit_timeframe_from_position(position)
+    if preferred_timeframe:
+        indicators = timeframe_indicators.get(preferred_timeframe) or []
+        if indicators:
+            return indicators[-1]
+        if preferred_timeframe == "15m" and fallback:
+            return fallback[-1]
     for timeframe in ("1h", "4h"):
         indicators = timeframe_indicators.get(timeframe) or []
         if indicators:
             return indicators[-1]
     return fallback[-1] if fallback else None
+
+
+def _exit_timeframe_from_position(position: Position | None) -> str | None:
+    if position is None:
+        return None
+    context = position.metadata.get("entry_context")
+    if not isinstance(context, dict):
+        return None
+    timeframe = str(context.get("stop_timeframe") or "").lower()
+    if timeframe in {"15m", "1h", "4h", "1d"}:
+        if timeframe == "15m" and position.side == PositionSide.SHORT:
+            return "1h"
+        return timeframe
+    stop_basis = str(context.get("stop_basis") or "")
+    if stop_basis == "15m_precision_structure":
+        if position.side == PositionSide.SHORT:
+            return "1h"
+        return "15m"
+    setup = str(context.get("entry_setup") or "")
+    if setup.startswith("h4_"):
+        return "4h"
+    if setup.startswith("h1_") or setup == "kc_atr_volatility":
+        return "1h"
+    return None
 
 
 def _refine_stop_with_precision(

@@ -525,7 +525,7 @@ def test_entry_reward_r_requires_enough_target_space() -> None:
     assert _entry_reward_r(signal, PositionSide.LONG, price=100.0, stop=99.5) == 2.0
 
 
-def test_auto_signal_allows_strong_one_way_15m_tactical_short() -> None:
+def test_auto_signal_waits_for_1h_4h_retest_in_one_way_down_short() -> None:
     signal = {
         "action": "ENTRY_SHORT",
         "score": 96,
@@ -542,9 +542,9 @@ def test_auto_signal_allows_strong_one_way_15m_tactical_short() -> None:
     }
     timing, reason = _signal_entry_timing(signal)
 
-    assert timing == "GOOD"
-    assert "entry zone" in reason
-    assert _auto_signal_allowed(signal)
+    assert timing == "WAIT"
+    assert "1h/4h resistance" in reason
+    assert not _auto_signal_allowed(signal)
 
 
 def test_auto_signal_waits_when_m15_tactical_stop_is_noise_close() -> None:
@@ -1075,6 +1075,48 @@ def test_preferred_exit_indicator_uses_1h_4h_not_15m_for_targets() -> None:
     assert _preferred_exit_indicator({"15m": [m15], "4h": [h4]}, [m15]) is h4
 
 
+def test_preferred_exit_indicator_uses_position_stop_timeframe() -> None:
+    engine = PaperTradingEngine(AppSettings(), starting_balance=1000, market_data=FakeMarketData())
+    m15 = indicator_snapshot(close=99.0, atr=0.4)
+    h1 = indicator_snapshot(close=100.0, atr=1.2)
+
+    import asyncio
+
+    position = asyncio.run(
+        engine.open_position(
+            "TESTUSDT",
+            "LONG",
+            margin_usdt=100,
+            leverage=5,
+            entry_context={"stop_basis": "15m_precision_structure"},
+        )
+    )
+
+    assert position.metadata["entry_context"]["stop_timeframe"] == "15m"
+    assert _preferred_exit_indicator({"15m": [m15], "1h": [h1]}, [m15], position) is m15
+
+
+def test_preferred_exit_indicator_ignores_15m_stop_timeframe_for_short() -> None:
+    engine = PaperTradingEngine(AppSettings(), starting_balance=1000, market_data=FakeMarketData())
+    m15 = indicator_snapshot(close=99.0, atr=0.4)
+    h1 = indicator_snapshot(close=100.0, atr=1.2)
+
+    import asyncio
+
+    position = asyncio.run(
+        engine.open_position(
+            "TESTUSDT",
+            "SHORT",
+            margin_usdt=100,
+            leverage=5,
+            entry_context={"stop_basis": "15m_precision_structure"},
+        )
+    )
+
+    assert position.metadata["entry_context"]["stop_timeframe"] == "15m"
+    assert _preferred_exit_indicator({"15m": [m15], "1h": [h1]}, [m15], position) is h1
+
+
 def test_rotation_candidate_requires_one_way_volatility_and_clean_risk() -> None:
     good = {
         "action": "ENTRY_LONG",
@@ -1175,7 +1217,7 @@ def test_auto_trade_rotates_weak_position_for_much_stronger_candidate() -> None:
     assert "TEST0USDT" not in engine.account.positions
     assert "TEST5USDT" in engine.account.positions
     assert len(engine.account.positions) == 5
-    assert engine.account.fills[-2].reason == "rotation exit: symbol=TEST5USDT score=95 current_score=75"
+    assert engine.account.fills[-2].reason == "rotation exit: trend invalidated; symbol=TEST5USDT score=95 current_score=75"
 
 
 def test_auto_trade_does_not_rotate_for_ordinary_high_score_candidate() -> None:
