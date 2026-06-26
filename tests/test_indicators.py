@@ -38,6 +38,11 @@ def test_build_indicators_aligns_derivatives_and_oi_change() -> None:
     assert indicators[-1].ma100 is not None
     assert indicators[-1].oi_change is not None
     assert indicators[-1].long_short_ratio == 1.1
+    assert indicators[-1].kc_mid is not None
+    assert indicators[-1].kc_upper is not None
+    assert indicators[-1].kc_lower is not None
+    assert indicators[-1].quote_flow is not None
+    assert indicators[-1].quote_flow_ratio is not None
 
 
 def test_atr_is_positive() -> None:

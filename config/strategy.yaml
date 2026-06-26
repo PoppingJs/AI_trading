@@ -39,6 +39,12 @@ strategy:
   structure_grind_tolerance_atr: 0.8
   sweep_wick_atr: 0.9
   wash_oi_drop_min: 0.003
+  keltner_window: 20
+  keltner_atr_multiplier: 2.0
+  keltner_near_atr: 0.35
+  qps_window: 20
+  qps_min_ratio: 1.15
+  qps_extreme_ratio: 4.0
   extreme_atr_pct: 0.06
   long_short_overcrowded_long: 2.2
   long_short_overcrowded_short: 0.45

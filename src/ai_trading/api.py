@@ -762,6 +762,10 @@ PAPER_DASHBOARD_HTML = """
       'take profit: near 4h support with profit protection': '止盈：靠近4小时支撑位，保护利润',
       'stop loss: near 4h resistance with profit protection': '止损：靠近4小时压力位后转弱',
       'stop loss: near 4h support with profit protection': '止损：靠近4小时支撑位后转弱',
+      'take profit: 4h support plus short exhaustion confirmed': '止盈：4小时支撑位出现空头衰竭确认',
+      'stop loss: 4h support plus short exhaustion confirmed': '止损：4小时支撑位反弹确认后离场',
+      'take profit: short trend support protection stop': '止盈：空头趋势支撑位保护止损触发',
+      'stop loss: short trend support protection stop': '止损：空头趋势支撑位保护止损触发',
       'take profit: profit drawdown after long crowd risk': '止盈：浮盈回撤叠加多头拥挤风险',
       'take profit: profit drawdown after short crowd risk': '止盈：浮盈回撤叠加空头拥挤风险',
       'take profit: profit drawdown after OI abnormal risk': '止盈：浮盈回撤叠加OI异常风险',
@@ -842,8 +846,14 @@ PAPER_DASHBOARD_HTML = """
       }
       const dynamicPrefixes = [
         ['VWAP pullback held; average cost support favors long', 'VWAP回踩不破，平均成本支撑多头'],
+        ['KC mid pullback held; volatility channel support favors long', 'KC中轨回踩不破，波动通道支撑多头'],
+        ['QPS quote flow accelerates with price; traded value confirms long', '成交额速度放大且价格上行，确认多头'],
+        ['QPS blow-off without price follow-through; long risk', '成交额放大但价格未跟进，多头风险'],
         ['price extended far above VWAP; chasing long risk', '价格远离VWAP，追多风险升高'],
         ['VWAP retest rejected; average cost resistance favors short', 'VWAP反抽不过，平均成本压制空头'],
+        ['KC mid retest rejected; volatility channel resistance favors short', 'KC中轨反抽不过，波动通道压制空头'],
+        ['QPS quote flow accelerates with price; traded value confirms short', '成交额速度放大且价格下行，确认空头'],
+        ['QPS blow-off without price follow-through; short risk', '成交额放大但价格未跟进，空头风险'],
         ['price extended far below VWAP; chasing short risk', '价格远离VWAP，追空风险升高'],
         ['volume pattern confirms long: breakout volume, quiet retest, renewed buying', '放量突破、缩量回踩、再放量上行'],
         ['volume breakout above resistance; retest confirmation preferred', '放量突破压力，等待回踩确认更稳'],
@@ -865,8 +875,9 @@ PAPER_DASHBOARD_HTML = """
         const text = String(value);
         const symbol = (text.match(/symbol=([^\\s]+)/) || [])[1] || '';
         const score = (text.match(/score=(\\d+)/) || [])[1] || '';
+        const type = text.includes('efficiency rotation') ? '效率调仓' : text.includes('trend invalidated') ? '趋势失效调仓' : '调仓';
         const display = symbol ? displaySymbol(symbol) : '更强标的';
-        return `调仓：5仓已满，换入高评分强趋势标的 ${display}${score ? `，评分=${score}` : ''}`;
+        return `${type}：5仓已满，换入高评分强趋势标的 ${display}${score ? `，评分=${score}` : ''}`;
       }
       if (String(value).startsWith('pyramid add:')) return String(value).replace('pyramid add:', '强趋势盈利回踩加仓：').replace('score=', '评分=').replace('state=', '状态=');
       if (String(value).startsWith('auto strategy score=')) return String(value).replace('auto strategy score=', '自动策略开仓，评分=');

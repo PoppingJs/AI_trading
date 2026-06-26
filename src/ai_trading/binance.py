@@ -26,6 +26,11 @@ class FuturesSymbol:
     status: str
     quote_volume: float
     trade_count: int
+    last_price: float | None = None
+    price_change_percent: float | None = None
+    high_price: float | None = None
+    low_price: float | None = None
+    open_price: float | None = None
 
 
 class BinanceFuturesMarketData:
@@ -74,6 +79,11 @@ class BinanceFuturesMarketData:
                     status="TRADING",
                     quote_volume=float(ticker.get("quoteVolume", 0.0)),
                     trade_count=int(ticker.get("count", 0)),
+                    last_price=_optional_float(ticker.get("lastPrice")),
+                    price_change_percent=_optional_float(ticker.get("priceChangePercent")),
+                    high_price=_optional_float(ticker.get("highPrice")),
+                    low_price=_optional_float(ticker.get("lowPrice")),
+                    open_price=_optional_float(ticker.get("openPrice")),
                 )
             )
         out.sort(key=lambda item: (item.quote_volume, item.trade_count), reverse=True)
@@ -211,6 +221,15 @@ def _retry_after_seconds(response: httpx.Response) -> float | None:
 
 def _from_ms(value: int | str) -> datetime:
     return datetime.fromtimestamp(int(value) / 1000, tz=UTC)
+
+
+def _optional_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _nearest_before(values: list[datetime], timestamp: datetime) -> datetime | None:

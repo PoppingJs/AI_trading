@@ -39,6 +39,12 @@ class StrategySettings:
     structure_grind_tolerance_atr: float = 0.8
     vwap_near_atr: float = 0.45
     vwap_extension_atr: float = 2.6
+    keltner_window: int = 20
+    keltner_atr_multiplier: float = 2.0
+    keltner_near_atr: float = 0.35
+    qps_window: int = 20
+    qps_min_ratio: float = 1.15
+    qps_extreme_ratio: float = 4.0
     volume_breakout_ratio: float = 1.3
     volume_pullback_ratio: float = 0.75
     volume_restart_ratio: float = 1.15

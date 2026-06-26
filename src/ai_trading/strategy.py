@@ -297,6 +297,18 @@ class CompositeStrategy:
                 score -= 6
                 reasons.append("price extended far above VWAP; chasing long risk")
 
+        if current.kc_mid is not None and current.atr14 is not None and current.atr14 > 0:
+            if latest_candle.low <= current.kc_mid + current.atr14 * self.settings.keltner_near_atr and current.close >= current.kc_mid:
+                score += 5
+                reasons.append("KC mid pullback held; volatility channel support favors long")
+
+        if current.quote_flow_ratio is not None:
+            if self.settings.qps_min_ratio <= current.quote_flow_ratio <= self.settings.qps_extreme_ratio and current.close >= previous.close:
+                score += 5
+                reasons.append("QPS quote flow accelerates with price; traded value confirms long")
+            elif current.quote_flow_ratio > self.settings.qps_extreme_ratio and current.close < previous.close:
+                reasons.append("QPS blow-off without price follow-through; long risk")
+
         if structure.long_confirmed:
             score += 12
             reasons.append("market structure confirms long: breakout or retest held")
@@ -391,6 +403,18 @@ class CompositeStrategy:
             elif current.close < current.vwap - current.atr14 * self.settings.vwap_extension_atr:
                 score -= 6
                 reasons.append("price extended far below VWAP; chasing short risk")
+
+        if current.kc_mid is not None and current.atr14 is not None and current.atr14 > 0:
+            if latest_candle.high >= current.kc_mid - current.atr14 * self.settings.keltner_near_atr and current.close <= current.kc_mid:
+                score += 5
+                reasons.append("KC mid retest rejected; volatility channel resistance favors short")
+
+        if current.quote_flow_ratio is not None:
+            if self.settings.qps_min_ratio <= current.quote_flow_ratio <= self.settings.qps_extreme_ratio and current.close <= previous.close:
+                score += 5
+                reasons.append("QPS quote flow accelerates with price; traded value confirms short")
+            elif current.quote_flow_ratio > self.settings.qps_extreme_ratio and current.close > previous.close:
+                reasons.append("QPS blow-off without price follow-through; short risk")
 
         if structure.short_confirmed:
             score += 12

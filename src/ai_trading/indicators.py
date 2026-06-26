@@ -118,9 +118,13 @@ def build_indicators(
     rsi_window: int = 14,
     atr_window: int = 14,
     volume_window: int = 20,
+    keltner_window: int = 20,
+    keltner_atr_multiplier: float = 2.0,
+    qps_window: int = 20,
 ) -> list[IndicatorSnapshot]:
     closes = [candle.close for candle in candles]
     volumes = [candle.volume for candle in candles]
+    typical_prices = [(candle.high + candle.low + candle.close) / 3 for candle in candles]
     ema_fast_values = ema(closes, ema_fast)
     ema_slow_values = ema(closes, ema_slow)
     ema_trend_values = ema(closes, 200)
@@ -129,6 +133,9 @@ def build_indicators(
     rsi_values = rsi(closes, rsi_window)
     atr_values = atr(candles, atr_window)
     volume_sma = sma(volumes, volume_window)
+    kc_mid_values = ema(typical_prices, keltner_window)
+    quote_flows = _quote_flow_per_second(candles, typical_prices)
+    quote_flow_sma = sma(quote_flows, qps_window)
 
     derivatives_by_time = {item.timestamp: item for item in derivatives or []}
     previous_oi: float | None = None
@@ -149,6 +156,13 @@ def build_indicators(
         vwap_value = vwap_price_volume / vwap_volume if vwap_volume else None
         volume_average = volume_sma[idx]
         volume_ratio = candle.volume / volume_average if volume_average else None
+        atr_value = atr_values[idx]
+        kc_mid = kc_mid_values[idx]
+        kc_upper = kc_mid + atr_value * keltner_atr_multiplier if kc_mid is not None and atr_value is not None else None
+        kc_lower = kc_mid - atr_value * keltner_atr_multiplier if kc_mid is not None and atr_value is not None else None
+        quote_flow = quote_flows[idx]
+        quote_flow_average = quote_flow_sma[idx]
+        quote_flow_ratio = quote_flow / quote_flow_average if quote_flow_average else None
         ema_slow_value = ema_slow_values[idx]
         ema_slope = None
         if idx >= 3 and ema_slow_value is not None and ema_slow_values[idx - 3] is not None:
@@ -180,17 +194,33 @@ def build_indicators(
                 boll_upper=boll_upper[idx],
                 boll_lower=boll_lower[idx],
                 rsi14=rsi_values[idx],
-                atr14=atr_values[idx],
+                atr14=atr_value,
                 volume_sma20=volume_average,
                 volume_ratio=volume_ratio,
                 ema50_slope=ema_slope,
                 vwap=vwap_value,
+                kc_mid=kc_mid,
+                kc_upper=kc_upper,
+                kc_lower=kc_lower,
+                quote_flow=quote_flow,
+                quote_flow_ratio=quote_flow_ratio,
                 open_interest=open_interest,
                 oi_change=oi_change,
                 long_short_ratio=long_short_ratio,
                 funding_rate=funding_rate,
             )
         )
+    return out
+
+
+def _quote_flow_per_second(candles: Sequence[Candle], typical_prices: Sequence[float]) -> list[float]:
+    out: list[float] = []
+    for idx, candle in enumerate(candles):
+        if idx == 0:
+            seconds = 60.0
+        else:
+            seconds = max((candle.timestamp - candles[idx - 1].timestamp).total_seconds(), 1.0)
+        out.append(typical_prices[idx] * candle.volume / seconds)
     return out
 
 

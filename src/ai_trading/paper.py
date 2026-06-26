@@ -18,6 +18,12 @@ from ai_trading.strategy import CompositeStrategy
 
 PaperSide = Literal["LONG", "SHORT"]
 AUTO_UNIVERSE_EXCLUDED_SYMBOLS = {"BTCUSDT", "BTCUSDC", "ETHUSDT", "SOLUSDT", "XAUUSDT"}
+CANDIDATE_MIN_QUOTE_VOLUME = 50_000_000
+CANDIDATE_MAX_ABS_24H_CHANGE = 60.0
+CANDIDATE_HIGH_CHANGE_THRESHOLD = 40.0
+CANDIDATE_MAX_UPPER_WICK_RATIO = 0.45
+CANDIDATE_MAX_RETRACE_FROM_HIGH_PCT = 22.0
+CANDIDATE_MAX_CENTER_OFFSET_PCT = 24.0
 BTC_EXTREME_4H_AMPLITUDE = 0.08
 ROTATION_MIN_SCORE_GAP = 20
 ROTATION_MIN_ATR_PCT = 0.008
@@ -47,6 +53,33 @@ MIN_ENTRY_REWARD_R = 1.2
 PROFIT_LOCK_SLIPPAGE_PCT = 0.0008
 MIN_PRECISION_STOP_PCT = 0.012
 MIN_PRECISION_STOP_ATR_MULTIPLE = 0.65
+
+
+def _candidate_prefilter_allowed(item: object) -> bool:
+    quote_volume = float(getattr(item, "quote_volume", 0.0) or 0.0)
+    if quote_volume < CANDIDATE_MIN_QUOTE_VOLUME:
+        return False
+    change = _float_or_none(getattr(item, "price_change_percent", None))
+    last_price = _float_or_none(getattr(item, "last_price", None))
+    high_price = _float_or_none(getattr(item, "high_price", None))
+    low_price = _float_or_none(getattr(item, "low_price", None))
+    open_price = _float_or_none(getattr(item, "open_price", None))
+    if change is not None and abs(change) > CANDIDATE_MAX_ABS_24H_CHANGE:
+        return False
+    if last_price and high_price and low_price and high_price > low_price:
+        center = (high_price + low_price) / 2
+        center_offset = abs(last_price - center) / last_price * 100
+        if change is not None and abs(change) > 35 and center_offset > CANDIDATE_MAX_CENTER_OFFSET_PCT:
+            return False
+        if change is not None and change > CANDIDATE_HIGH_CHANGE_THRESHOLD and open_price:
+            range_size = high_price - low_price
+            upper_wick_ratio = max(high_price - max(open_price, last_price), 0.0) / range_size
+            retrace_from_high_pct = (high_price - last_price) / last_price * 100
+            if upper_wick_ratio >= CANDIDATE_MAX_UPPER_WICK_RATIO:
+                return False
+            if retrace_from_high_pct >= CANDIDATE_MAX_RETRACE_FROM_HIGH_PCT:
+                return False
+    return True
 
 
 @dataclass(frozen=True)
@@ -187,8 +220,18 @@ class PaperTradingEngine:
     async def refresh_universe_if_needed(self) -> None:
         if self.symbols and self.symbols != ["AUTO_TOP30"]:
             return
-        top_symbols = await self.market_data.top_usdt_perpetuals(limit=45)
-        self.symbols = [item.symbol for item in top_symbols if item.symbol.upper() not in AUTO_UNIVERSE_EXCLUDED_SYMBOLS][:30]
+        top_symbols = await self.market_data.top_usdt_perpetuals(limit=80)
+        eligible = [item for item in top_symbols if item.symbol.upper() not in AUTO_UNIVERSE_EXCLUDED_SYMBOLS]
+        filtered = [item.symbol for item in eligible if _candidate_prefilter_allowed(item)]
+        if len(filtered) < 30:
+            seen = set(filtered)
+            for item in eligible:
+                if item.symbol not in seen:
+                    filtered.append(item.symbol)
+                    seen.add(item.symbol)
+                if len(filtered) >= 30:
+                    break
+        self.symbols = filtered[:30] or ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
 
     async def open_position(
         self,
@@ -410,6 +453,9 @@ class PaperTradingEngine:
             rsi_window=self.settings.strategy.rsi_window,
             atr_window=self.settings.strategy.atr_window,
             volume_window=self.settings.strategy.volume_window,
+            keltner_window=self.settings.strategy.keltner_window,
+            keltner_atr_multiplier=self.settings.strategy.keltner_atr_multiplier,
+            qps_window=self.settings.strategy.qps_window,
         )
         self.latest_indicators[symbol] = indicators
         timeframe_indicators, mtf_context = await self._multi_timeframe_context(symbol, candles, indicators)
@@ -469,6 +515,9 @@ class PaperTradingEngine:
                     rsi_window=self.settings.strategy.rsi_window,
                     atr_window=self.settings.strategy.atr_window,
                     volume_window=self.settings.strategy.volume_window,
+                    keltner_window=self.settings.strategy.keltner_window,
+                    keltner_atr_multiplier=self.settings.strategy.keltner_atr_multiplier,
+                    qps_window=self.settings.strategy.qps_window,
                 )
             candles = await self.market_data.klines(symbol, timeframe, limit=max(240, self.settings.strategy.ma_trend + 40))
             return timeframe, candles, _build_price_only_indicators(candles, self.settings)
@@ -560,6 +609,16 @@ class PaperTradingEngine:
                     preferred_indicator,
                 )
                 stop_basis = "volatility_structure"
+                kc_stop = _refine_stop_with_keltner(
+                    PositionSide(side),
+                    stop_loss,
+                    entry_price,
+                    preferred_indicator,
+                    trend_state,
+                )
+                if kc_stop != stop_loss:
+                    stop_loss = kc_stop
+                    stop_basis = "kc_atr_volatility"
                 stop_loss = _refine_stop_with_ma_cluster(PositionSide(side), stop_loss, mtf_context)
                 structure_stop = _refine_stop_with_retest_structure(
                     PositionSide(side),
@@ -633,31 +692,40 @@ class PaperTradingEngine:
         if replace_target is None:
             return
         best_score = int(best_signal.get("score") or 0)
-        position, current_score = replace_target
+        position, current_score, rotation_type = replace_target
         await self.close_position(
             position.symbol,
-            reason=f"rotation exit: symbol={best_symbol} score={best_score} current_score={current_score}",
+            reason=f"rotation exit: {rotation_type}; symbol={best_symbol} score={best_score} current_score={current_score}",
         )
 
     def _rotation_replace_target(
         self,
         candidate_signal: dict[str, object],
         candidate_indicator: IndicatorSnapshot | None,
-    ) -> tuple[Position, int] | None:
-        best_target: tuple[Position, int] | None = None
+    ) -> tuple[Position, int, str] | None:
+        best_target: tuple[Position, int, str] | None = None
         candidate_score = int(candidate_signal.get("score") or 0)
+        candidate_is_strong = _rotation_candidate_strong(candidate_signal)
         for symbol, position in self.account.positions.items():
             signal = self.latest_signals.get(symbol, {})
             current_score = int(signal.get("score") or 0)
+            price = self.latest_prices.get(symbol)
             current_indicators = self.latest_indicators.get(symbol, [])
             current_indicator = current_indicators[-1] if current_indicators else None
             if candidate_score - current_score < ROTATION_MIN_SCORE_GAP:
                 continue
-            if not _position_structure_failed(position, signal):
+            trend_failed = _position_structure_failed(position, signal)
+            efficiency_stalled = (
+                candidate_is_strong
+                and price is not None
+                and _position_efficiency_stalled(position, signal, current_indicator, price)
+            )
+            if not trend_failed and not efficiency_stalled:
                 continue
             if not _rotation_efficiency_better(candidate_indicator, current_indicator):
                 continue
-            target = (position, current_score)
+            rotation_type = "trend invalidated" if trend_failed else "efficiency rotation"
+            target = (position, current_score, rotation_type)
             if best_target is None or current_score < best_target[1]:
                 best_target = target
         return best_target
@@ -705,7 +773,14 @@ class PaperTradingEngine:
             if drawdown_exit_reason:
                 self._close_position_unlocked(position, price, drawdown_exit_reason)
                 continue
-            structure_take_profit_reason = _structure_take_profit_reason(position, price, signal, exit_indicator)
+            structure_take_profit_reason = _structure_take_profit_reason(
+                position,
+                price,
+                signal,
+                exit_indicator,
+                trend_state,
+                self.settings.execution.taker_fee_rate,
+            )
             if structure_take_profit_reason:
                 self._close_position_unlocked(position, price, structure_take_profit_reason)
                 continue
@@ -809,6 +884,7 @@ class PaperTradingEngine:
         notional = price * position.quantity
         fee = notional * self.settings.execution.taker_fee_rate
         realized = gross_pnl - fee
+        reason = _strict_exit_reason_by_realized(reason, realized)
         margin_usdt = float(position.metadata.get("margin_usdt", 0.0))
         leverage = int(position.metadata.get("leverage", self.settings.risk.leverage_default))
         self.account.wallet_balance += realized
@@ -1165,6 +1241,8 @@ def _stop_exit_reason(
         return "stop loss: 15m entry structure stop"
     if position.metadata.get("breakout_protected"):
         return _outcome_exit_reason(position, reference_price, "breakout protection stop", fee_rate)
+    if position.metadata.get("short_support_protected"):
+        return _outcome_exit_reason(position, reference_price, "short trend support protection stop", fee_rate)
     if _position_structure_failed(position, signal):
         return "stop loss: signal direction or structure failed"
     return "stop loss: ATR volatility hard stop"
@@ -1173,6 +1251,20 @@ def _stop_exit_reason(
 def _outcome_exit_reason(position: Position, price: float, detail: str, fee_rate: float = 0.0) -> str:
     prefix = "take profit" if _estimated_exit_net_pnl(position, price, fee_rate) > 0 else "stop loss"
     return f"{prefix}: {detail}"
+
+
+def _strict_exit_reason_by_realized(reason: str, realized: float) -> str:
+    text = (reason or "").strip()
+    if not text:
+        return "take profit" if realized > 0 else "stop loss"
+    lower = text.lower()
+    if lower.startswith(("rotation exit:", "pyramid add:", "manual")):
+        return text
+    if lower.startswith(("take profit:", "stop loss:")):
+        detail = text.split(":", 1)[1].strip()
+        prefix = "take profit" if realized > 0 else "stop loss"
+        return f"{prefix}: {detail}" if detail else prefix
+    return text
 
 
 def _estimated_exit_net_pnl(position: Position, price: float, fee_rate: float = 0.0) -> float:
@@ -1247,6 +1339,8 @@ def _structure_take_profit_reason(
     price: float,
     signal: dict[str, object],
     indicator: IndicatorSnapshot | None,
+    trend_state: str = "CHOP",
+    fee_rate: float = 0.0,
 ) -> str | None:
     stop_distance = float(position.metadata.get("initial_stop_distance") or abs(position.entry_price - position.stop_price))
     if stop_distance <= 0:
@@ -1264,8 +1358,13 @@ def _structure_take_profit_reason(
     else:
         support = _float_or_none(h4.get("support"))
         if support is not None and price <= support + buffer:
-            if _profit_risk_signal(signal, indicator) or current_profit >= stop_distance * 1.2:
-                return _outcome_exit_reason(position, price, "near 4h support with profit protection")
+            if _short_support_trend_should_hold(position, price, signal, indicator, trend_state):
+                _tighten_short_support_stop(position, price, signal, indicator)
+                return None
+            if _short_support_exhaustion_confirmed(price, signal, indicator):
+                return _outcome_exit_reason(position, price, "4h support plus short exhaustion confirmed", fee_rate)
+            if trend_state not in {"TREND_SHORT", "ONE_WAY_DOWN"} and _profit_risk_signal(signal, indicator):
+                return _outcome_exit_reason(position, price, "near 4h support with profit protection", fee_rate)
     return None
 
 
@@ -1273,6 +1372,97 @@ def _exit_structure_buffer(price: float, indicator: IndicatorSnapshot | None) ->
     if indicator and indicator.atr14:
         return max(indicator.atr14 * 0.8, price * 0.003)
     return price * 0.006
+
+
+def _short_support_trend_should_hold(
+    position: Position,
+    price: float,
+    signal: dict[str, object],
+    indicator: IndicatorSnapshot | None,
+    trend_state: str,
+) -> bool:
+    if position.side != PositionSide.SHORT:
+        return False
+    if trend_state not in {"TREND_SHORT", "ONE_WAY_DOWN"}:
+        return False
+    return not _short_support_exhaustion_confirmed(price, signal, indicator)
+
+
+def _short_support_exhaustion_confirmed(
+    price: float,
+    signal: dict[str, object],
+    indicator: IndicatorSnapshot | None,
+) -> bool:
+    risk_state = str(signal.get("risk_state") or "NORMAL")
+    h4_oi = signal.get("h4_oi") if isinstance(signal.get("h4_oi"), dict) else {}
+    drop_from_high = _float_or_none(h4_oi.get("drop_from_high_pct")) or 0.0
+    reasons_text = " | ".join(str(reason).lower() for reason in (signal.get("reasons") or ()))
+    rsi_extreme = bool(indicator and indicator.rsi14 is not None and indicator.rsi14 <= RSI_STRONG_SHORT_SEVERE)
+    short_crowded = risk_state == "SHORT_CROWD" or "short crowd" in reasons_text or "空头拥挤" in reasons_text
+    oi_valley = drop_from_high <= -0.16 or any(
+        token in reasons_text
+        for token in (
+            "oi valley",
+            "oi flush",
+            "oi drained",
+            "deleverag",
+            "oi洼地",
+            "oi 去杠杆",
+        )
+    )
+    h1_reclaimed = False
+    if indicator:
+        levels = [value for value in (indicator.ema20, indicator.boll_mid) if value is not None]
+        if levels:
+            h1_reclaimed = price >= min(levels)
+    downside_reclaim = any(
+        token in reasons_text
+        for token in (
+            "lower wick sweep reclaimed",
+            "downside sweep reclaimed",
+            "capitulation absorption",
+            "support held",
+            "下插针",
+            "收回支撑",
+            "支撑收回",
+        )
+    )
+    return ((rsi_extreme or short_crowded) and (h1_reclaimed or downside_reclaim)) or (oi_valley and downside_reclaim)
+
+
+def _tighten_short_support_stop(
+    position: Position,
+    price: float,
+    signal: dict[str, object],
+    indicator: IndicatorSnapshot | None,
+) -> None:
+    if position.side != PositionSide.SHORT or indicator is None or not indicator.atr14:
+        return
+    candidates: list[float] = []
+    if indicator.ema20 is not None:
+        candidates.append(indicator.ema20 + indicator.atr14 * 0.45)
+    if indicator.ema50 is not None:
+        candidates.append(indicator.ema50 + indicator.atr14 * 0.35)
+    h1 = signal.get("h1_trigger") if isinstance(signal.get("h1_trigger"), dict) else {}
+    h4 = signal.get("h4_structure") if isinstance(signal.get("h4_structure"), dict) else {}
+    for key in ("resistance_zone_low", "resistance", "resistance_zone_high"):
+        value = _float_or_none(h1.get(key))
+        if value is not None:
+            candidates.append(value + indicator.atr14 * 0.25)
+    for key in ("resistance_zone_low", "resistance", "resistance_zone_high"):
+        value = _float_or_none(h4.get(key))
+        if value is not None:
+            candidates.append(value + indicator.atr14 * 0.35)
+    worst_price = _float_or_none(position.metadata.get("worst_price"))
+    if worst_price is not None and worst_price > price:
+        candidates.append(worst_price + indicator.atr14 * 0.2)
+    valid = [candidate for candidate in candidates if candidate > price]
+    if not valid:
+        return
+    protected_stop = min(valid)
+    if protected_stop < position.stop_price:
+        position.stop_price = protected_stop
+        position.metadata["short_support_protected"] = True
 
 
 def _confirmed_structure_exit_reason(position: Position, price: float, signal: dict[str, object]) -> str | None:
@@ -1773,6 +1963,52 @@ def _position_structure_failed(position: Position, signal: dict[str, object]) ->
     return opposite_signal or trend_lost or risk_break or bool(vetoes)
 
 
+def _rotation_candidate_strong(signal: dict[str, object]) -> bool:
+    action = str(signal.get("action") or "")
+    trend = str(signal.get("trend_state") or signal.get("regime") or "")
+    risk_state = str(signal.get("risk_state") or "NORMAL")
+    entry_timing, _ = _signal_entry_timing(signal)
+    return (
+        action in {SignalAction.ENTRY_LONG.value, SignalAction.ENTRY_SHORT.value}
+        and trend in {"ONE_WAY_UP", "ONE_WAY_DOWN"}
+        and int(signal.get("score") or 0) >= 95
+        and risk_state == "NORMAL"
+        and entry_timing == ENTRY_TIMING_GOOD
+        and not signal.get("vetoes")
+    )
+
+
+def _position_efficiency_stalled(
+    position: Position,
+    signal: dict[str, object],
+    indicator: IndicatorSnapshot | None,
+    price: float,
+) -> bool:
+    opened_at = position.opened_at
+    if opened_at.tzinfo is None:
+        opened_at = opened_at.replace(tzinfo=UTC)
+    if datetime.now(UTC) - opened_at < timedelta(hours=1):
+        return False
+    if _position_structure_failed(position, signal):
+        return False
+    stop_distance = float(position.metadata.get("initial_stop_distance") or abs(position.entry_price - position.stop_price))
+    if stop_distance <= 0:
+        return False
+    current_profit = price - position.entry_price if position.side == PositionSide.LONG else position.entry_price - price
+    if current_profit >= stop_distance * 0.8:
+        return False
+    trend = str(signal.get("trend_state") or signal.get("regime") or "CHOP")
+    score = int(signal.get("score") or 0)
+    risk_state = str(signal.get("risk_state") or "NORMAL")
+    if trend in {"ONE_WAY_UP", "ONE_WAY_DOWN"} and score >= 95 and risk_state == "NORMAL":
+        return False
+    if indicator is None:
+        return True
+    weak_volume = (indicator.volume_ratio or 0.0) < 1.05
+    weak_oi = (indicator.oi_change or 0.0) <= 0.0
+    return trend not in {"ONE_WAY_UP", "ONE_WAY_DOWN"} or score < 85 or weak_volume or weak_oi
+
+
 def _rotation_efficiency_better(candidate: IndicatorSnapshot | None, current: IndicatorSnapshot | None) -> bool:
     if candidate is None or not candidate.close or not candidate.atr14:
         return False
@@ -1806,6 +2042,9 @@ def _build_price_only_indicators(candles: list[Candle], settings: AppSettings) -
         rsi_window=settings.strategy.rsi_window,
         atr_window=settings.strategy.atr_window,
         volume_window=settings.strategy.volume_window,
+        keltner_window=settings.strategy.keltner_window,
+        keltner_atr_multiplier=settings.strategy.keltner_atr_multiplier,
+        qps_window=settings.strategy.qps_window,
     )
 
 
@@ -2827,6 +3066,33 @@ def _refine_stop_with_ma_cluster(side: PositionSide, stop: float, context: dict[
         if state == "RETEST_DOWN" and ema20_value is not None:
             return max(stop, ema20_value + buffer)
     return stop
+
+
+def _refine_stop_with_keltner(
+    side: PositionSide,
+    stop: float,
+    entry: float,
+    indicator: IndicatorSnapshot | None,
+    trend_state: str,
+) -> float:
+    if indicator is None or indicator.atr14 is None or indicator.atr14 <= 0 or indicator.kc_mid is None:
+        return stop
+    buffer = indicator.atr14 * 0.35
+    if side == PositionSide.LONG:
+        candidates = [stop]
+        if indicator.kc_lower is not None and indicator.kc_lower < entry:
+            candidates.append(indicator.kc_lower - buffer)
+        if trend_state in {"TREND_LONG", "ONE_WAY_UP"} and indicator.kc_mid < entry:
+            candidates.append(indicator.kc_mid - buffer)
+        valid = [candidate for candidate in candidates if candidate < entry]
+        return min(valid) if valid else stop
+    candidates = [stop]
+    if indicator.kc_upper is not None and indicator.kc_upper > entry:
+        candidates.append(indicator.kc_upper + buffer)
+    if trend_state in {"TREND_SHORT", "ONE_WAY_DOWN"} and indicator.kc_mid > entry:
+        candidates.append(indicator.kc_mid + buffer)
+    valid = [candidate for candidate in candidates if candidate > entry]
+    return max(valid) if valid else stop
 
 
 def _refine_stop_with_retest_structure(
