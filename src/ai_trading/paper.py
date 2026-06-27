@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 from dataclasses import asdict, dataclass, field
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta, timezone
@@ -142,7 +143,11 @@ class PaperTradingEngine:
         self.interval = interval
         self.market_data = market_data or BinanceFuturesMarketData()
         self.strategy = CompositeStrategy(settings.strategy)
-        self.latest_prices: dict[str, float] = {}
+        self.latest_prices: dict[str, float] = {
+            symbol: mark_price
+            for symbol, position in self.account.positions.items()
+            if (mark_price := _stored_mark_price(position)) is not None
+        }
         self.latest_signals: dict[str, dict[str, object]] = {symbol: dict(signal) for symbol, signal in self.account.latest_signals.items()}
         self.latest_indicators: dict[str, list[IndicatorSnapshot]] = {}
         self.latest_timeframe_contexts: dict[str, dict[str, object]] = {}
@@ -152,17 +157,25 @@ class PaperTradingEngine:
         self.last_error: str | None = None
         self.last_market_update_at: datetime | None = None
         self._task: asyncio.Task | None = None
+        self._poll_seconds = 20
         self._lock = asyncio.Lock()
 
     async def start(self, *, auto_trade: bool = False, poll_seconds: int = 20) -> None:
         async with self._lock:
             self.auto_trade = auto_trade
+            self._poll_seconds = max(poll_seconds, 5)
             if self.running:
                 return
             self.running = True
-            self._task = asyncio.create_task(self._run_loop(poll_seconds=poll_seconds))
+            self._task = asyncio.create_task(self._run_loop())
 
     async def stop(self) -> None:
+        """Disable new automated entries while keeping market and position management alive."""
+        async with self._lock:
+            self.auto_trade = False
+
+    async def shutdown(self) -> None:
+        """Stop the background worker during application shutdown."""
         async with self._lock:
             self.running = False
             self.auto_trade = False
@@ -190,7 +203,7 @@ class PaperTradingEngine:
             self._save_state_unlocked()
 
     async def close(self) -> None:
-        await self.stop()
+        await self.shutdown()
         close = getattr(self.market_data, "aclose", None)
         if close is not None:
             await close()
@@ -217,6 +230,36 @@ class PaperTradingEngine:
             self._save_state_unlocked()
         elif errors:
             self.last_error = f"行情刷新失败，等待网络恢复：{'; '.join(errors[:3])}"
+
+    async def refresh_open_position_prices(self) -> int:
+        """Refresh persisted positions without starting the strategy loop."""
+        symbols = list(self.account.positions)
+        if not symbols:
+            return 0
+
+        semaphore = asyncio.Semaphore(5)
+
+        async def fetch(symbol: str) -> tuple[str, float] | None:
+            async with semaphore:
+                try:
+                    candles = await self.market_data.klines(symbol, self.interval, limit=2)
+                except Exception:  # noqa: BLE001 - keep the persisted mark when the network is unavailable
+                    return None
+                if not candles:
+                    return None
+                return symbol, float(candles[-1].close)
+
+        results = await asyncio.gather(*(fetch(symbol) for symbol in symbols))
+        refreshed = [result for result in results if result is not None]
+        if not refreshed:
+            return 0
+
+        async with self._lock:
+            for symbol, price in refreshed:
+                self._remember_mark_price(symbol, price)
+            self.last_market_update_at = datetime.now(UTC)
+            self._save_state_unlocked()
+        return len(refreshed)
 
     async def refresh_universe_if_needed(self) -> None:
         if self.symbols and self.symbols != ["AUTO_TOP30"]:
@@ -290,6 +333,7 @@ class PaperTradingEngine:
                     "entry_position": entry_position,
                     "adds": 0,
                     "initial_stop_distance": abs(price - stop_loss),
+                    "last_mark_price": price,
                 },
             )
             self.account.positions[symbol] = position
@@ -343,7 +387,7 @@ class PaperTradingEngine:
         positions_snapshot = list(self.account.positions.values())
         fills_snapshot = list(self.account.fills[-100:])
         for position in positions_snapshot:
-            price = latest_prices.get(position.symbol, position.entry_price)
+            price = latest_prices.get(position.symbol) or _stored_mark_price(position) or position.entry_price
             pnl = _pnl(position.side, position.entry_price, price, position.quantity)
             margin = float(position.metadata.get("margin_usdt", 0.0))
             entry_reasons = tuple(str(reason) for reason in (position.metadata.get("entry_reasons") or ()))
@@ -385,6 +429,11 @@ class PaperTradingEngine:
             )
         equity = self.account.wallet_balance + unrealized
         total_pnl = equity - self.account.starting_balance
+        gross_realized_pnl = (
+            self.account.wallet_balance
+            - self.account.starting_balance
+            + self.account.fees_paid
+        )
         now = datetime.now(UTC)
         pnl_history = _pnl_history_payload(self.account.pnl_history, total_pnl, now=now)
         return {
@@ -397,7 +446,7 @@ class PaperTradingEngine:
             "equity": equity,
             "available_balance": max(equity - used_margin, 0.0),
             "used_margin": used_margin,
-            "realized_pnl": self.account.realized_pnl,
+            "realized_pnl": gross_realized_pnl,
             "unrealized_pnl": unrealized,
             "total_pnl": total_pnl,
             "total_pnl_pct": total_pnl / self.account.starting_balance,
@@ -414,7 +463,7 @@ class PaperTradingEngine:
             "updated_at": now.isoformat(),
         }
 
-    async def _run_loop(self, *, poll_seconds: int) -> None:
+    async def _run_loop(self) -> None:
         while self.running:
             try:
                 await self.refresh_once()
@@ -424,7 +473,7 @@ class PaperTradingEngine:
             except Exception as exc:  # noqa: BLE001 - user-facing paper loop should keep running
                 self.last_error = str(exc)
             self._record_account_snapshots()
-            await asyncio.sleep(max(poll_seconds, 5))
+            await asyncio.sleep(self._poll_seconds)
 
     def _record_account_snapshots(self, now: datetime | None = None) -> None:
         total_pnl = self._current_total_pnl()
@@ -438,7 +487,7 @@ class PaperTradingEngine:
     def _current_total_pnl(self) -> float:
         unrealized = 0.0
         for position in self.account.positions.values():
-            price = self.latest_prices.get(position.symbol, position.entry_price)
+            price = self.latest_prices.get(position.symbol) or _stored_mark_price(position) or position.entry_price
             unrealized += _pnl(position.side, position.entry_price, price, position.quantity)
         return self.account.wallet_balance + unrealized - self.account.starting_balance
 
@@ -448,7 +497,7 @@ class PaperTradingEngine:
         if not candles:
             return False
         price = candles[-1].close
-        self.latest_prices[symbol] = price
+        self._remember_mark_price(symbol, price)
         indicators = build_indicators(
             candles,
             derivatives,
@@ -550,8 +599,17 @@ class PaperTradingEngine:
             candles = await self.market_data.klines(symbol, self.interval, limit=2)
             if not candles:
                 raise ValueError(f"cannot fetch price for {symbol}")
-            self.latest_prices[symbol] = candles[-1].close
+            self._remember_mark_price(symbol, float(candles[-1].close))
         return self.latest_prices[symbol]
+
+    def _remember_mark_price(self, symbol: str, price: float) -> None:
+        if not math.isfinite(price) or price <= 0:
+            return
+        symbol = symbol.upper()
+        self.latest_prices[symbol] = price
+        position = self.account.positions.get(symbol)
+        if position is not None:
+            position.metadata["last_mark_price"] = price
 
     async def _auto_trade_once(self) -> None:
         if await self._btc_4h_extreme_volatility():
@@ -970,6 +1028,14 @@ def _pnl(side: PositionSide, entry_price: float, mark_price: float, quantity: fl
     if side == PositionSide.LONG:
         return (mark_price - entry_price) * quantity
     return (entry_price - mark_price) * quantity
+
+
+def _stored_mark_price(position: Position) -> float | None:
+    try:
+        price = float(position.metadata.get("last_mark_price"))
+    except (TypeError, ValueError):
+        return None
+    return price if math.isfinite(price) and price > 0 else None
 
 
 def _score_from_reason(reason: str) -> str:

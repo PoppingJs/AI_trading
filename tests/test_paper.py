@@ -5,6 +5,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from fastapi.testclient import TestClient
+import pytest
 
 from ai_trading.api import create_app
 from ai_trading.config import AppSettings
@@ -130,6 +131,22 @@ def test_paper_engine_manual_long_close_profit() -> None:
     assert engine.status()["equity"] > 1000
 
 
+def test_paper_status_pnl_components_reconcile_to_total() -> None:
+    market = FakeMarketData()
+    engine = PaperTradingEngine(AppSettings(), starting_balance=1000, market_data=market)
+
+    asyncio.run(engine.open_position("BTCUSDT", "LONG", margin_usdt=100, leverage=5))
+    market.price = 110.0
+    engine.latest_prices["BTCUSDT"] = 110.0
+    asyncio.run(engine.close_position("BTCUSDT"))
+    asyncio.run(engine.open_position("ETHUSDT", "SHORT", margin_usdt=50, leverage=5))
+    engine.latest_prices["ETHUSDT"] = 105.0
+
+    status = engine.status()
+    components = status["realized_pnl"] + status["unrealized_pnl"] - status["fees_paid"]
+    assert components == pytest.approx(status["total_pnl"])
+
+
 def test_closed_fill_preserves_actual_auto_entry_position() -> None:
     market = FakeMarketData()
     engine = PaperTradingEngine(AppSettings(), starting_balance=1000, market_data=market)
@@ -202,6 +219,105 @@ def test_paper_engine_persists_positions_and_fills(tmp_path: Path) -> None:
     restored_again = PaperTradingEngine(AppSettings(), starting_balance=500, market_data=FakeMarketData(), state_path=state_path)
     assert restored_again.status()["positions"] == []
     assert restored_again.status()["fills"][-1]["action"] == "CLOSE"
+
+
+def test_paper_engine_persists_last_mark_price_for_open_positions(tmp_path: Path) -> None:
+    state_path = tmp_path / "paper_state.json"
+    market = FakeMarketData()
+    engine = PaperTradingEngine(AppSettings(), starting_balance=1000, market_data=market, state_path=state_path)
+
+    asyncio.run(engine.open_position("BTCUSDT", "LONG", margin_usdt=100, leverage=5))
+    market.price = 110.0
+    assert asyncio.run(engine.refresh_open_position_prices()) == 1
+
+    restored = PaperTradingEngine(AppSettings(), starting_balance=500, market_data=FakeMarketData(), state_path=state_path)
+    status = restored.status()
+    assert status["positions"][0]["mark_price"] == 110.0
+    assert status["unrealized_pnl"] == 50.0
+
+
+def test_stop_disables_entries_without_stopping_background_worker() -> None:
+    async def scenario() -> None:
+        engine = PaperTradingEngine(AppSettings(), starting_balance=1000, market_data=FakeMarketData())
+        refreshed = asyncio.Event()
+
+        async def fake_refresh() -> None:
+            refreshed.set()
+
+        engine.refresh_once = fake_refresh  # type: ignore[method-assign]
+        await engine.start(auto_trade=True, poll_seconds=5)
+        await asyncio.wait_for(refreshed.wait(), timeout=1)
+        worker = engine._task
+
+        await engine.stop()
+
+        assert engine.running is True
+        assert engine.auto_trade is False
+        assert worker is not None and not worker.done()
+
+        await engine.shutdown()
+        assert engine.running is False
+        assert engine._task is None
+
+    asyncio.run(scenario())
+
+
+def test_disabled_entries_still_manage_and_close_existing_position() -> None:
+    async def scenario() -> None:
+        engine = PaperTradingEngine(AppSettings(), starting_balance=1000, market_data=FakeMarketData())
+        await engine.open_position(
+            "BTCUSDT",
+            "LONG",
+            margin_usdt=100,
+            leverage=5,
+            stop_loss=99.0,
+            take_profit_1=110.0,
+            take_profit_2=120.0,
+        )
+
+        async def fake_refresh() -> None:
+            engine._remember_mark_price("BTCUSDT", 98.0)
+
+        engine.refresh_once = fake_refresh  # type: ignore[method-assign]
+        await engine.start(auto_trade=False, poll_seconds=5)
+
+        for _ in range(20):
+            if not engine.account.positions:
+                break
+            await asyncio.sleep(0.01)
+
+        status = engine.status()
+        assert engine.auto_trade is False
+        assert engine.running is True
+        assert status["positions"] == []
+        assert status["fills"][-1]["action"] == "CLOSE"
+        assert status["realized_pnl"] < 0
+        assert status["fees_paid"] > 0
+
+        await engine.shutdown()
+
+    asyncio.run(scenario())
+
+
+def test_app_starts_position_management_with_new_entries_disabled(tmp_path: Path) -> None:
+    app = create_app(state_path=tmp_path / "paper_state.json")
+    engine = PaperTradingEngine(AppSettings(), starting_balance=1000, market_data=FakeMarketData())
+    app.state.paper_engine = engine
+
+    with TestClient(app) as client:
+        initial = client.get("/api/paper/status").json()
+        assert initial["running"] is True
+        assert initial["auto_trade"] is False
+
+        enabled = client.post("/api/paper/start", json={"auto_trade": True}).json()
+        assert enabled["running"] is True
+        assert enabled["auto_trade"] is True
+
+        disabled = client.post("/api/paper/stop").json()
+        assert disabled["running"] is True
+        assert disabled["auto_trade"] is False
+
+    assert engine.running is False
 
 
 def test_auto_leverage_scales_with_signal_score() -> None:

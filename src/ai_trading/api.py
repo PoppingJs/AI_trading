@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from contextlib import asynccontextmanager
 from dataclasses import asdict
 import os
@@ -54,8 +55,18 @@ def create_app(settings_path: str | Path = "config/strategy.yaml", state_path: s
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        yield
-        await app.state.paper_engine.close()
+        await app.state.paper_engine.start(auto_trade=False)
+        startup_refresh = asyncio.create_task(app.state.paper_engine.refresh_open_position_prices())
+        try:
+            yield
+        finally:
+            if not startup_refresh.done():
+                startup_refresh.cancel()
+                try:
+                    await startup_refresh
+                except asyncio.CancelledError:
+                    pass
+            await app.state.paper_engine.close()
 
     app = FastAPI(
         title="AI Trading Strategy API",
@@ -461,7 +472,7 @@ PAPER_DASHBOARD_HTML = """
         <select id="interval"><option>15m</option><option selected>1h</option><option>4h</option><option>1d</option></select>
         <div class="control-actions">
           <button class="primary" onclick="startPaper(true)">启动策略</button>
-          <button class="neutral" onclick="stopPaper()">停止</button>
+          <button class="neutral" onclick="stopPaper()">关闭策略</button>
           <button class="neutral" onclick="resetPaper()">重置1200U</button>
         </div>
         <p class="error" id="error"></p>
@@ -1395,7 +1406,7 @@ PAPER_DASHBOARD_HTML = """
     function render(data) {
       const marketAge = data.market_updated_at ? (Date.now() - new Date(data.market_updated_at).getTime()) / 1000 : Infinity;
       const marketState = marketAge > 60 ? '行情延迟' : '行情正常';
-      document.getElementById('updated').textContent = `${data.running ? '运行中' : '已停止'} | 自动策略 ${data.auto_trade ? '开' : '关'} | ${marketState} | ${timeText(data.market_updated_at || data.updated_at)}`;
+      document.getElementById('updated').textContent = `${data.running ? '行情与持仓管理运行中' : '后台服务已停止'} | 新开仓 ${data.auto_trade ? '允许' : '禁止'} | ${marketState} | ${timeText(data.market_updated_at || data.updated_at)}`;
       const metrics = [
         ['资金', money(data.equity) + ' U'],
         ['可用', money(data.available_balance) + ' U'],
