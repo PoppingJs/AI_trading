@@ -311,8 +311,8 @@ PAPER_DASHBOARD_HTML = """
     #positions tbody tr, #signals tbody tr, #fills tbody tr { height: 16px; }
     #signals th, #signals td { height: 22px; padding: 2px 4px; line-height: 1.2; }
     #signals tbody tr { height: 22px; }
-    #fills { width: max-content; max-width: 100%; table-layout: auto; }
-    #fills th, #fills td { padding: 0 1px; overflow: hidden; text-overflow: clip; }
+    #fills { width: 100%; max-width: 100%; table-layout: fixed; }
+    #fills th, #fills td { min-width: 0; max-width: none; padding: 0 1px; overflow: hidden; text-overflow: clip; }
     #fills .time-col { font-size: 11px; }
     #fills .side-col { padding-left: 0; padding-right: 0; }
     #fills .reason-col { text-align: center; line-height: 1.2; overflow-wrap: anywhere; }
@@ -348,7 +348,10 @@ PAPER_DASHBOARD_HTML = """
     .center-table .reason-col { min-width: 180px; max-width: 360px; text-align: left; white-space: normal; line-height: 1.2; }
     #positions { width: 100%; table-layout: auto; }
     #positions .reason-col { min-width: 560px; max-width: none; width: 100%; }
-    #fills .reason-col { min-width: 50em; max-width: 50em; }
+    #fills .symbol-col, #fills .side-col, #fills .num-col, #fills .time-col { min-width: 0; max-width: none; }
+    #fills .reason-col { min-width: 0; max-width: none; text-align: center; white-space: normal; }
+    #fills .entry-position-col { min-width: 0; max-width: none; text-align: left; white-space: normal; line-height: 1.2; overflow-wrap: anywhere; }
+    #fills th.entry-position-col { text-align: center; }
     .center-table th.reason-col { text-align: center; }
     .status { font-size: 12px; color: #6b7280; }
     .pill { display: inline-block; padding: 3px 7px; border-radius: 999px; background: #eef2ff; color: #3730a3; font-size: 12px; }
@@ -509,7 +512,6 @@ PAPER_DASHBOARD_HTML = """
     let pnlSamples = [];
     let latestTotalPnl = 0;
     let fillsPage = 1;
-    const fillsPageSize = 6;
     let dailyMonthKey = null;
     let latestDailyPnl = null;
     async function api(path, options = {}) {
@@ -1428,11 +1430,10 @@ PAPER_DASHBOARD_HTML = """
         .map(([symbol, s]) => [displaySymbol(symbol), `<span class="pill">${tAction(s.action)}</span>`, tTrendState(s.trend_state || s.regime), tRiskState(s.risk_state), tSmartMoneyPhase(s.smart_money_phase), s.score, signalEntryTiming(s), wrapReason(signalReasonText(s), 100), tReasons(s.vetoes)]);
       document.getElementById('signals').className = 'signals-table';
       document.getElementById('signals').innerHTML = table(['币种','动作','状态','风险','主力周期','分数','入场时机','原因','否决'], signalRows);
+      balanceSignalAndFillPanels();
+      const fillHeaders = ['币种','方向','杠杆','开仓均价','平仓均价','数量','止损','止盈','收益率','实现盈亏','手续费','开仓时间','平仓时间','入场位置','出场原因'];
       const allFills = [...(data.fills || [])].filter(f => f.action === 'CLOSE' || f.closed_at).reverse();
-      const totalFillPages = Math.max(Math.ceil(allFills.length / fillsPageSize), 1);
-      fillsPage = Math.min(Math.max(fillsPage, 1), totalFillPages);
-      const pageFills = allFills.slice((fillsPage - 1) * fillsPageSize, fillsPage * fillsPageSize);
-      const fills = pageFills.map(f => [
+      const fillRows = allFills.map(f => [
         displaySymbol(f.symbol),
         tAction(f.side),
         `${f.leverage || 0}x`,
@@ -1446,10 +1447,13 @@ PAPER_DASHBOARD_HTML = """
         money(f.fee),
         timeText(f.opened_at),
         timeText(f.closed_at),
+        wrapReason(f.entry_position || '--', 50),
         wrapReason(tReason(f.reason), 50)
       ]);
-      document.getElementById('fills').className = 'center-table';
-      document.getElementById('fills').innerHTML = fillsTable(['币种','方向','杠杆','开仓均价','平仓均价','数量','止损','止盈','收益率','实现盈亏','手续费','开仓时间','平仓时间','出场原因'], fills);
+      const fillPages = paginateFillRows(fillHeaders, fillRows);
+      const totalFillPages = Math.max(fillPages.length, 1);
+      fillsPage = Math.min(Math.max(fillsPage, 1), totalFillPages);
+      document.getElementById('fills').innerHTML = fillsTable(fillHeaders, fillPages[fillsPage - 1] || []);
       renderFillsPager(totalFillPages);
       renderDailyPnl(data.daily_pnl);
       if (data.last_error) showError(data.last_error);
@@ -1462,6 +1466,47 @@ PAPER_DASHBOARD_HTML = """
       if (!rows.length) return `<thead><tr>${headers.map((h, i) => `<th class="${classes[i]}">${h}</th>`).join('')}</tr></thead><tbody><tr><td colspan="${headers.length}">暂无数据</td></tr></tbody>`;
       return `<thead><tr>${headers.map((h, i) => `<th class="${classes[i]}">${h}</th>`).join('')}</tr></thead><tbody>${rows.map(row => `<tr>${row.map((v, i) => `<td class="${classes[i]}">${v}</td>`).join('')}</tr>`).join('')}</tbody>`;
     }
+    function balanceSignalAndFillPanels() {
+      const tableElement = document.getElementById('signals');
+      const scrollElement = tableElement.closest('.scroll');
+      const signalCard = tableElement.closest('.card');
+      const dataGrid = signalCard?.parentElement;
+      if (!scrollElement || !signalCard || !dataGrid) return;
+
+      const rows = [...tableElement.querySelectorAll('tbody tr')];
+      if (!rows.length) return;
+
+      dataGrid.style.gridTemplateRows = '230px minmax(70px, 1fr) 210px';
+      const headerHeight = Math.ceil(tableElement.tHead?.getBoundingClientRect().height || 0);
+      const chromeHeight = signalCard.clientHeight - scrollElement.clientHeight;
+      const targetRowsHeight = Math.max(scrollElement.clientHeight - headerHeight - 22, 22);
+      let rowsHeight = 0;
+      let fittedRows = 0;
+      for (const row of rows) {
+        const rowHeight = Math.max(Math.ceil(row.getBoundingClientRect().height), 22);
+        if (fittedRows && rowsHeight + rowHeight > targetRowsHeight) break;
+        rowsHeight += rowHeight;
+        fittedRows += 1;
+      }
+      const maxSignalHeight = Math.max(dataGrid.clientHeight - 230 - 210 - 20, 70);
+      let signalHeight = Math.min(
+        Math.max(Math.ceil(chromeHeight + headerHeight + rowsHeight), 70),
+        maxSignalHeight
+      );
+      dataGrid.style.gridTemplateRows = `230px ${signalHeight}px minmax(210px, 1fr)`;
+      const scrollRect = scrollElement.getBoundingClientRect();
+      const partialRow = rows.find(row => {
+        const rect = row.getBoundingClientRect();
+        return rect.top < scrollRect.bottom && rect.bottom > scrollRect.bottom;
+      });
+      if (partialRow) {
+        const overlap = scrollRect.bottom - partialRow.getBoundingClientRect().top;
+        if (overlap > 0) {
+          signalHeight = Math.max(signalHeight - Math.ceil(overlap) - 1, 70);
+          dataGrid.style.gridTemplateRows = `230px ${signalHeight}px minmax(210px, 1fr)`;
+        }
+      }
+    }
     function fillsTable(headers, rows) {
       const classes = headers.map(tableClass);
       const widths = headers.map(fillColumnWidth);
@@ -1470,20 +1515,64 @@ PAPER_DASHBOARD_HTML = """
       if (rows.length) {
         return `${head}<tbody>${rows.map(row => `<tr>${row.map((v, i) => `<td class="${classes[i]}">${v}</td>`).join('')}</tr>`).join('')}</tbody>`;
       }
-      return `${head}<tbody>${Array.from({ length: fillsPageSize }).map((_, idx) => `<tr class="empty-fill-row"><td colspan="${headers.length}">${idx === 0 ? '暂无数据' : '&nbsp;'}</td></tr>`).join('')}</tbody>`;
+      return `${head}<tbody><tr class="empty-fill-row"><td colspan="${headers.length}">暂无数据</td></tr></tbody>`;
+    }
+    function paginateFillRows(headers, rows) {
+      const tableElement = document.getElementById('fills');
+      const scrollElement = tableElement.closest('.fills-scroll');
+      const pager = document.getElementById('fillsPager');
+      tableElement.className = 'center-table';
+      if (!rows.length || !scrollElement || !pager) return [rows];
+
+      pager.style.display = 'none';
+      pager.innerHTML = '';
+      tableElement.innerHTML = fillsTable(headers, rows);
+      let pages = measuredFillPages(tableElement, scrollElement, rows);
+
+      if (pages.length > 1) {
+        pager.style.display = 'flex';
+        pager.innerHTML = '<button style="visibility:hidden">上一页</button>';
+        pages = measuredFillPages(tableElement, scrollElement, rows);
+      }
+      return pages;
+    }
+    function measuredFillPages(tableElement, scrollElement, rows) {
+      const headHeight = Math.ceil(tableElement.tHead?.getBoundingClientRect().height || 0);
+      const availableHeight = Math.max(scrollElement.clientHeight - headHeight - 1, 16);
+      const rowElements = [...tableElement.tBodies[0].rows];
+      const pages = [];
+      let page = [];
+      let usedHeight = 0;
+
+      rowElements.forEach((rowElement, index) => {
+        const rowHeight = Math.max(Math.ceil(rowElement.getBoundingClientRect().height), 16);
+        if (page.length && usedHeight + rowHeight > availableHeight) {
+          pages.push(page);
+          page = [];
+          usedHeight = 0;
+        }
+        page.push(rows[index]);
+        usedHeight += rowHeight;
+      });
+      if (page.length) pages.push(page);
+      return pages.length ? pages : [[]];
     }
     function fillColumnWidth(header) {
-      if (header === '币种') return '7em';
-      if (header === '方向') return '4em';
-      if (header === '杠杆') return '4em';
-      if (['开仓均价', '平仓均价', '数量', '止损', '止盈', '收益率', '实现盈亏'].includes(header)) return '6em';
-      if (header === '手续费') return '5em';
-      if (header.includes('时间')) return '8.2%';
-      if (header === '出场原因') return '50em';
-      if (header === '原因') return '30em';
-      return '6em';
+      if (header === '币种') return '5%';
+      if (header === '方向') return '2.4%';
+      if (header === '杠杆') return '2.6%';
+      if (['开仓均价', '平仓均价', '止损', '止盈'].includes(header)) return '4.4%';
+      if (header === '数量') return '3.8%';
+      if (['收益率', '实现盈亏'].includes(header)) return '4.2%';
+      if (header === '手续费') return '3.2%';
+      if (header.includes('时间')) return '8.5%';
+      if (header === '入场位置') return '18%';
+      if (header === '出场原因') return '22%';
+      if (header === '原因') return '22%';
+      return '5%';
     }
     function tableClass(header) {
+      if (header === '入场位置') return 'entry-position-col';
       if (header === '原因' || header === '入场原因' || header === '出场原因') return 'reason-col';
       if (header === '入场时机') return 'timing-col';
       if (header === '否决') return 'veto-col';

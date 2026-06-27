@@ -125,8 +125,45 @@ def test_paper_engine_manual_long_close_profit() -> None:
     assert trade.pnl > 0
     assert close_fill["closed_at"] is not None
     assert close_fill["return_pct"] > 0
+    assert close_fill["entry_position"] == "手动开仓≈100"
     assert not engine.account.positions
     assert engine.status()["equity"] > 1000
+
+
+def test_closed_fill_preserves_actual_auto_entry_position() -> None:
+    market = FakeMarketData()
+    engine = PaperTradingEngine(AppSettings(), starting_balance=1000, market_data=market)
+    entry_context = {
+        "entry_levels": {
+            "long": {
+                "h1_support": {"low": 99.0, "high": 101.0, "price": 100.0},
+                "h1_boll_mid": {"low": 99.5, "high": 100.5, "price": 100.0},
+            }
+        }
+    }
+
+    import asyncio
+
+    position = asyncio.run(
+        engine.open_position(
+            "BTCUSDT",
+            "LONG",
+            margin_usdt=100,
+            leverage=5,
+            reason="auto strategy score=96; state=TREND_LONG",
+            entry_context=entry_context,
+        )
+    )
+    assert position.metadata["entry_position"] == (
+        "1H支撑回踩≈99-101；1H BOLL中轨回踩≈99.5-100.5；实际开仓≈100"
+    )
+
+    market.price = 105.0
+    engine.latest_prices["BTCUSDT"] = 105.0
+    asyncio.run(engine.close_position("BTCUSDT", reason="take profit: test"))
+    close_fill = engine.status()["fills"][-1]
+
+    assert close_fill["entry_position"] == position.metadata["entry_position"]
 
 
 def test_paper_api_manual_order_with_fake_engine(tmp_path: Path) -> None:

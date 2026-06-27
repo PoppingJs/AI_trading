@@ -100,6 +100,7 @@ class PaperFill:
     take_profit_1: float
     take_profit_2: float
     opened_at: datetime
+    entry_position: str = ""
     closed_at: datetime | None = None
     return_pct: float = 0.0
 
@@ -268,6 +269,7 @@ class PaperTradingEngine:
             take_profit_1 = take_profit_1 or _default_take_profit(side_enum, price, stop_loss, 1)
             take_profit_2 = take_profit_2 or _default_take_profit(side_enum, price, stop_loss, 2)
             normalized_entry_context = _normalize_entry_context(entry_context)
+            entry_position = _entry_position_text(side_enum, price, normalized_entry_context, reason)
             position = Position(
                 symbol=symbol,
                 side=side_enum,
@@ -285,6 +287,7 @@ class PaperTradingEngine:
                     "entry_reason": _entry_reason_text(reason, entry_reasons),
                     "entry_reasons": list(entry_reasons or ()),
                     "entry_context": normalized_entry_context,
+                    "entry_position": entry_position,
                     "adds": 0,
                     "initial_stop_distance": abs(price - stop_loss),
                 },
@@ -308,6 +311,7 @@ class PaperTradingEngine:
                     take_profit_1=take_profit_1,
                     take_profit_2=take_profit_2,
                     opened_at=position.opened_at,
+                    entry_position=entry_position,
                 )
             )
             self._save_state_unlocked()
@@ -374,6 +378,8 @@ class PaperTradingEngine:
                     "entry_score": entry_score,
                     "entry_reasons": entry_reasons,
                     "entry_context": entry_context,
+                    "entry_position": position.metadata.get("entry_position")
+                    or _entry_position_text(position.side, position.entry_price, entry_context, str(position.metadata.get("reason", ""))),
                     "entry_reason": _entry_reason_text(str(position.metadata.get("reason", "")), entry_reasons, entry_score),
                 }
             )
@@ -879,9 +885,10 @@ class PaperTradingEngine:
                     margin_usdt=add_margin,
                     stop_price=position.stop_price,
                     take_profit_1=position.take_profit_1,
-                    take_profit_2=position.take_profit_2,
-                    opened_at=position.opened_at,
-                )
+                take_profit_2=position.take_profit_2,
+                opened_at=position.opened_at,
+                entry_position=str(position.metadata.get("entry_position") or ""),
+            )
             )
             self._save_state_unlocked()
             break
@@ -928,6 +935,15 @@ class PaperTradingEngine:
                 take_profit_1=position.take_profit_1,
                 take_profit_2=position.take_profit_2,
                 opened_at=position.opened_at,
+                entry_position=str(
+                    position.metadata.get("entry_position")
+                    or _entry_position_text(
+                        position.side,
+                        position.entry_price,
+                        position.metadata.get("entry_context") if isinstance(position.metadata.get("entry_context"), dict) else {},
+                        str(position.metadata.get("reason", "")),
+                    )
+                ),
                 closed_at=timestamp,
                 return_pct=realized / margin_usdt if margin_usdt else 0.0,
             )
@@ -983,6 +999,69 @@ def _normalize_entry_context(entry_context: dict[str, object] | None) -> dict[st
     context.setdefault("entry_setup", _entry_setup_from_context(context))
     context.setdefault("stop_timeframe", _stop_timeframe_from_context(context))
     return context
+
+
+def _entry_position_text(
+    side: PositionSide,
+    entry_price: float,
+    entry_context: dict[str, object] | None,
+    reason: str = "",
+) -> str:
+    if "manual" in reason.lower():
+        return f"手动开仓≈{_summary_price(entry_price)}"
+    context = entry_context if isinstance(entry_context, dict) else {}
+    levels = context.get("entry_levels") if isinstance(context.get("entry_levels"), dict) else {}
+    side_key = "long" if side == PositionSide.LONG else "short"
+    side_levels = levels.get(side_key) if isinstance(levels.get(side_key), dict) else {}
+    labels = (
+        {
+            "h1_support": "1H支撑回踩",
+            "h4_support": "4H支撑回踩",
+            "h1_boll_mid": "1H BOLL中轨回踩",
+            "h1_ema20_ema60": "1H EMA20/EMA60回踩",
+            "h4_ema20_ema60": "4H EMA20/EMA60回踩",
+            "m15_ema20_ema60": "强单边15m EMA20/EMA60回踩",
+            "sweep_reclaim_support": "下插针扫损后收回支撑",
+            "oi_valley_recovery": "OI洼地止跌回稳",
+            "ma_cluster_breakout": "上穿均线密集区",
+            "ma20_retest": "突破均线密集后回踩MA20",
+            "breakout_retest": "前压力突破后回踩确认",
+            "vwap_pullback": "VWAP/成交密集区回踩",
+        }
+        if side == PositionSide.LONG
+        else {
+            "h1_resistance": "1H压力反抽",
+            "h4_resistance": "4H压力反抽",
+            "h1_boll_mid": "1H BOLL中轨反抽",
+            "h1_ema20_ema60": "1H EMA20/EMA60反抽",
+            "h4_ema20_ema60": "4H EMA20/EMA60反抽",
+            "sweep_reject_resistance": "上插针扫空后跌回压力",
+            "oi_distribution": "高位OI下降横盘滞涨",
+            "ma_cluster_breakdown": "下穿均线密集区",
+            "ma20_retest": "跌破均线密集后反抽MA20",
+            "breakdown_retest": "前支撑跌破后反抽确认",
+            "vwap_retest": "VWAP/成交密集区反抽",
+        }
+    )
+    matched: dict[tuple[str, str], list[str]] = {}
+    for key, label in labels.items():
+        level = side_levels.get(key)
+        if not _entry_level_hit(entry_price, level) or not isinstance(level, dict):
+            continue
+        low = _float_or_none(level.get("low"))
+        high = _float_or_none(level.get("high"))
+        point = _float_or_none(level.get("price"))
+        values = [value for value in (low, high, point) if value is not None]
+        if not values:
+            continue
+        zone_key = (_summary_price(min(values)), _summary_price(max(values)))
+        matched.setdefault(zone_key, []).append(label)
+    details = []
+    for (low_text, high_text), names in list(matched.items())[:3]:
+        zone_text = low_text if low_text == high_text else f"{low_text}-{high_text}"
+        details.append(f"{'/'.join(names)}≈{zone_text}")
+    actual = f"实际开仓≈{_summary_price(entry_price)}"
+    return f"{'；'.join(details)}；{actual}" if details else actual
 
 
 def _entry_setup_from_context(context: dict[str, object]) -> str:
@@ -1158,6 +1237,7 @@ def _fill_from_payload(payload: dict[str, Any]) -> PaperFill:
         take_profit_1=float(payload.get("take_profit_1", 0.0)),
         take_profit_2=float(payload.get("take_profit_2", 0.0)),
         opened_at=_parse_datetime(payload["opened_at"]),
+        entry_position=str(payload.get("entry_position", "")),
         closed_at=_parse_datetime(payload["closed_at"]) if payload.get("closed_at") else None,
         return_pct=float(payload.get("return_pct", 0.0)),
     )
