@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import json
 import math
+import os
+import shutil
 from dataclasses import asdict, dataclass, field
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta, timezone
@@ -13,7 +15,7 @@ from typing import Literal
 from ai_trading.binance import BinanceFuturesMarketData
 from ai_trading.config import AppSettings
 from ai_trading.indicators import build_indicators, ema, sma
-from ai_trading.models import Candle, IndicatorSnapshot, Position, PositionSide, SignalAction, Trade
+from ai_trading.models import Candle, DerivativesSnapshot, IndicatorSnapshot, Position, PositionSide, SignalAction, Trade
 from ai_trading.strategy import CompositeStrategy
 
 
@@ -50,10 +52,87 @@ TREND_STAGE_EARLY = "EARLY"
 TREND_STAGE_MID = "MID"
 TREND_STAGE_LATE = "LATE"
 TREND_STAGE_NEUTRAL = "NEUTRAL"
+AUTO_ENTRY_MIN_SCORE = 82
 MIN_ENTRY_REWARD_R = 1.2
 PROFIT_LOCK_SLIPPAGE_PCT = 0.0008
 MIN_PRECISION_STOP_PCT = 0.012
 MIN_PRECISION_STOP_ATR_MULTIPLE = 0.65
+MARKET_PRICE_STALE_SECONDS = 15.0
+WEBSOCKET_STALE_SECONDS = 15.0
+DERIVATIVES_STALE_SECONDS = 180.0
+LIVE_RISK_REFRESH_SECONDS = 3.0
+LIVE_ENTRY_REFRESH_SECONDS = 5.0
+POSITION_DERIVATIVES_REFRESH_SECONDS = 60.0
+BACKGROUND_DERIVATIVES_REFRESH_SECONDS = 180.0
+FUNDING_REFRESH_SECONDS = 600.0
+UNIVERSE_REFRESH_SECONDS = 900.0
+STATE_SAVE_SECONDS = 15.0
+FULL_DATA_CHECK_SECONDS = 120.0
+MARKET_REQUEST_CONCURRENCY = 3
+WARMUP_BATCH_SIZE = 5
+TIMEFRAME_CLOSE_GRACE_SECONDS = 5.0
+SUPPORTED_TIMEFRAMES = ("15m", "1h", "4h", "1d")
+POSITION_SAFETY_REFRESH_SECONDS = 1.0
+
+
+class PaperStateError(RuntimeError):
+    """Raised when persisted paper-account state cannot be loaded safely."""
+
+
+class _StateFileLock:
+    def __init__(self, state_path: Path | None) -> None:
+        self.path = (
+            state_path.with_name(f"{state_path.name}.lock")
+            if state_path is not None
+            else None
+        )
+        self._handle: Any | None = None
+
+    def acquire(self) -> None:
+        if self.path is None or self._handle is not None:
+            return
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        handle: Any | None = None
+        try:
+            handle = self.path.open("a+b")
+            handle.seek(0)
+            if handle.read(1) == b"":
+                handle.write(b"0")
+                handle.flush()
+            handle.seek(0)
+            if os.name == "nt":
+                import msvcrt
+
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            if handle is not None:
+                handle.close()
+            raise PaperStateError(
+                f"状态文件正在被另一个交易进程使用：{self.path}"
+            ) from exc
+        self._handle = handle
+
+    def release(self) -> None:
+        handle = self._handle
+        self._handle = None
+        if handle is None:
+            return
+        try:
+            handle.seek(0)
+            if os.name == "nt":
+                import msvcrt
+
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            handle.close()
 
 
 def _candidate_prefilter_allowed(item: object) -> bool:
@@ -132,7 +211,7 @@ class PaperTradingEngine:
         *,
         starting_balance: float = PAPER_DEFAULT_BALANCE,
         symbols: list[str] | None = None,
-        interval: str = "15m",
+        interval: str = "1h",
         market_data: BinanceFuturesMarketData | None = None,
         state_path: str | Path | None = None,
     ) -> None:
@@ -140,6 +219,7 @@ class PaperTradingEngine:
         self.state_path = Path(state_path) if state_path else None
         self.account = _load_paper_account(self.state_path) or PaperAccount(starting_balance=starting_balance, wallet_balance=starting_balance)
         self.symbols = [symbol.upper() for symbol in (symbols or ["AUTO_TOP30"])]
+        self._auto_universe = self.symbols == ["AUTO_TOP30"]
         self.interval = interval
         self.market_data = market_data or BinanceFuturesMarketData()
         self.strategy = CompositeStrategy(settings.strategy)
@@ -157,8 +237,39 @@ class PaperTradingEngine:
         self.last_error: str | None = None
         self.last_market_update_at: datetime | None = None
         self._task: asyncio.Task | None = None
+        self._price_stream_task: asyncio.Task | None = None
+        self._price_fallback_task: asyncio.Task | None = None
+        self._position_safety_task: asyncio.Task | None = None
         self._poll_seconds = 20
         self._lock = asyncio.Lock()
+        self._scan_lock = asyncio.Lock()
+        self._funding_lock = asyncio.Lock()
+        self._price_update_event = asyncio.Event()
+        self._state_file_lock = _StateFileLock(self.state_path)
+        self._timeframe_candles: dict[str, dict[str, list[Candle]]] = {}
+        self._timeframe_derivatives: dict[str, dict[str, list[DerivativesSnapshot]]] = {}
+        self._live_m15_candles: dict[str, Candle] = {}
+        self._price_updated_at: dict[str, datetime] = {}
+        self._signal_updated_at: dict[str, datetime] = {}
+        self._derivatives_updated_at: dict[str, datetime] = {}
+        self._oi_ratio_updated_at: dict[str, datetime] = {}
+        self._funding_updated_at: dict[str, datetime] = {}
+        self._derivatives_source_at: dict[str, datetime] = {}
+        self._current_funding_rates: dict[str, float] = {}
+        self._last_ws_update_at: datetime | None = None
+        self._last_price_stream_error: str | None = None
+        self._last_rest_price_refresh_at: datetime | None = None
+        self._last_universe_refresh_at: datetime | None = None
+        self._last_funding_refresh_at: datetime | None = None
+        self._last_full_data_check_at: datetime | None = None
+        self._last_state_save_at: datetime | None = None
+        self._last_btc_extreme_check_at: datetime | None = None
+        self._btc_extreme_cached = False
+        self._last_closed_candle_slot: dict[str, datetime] = {}
+        self._next_candle_retry_at: datetime | None = None
+        self._warmup_complete = False
+        self._stream_symbols: tuple[str, ...] = ()
+        self._last_position_management_at: datetime | None = None
 
     async def start(self, *, auto_trade: bool = False, poll_seconds: int = 20) -> None:
         async with self._lock:
@@ -166,7 +277,14 @@ class PaperTradingEngine:
             self._poll_seconds = max(poll_seconds, 5)
             if self.running:
                 return
+            self._state_file_lock.acquire()
             self.running = True
+            self._position_safety_task = asyncio.create_task(
+                self._position_safety_loop()
+            )
+            self._price_fallback_task = asyncio.create_task(
+                self._price_fallback_loop()
+            )
             self._task = asyncio.create_task(self._run_loop())
 
     async def stop(self) -> None:
@@ -180,13 +298,38 @@ class PaperTradingEngine:
             self.running = False
             self.auto_trade = False
             task = self._task
+            price_stream_task = self._price_stream_task
+            price_fallback_task = self._price_fallback_task
+            position_safety_task = self._position_safety_task
             self._task = None
+            self._price_stream_task = None
+            self._price_fallback_task = None
+            self._position_safety_task = None
         if task:
             task.cancel()
             try:
                 await task
             except asyncio.CancelledError:
                 pass
+        if price_stream_task:
+            price_stream_task.cancel()
+            try:
+                await price_stream_task
+            except asyncio.CancelledError:
+                pass
+        if price_fallback_task:
+            price_fallback_task.cancel()
+            try:
+                await price_fallback_task
+            except asyncio.CancelledError:
+                pass
+        if position_safety_task:
+            position_safety_task.cancel()
+            try:
+                await position_safety_task
+            except asyncio.CancelledError:
+                pass
+        self._state_file_lock.release()
 
     async def reset(self, starting_balance: float = PAPER_DEFAULT_BALANCE) -> None:
         await self.stop()
@@ -197,10 +340,43 @@ class PaperTradingEngine:
             self.latest_indicators.clear()
             self.latest_timeframe_contexts.clear()
             self.latest_timeframe_indicators.clear()
+            self._timeframe_candles.clear()
+            self._timeframe_derivatives.clear()
+            self._live_m15_candles.clear()
+            self._price_updated_at.clear()
+            self._signal_updated_at.clear()
+            self._derivatives_updated_at.clear()
+            self._oi_ratio_updated_at.clear()
+            self._funding_updated_at.clear()
+            self._derivatives_source_at.clear()
+            self._current_funding_rates.clear()
             self.last_error = None
             self.last_market_update_at = None
+            self._warmup_complete = False
             self.auto_trade = False
             self._save_state_unlocked()
+
+    def configure_symbols(self, symbols: list[str]) -> None:
+        requested = [symbol.upper() for symbol in symbols if symbol]
+        use_auto_universe = not requested or requested == ["AUTO_TOP30"]
+        if use_auto_universe and self._auto_universe and self.symbols != ["AUTO_TOP30"]:
+            return
+        next_symbols = ["AUTO_TOP30"] if use_auto_universe else requested
+        if self._auto_universe == use_auto_universe and self.symbols == next_symbols:
+            return
+        self._auto_universe = use_auto_universe
+        self.symbols = next_symbols
+        self._warmup_complete = False
+        if not use_auto_universe:
+            self._prune_market_cache()
+
+    def configure_interval(self, interval: str) -> None:
+        if interval not in SUPPORTED_TIMEFRAMES:
+            raise ValueError(f"unsupported paper interval: {interval}")
+        if self.interval == interval:
+            return
+        self.interval = interval
+        self._warmup_complete = False
 
     async def close(self) -> None:
         await self.shutdown()
@@ -209,27 +385,40 @@ class PaperTradingEngine:
             await close()
 
     async def refresh_once(self) -> None:
-        await self.refresh_universe_if_needed()
-        semaphore = asyncio.Semaphore(6)
-        errors: list[str] = []
-        refreshed = 0
+        if self._scan_lock.locked():
+            return
+        async with self._scan_lock:
+            await self.refresh_universe_if_needed(force=not self._warmup_complete)
+            errors: list[str] = []
+            refreshed = 0
+            symbols = self._managed_symbols()
+            await self._refresh_current_funding_cache(
+                symbols,
+                datetime.now(UTC),
+            )
+            semaphore = asyncio.Semaphore(MARKET_REQUEST_CONCURRENCY)
 
-        async def refresh_with_limit(symbol: str) -> None:
-            nonlocal refreshed
-            async with semaphore:
-                try:
-                    if await self._refresh_symbol(symbol):
-                        refreshed += 1
-                except Exception as exc:  # noqa: BLE001
-                    errors.append(f"{symbol}: {exc}")
+            async def refresh_with_limit(symbol: str) -> None:
+                nonlocal refreshed
+                async with semaphore:
+                    try:
+                        if await self._refresh_symbol(symbol):
+                            refreshed += 1
+                    except Exception as exc:  # noqa: BLE001
+                        errors.append(f"{symbol}: {exc}")
 
-        await asyncio.gather(*(refresh_with_limit(symbol) for symbol in self.symbols))
-        if refreshed:
-            self.last_market_update_at = datetime.now(UTC)
-            self.last_error = _format_partial_market_errors(errors) if errors else None
-            self._save_state_unlocked()
-        elif errors:
-            self.last_error = f"行情刷新失败，等待网络恢复：{'; '.join(errors[:3])}"
+            for start in range(0, len(symbols), WARMUP_BATCH_SIZE):
+                batch = symbols[start : start + WARMUP_BATCH_SIZE]
+                await asyncio.gather(*(refresh_with_limit(symbol) for symbol in batch))
+                await asyncio.sleep(0)
+            self._warmup_complete = True
+            if refreshed:
+                now = datetime.now(UTC)
+                self.last_market_update_at = now
+                self.last_error = _format_partial_market_errors(errors) if errors else None
+                self._save_state_unlocked()
+            elif errors:
+                self.last_error = f"行情刷新失败，等待网络恢复：{'; '.join(errors[:3])}"
 
     async def refresh_open_position_prices(self) -> int:
         """Refresh persisted positions without starting the strategy loop."""
@@ -237,32 +426,54 @@ class PaperTradingEngine:
         if not symbols:
             return 0
 
-        semaphore = asyncio.Semaphore(5)
+        mark_prices = getattr(self.market_data, "mark_prices", None)
+        ticker_prices = getattr(self.market_data, "ticker_prices", None)
+        try:
+            if mark_prices is not None:
+                prices = await mark_prices(symbols)
+            elif ticker_prices is not None:
+                prices = await ticker_prices(symbols)
+            else:
+                semaphore = asyncio.Semaphore(MARKET_REQUEST_CONCURRENCY)
 
-        async def fetch(symbol: str) -> tuple[str, float] | None:
-            async with semaphore:
-                try:
-                    candles = await self.market_data.klines(symbol, self.interval, limit=2)
-                except Exception:  # noqa: BLE001 - keep the persisted mark when the network is unavailable
-                    return None
-                if not candles:
-                    return None
-                return symbol, float(candles[-1].close)
+                async def fetch(symbol: str) -> tuple[str, float] | None:
+                    async with semaphore:
+                        candles = await self.market_data.klines(
+                            symbol,
+                            self.interval,
+                            limit=2,
+                        )
+                        if not candles:
+                            return None
+                        return symbol, float(candles[-1].close)
 
-        results = await asyncio.gather(*(fetch(symbol) for symbol in symbols))
-        refreshed = [result for result in results if result is not None]
-        if not refreshed:
+                results = await asyncio.gather(
+                    *(fetch(symbol) for symbol in symbols)
+                )
+                prices = dict(
+                    result for result in results if result is not None
+                )
+        except Exception:  # noqa: BLE001 - keep persisted marks when network is unavailable
+            return 0
+        if not prices:
             return 0
 
         async with self._lock:
-            for symbol, price in refreshed:
+            for symbol, price in prices.items():
                 self._remember_mark_price(symbol, price)
             self.last_market_update_at = datetime.now(UTC)
             self._save_state_unlocked()
-        return len(refreshed)
+        return len(prices)
 
-    async def refresh_universe_if_needed(self) -> None:
-        if self.symbols and self.symbols != ["AUTO_TOP30"]:
+    async def refresh_universe_if_needed(self, *, force: bool = False) -> None:
+        if not self._auto_universe:
+            return
+        now = datetime.now(UTC)
+        if (
+            not force
+            and self._last_universe_refresh_at is not None
+            and (now - self._last_universe_refresh_at).total_seconds() < UNIVERSE_REFRESH_SECONDS
+        ):
             return
         top_symbols = await self.market_data.top_usdt_perpetuals(limit=80)
         eligible = [item for item in top_symbols if item.symbol.upper() not in AUTO_UNIVERSE_EXCLUDED_SYMBOLS]
@@ -276,6 +487,46 @@ class PaperTradingEngine:
                 if len(filtered) >= 30:
                     break
         self.symbols = filtered[:30] or ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
+        self._last_universe_refresh_at = now
+        self._prune_market_cache()
+        await self._restart_price_stream_if_needed()
+
+    def _managed_symbols(self) -> list[str]:
+        symbols = [
+            symbol for symbol in self.symbols
+            if symbol != "AUTO_TOP30"
+        ]
+        if self._auto_universe and not symbols:
+            symbols.extend(self.latest_signals)
+        for symbol in self.account.positions:
+            if symbol not in symbols:
+                symbols.append(symbol)
+        return symbols
+
+    def _prune_market_cache(self) -> None:
+        managed = set(self._managed_symbols())
+        mappings = (
+            self.latest_prices,
+            self.latest_signals,
+            self.latest_indicators,
+            self.latest_timeframe_contexts,
+            self.latest_timeframe_indicators,
+            self._timeframe_candles,
+            self._timeframe_derivatives,
+            self._live_m15_candles,
+            self._price_updated_at,
+            self._signal_updated_at,
+            self._derivatives_updated_at,
+            self._oi_ratio_updated_at,
+            self._funding_updated_at,
+            self._derivatives_source_at,
+            self._current_funding_rates,
+            self.account.latest_signals,
+        )
+        for mapping in mappings:
+            for symbol in list(mapping):
+                if symbol not in managed:
+                    mapping.pop(symbol, None)
 
     async def open_position(
         self,
@@ -377,12 +628,71 @@ class PaperTradingEngine:
     def status(self) -> dict[str, object]:
         return self._status_unlocked()
 
+    def health_status(self) -> dict[str, object]:
+        now = datetime.now(UTC)
+        stale_positions = [
+            symbol
+            for symbol in self.account.positions
+            if (updated_at := self._price_updated_at.get(symbol)) is None
+            or (now - updated_at).total_seconds() > MARKET_PRICE_STALE_SECONDS
+        ]
+        scheduler_alive = self._task is not None and not self._task.done()
+        safety_alive = (
+            self._position_safety_task is not None
+            and not self._position_safety_task.done()
+        )
+        return {
+            "status": (
+                "ok"
+                if self.running and scheduler_alive and safety_alive
+                and not stale_positions
+                else "degraded"
+            ),
+            "running": self.running,
+            "auto_trade": self.auto_trade,
+            "warmup_complete": self._warmup_complete,
+            "scheduler_alive": scheduler_alive,
+            "position_safety_alive": safety_alive,
+            "price_stream_alive": (
+                self._price_stream_task is not None
+                and not self._price_stream_task.done()
+            ),
+            "price_fallback_alive": (
+                self._price_fallback_task is not None
+                and not self._price_fallback_task.done()
+            ),
+            "price_stream_error": self._last_price_stream_error,
+            "stale_position_symbols": stale_positions,
+            "position_management_at": (
+                self._last_position_management_at.isoformat()
+                if self._last_position_management_at
+                else None
+            ),
+            "market_updated_at": (
+                self.last_market_update_at.isoformat()
+                if self.last_market_update_at
+                else None
+            ),
+            "last_error": self.last_error,
+        }
+
     def _status_unlocked(self) -> dict[str, object]:
         positions = []
         unrealized = 0.0
         used_margin = 0.0
         latest_prices = dict(self.latest_prices)
-        latest_signals = {symbol: dict(signal) for symbol, signal in self.latest_signals.items()}
+        latest_signals: dict[str, dict[str, object]] = {}
+        for symbol, signal in self.latest_signals.items():
+            payload = _auto_entry_status_signal(
+                symbol,
+                signal,
+                auto_trade=self.auto_trade,
+                has_position=symbol in self.account.positions,
+            )
+            if self.running:
+                for reason in self._data_freshness_blocks(symbol):
+                    _record_auto_entry_block(payload, reason)
+            latest_signals[symbol] = payload
         latest_timeframe_contexts = {symbol: dict(context) for symbol, context in self.latest_timeframe_contexts.items()}
         positions_snapshot = list(self.account.positions.values())
         fills_snapshot = list(self.account.fills[-100:])
@@ -464,16 +774,535 @@ class PaperTradingEngine:
         }
 
     async def _run_loop(self) -> None:
+        loop = asyncio.get_running_loop()
+        last_live_entry_refresh = 0.0
+        try:
+            await self._restart_price_stream_if_needed()
+            await self._warm_restored_positions()
+            await self.refresh_once()
+            now = datetime.now(UTC)
+            self._last_closed_candle_slot = {
+                timeframe: _latest_closed_slot(timeframe, now)
+                for timeframe in SUPPORTED_TIMEFRAMES
+            }
+        except Exception as exc:  # noqa: BLE001 - keep restored positions manageable
+            self._warmup_complete = True
+            self.last_error = str(exc)
+
         while self.running:
+            monotonic_now = loop.time()
+            now = datetime.now(UTC)
             try:
-                await self.refresh_once()
-                self._manage_open_positions()
-                if self.auto_trade:
-                    await self._auto_trade_once()
+                if not self._warmup_complete:
+                    await self._warm_configured_symbols()
+                due_timeframes = self._due_closed_timeframes(now)
+                if due_timeframes:
+                    await self._refresh_closed_timeframes(due_timeframes)
+                await self._refresh_due_derivatives(now)
+                await self._refresh_universe_and_new_symbols(now)
+                await self._validate_cached_market_data(now)
+                if monotonic_now - last_live_entry_refresh >= LIVE_ENTRY_REFRESH_SECONDS:
+                    self._refresh_live_entry_timing()
+                    if self.auto_trade:
+                        await self._auto_trade_once()
+                    last_live_entry_refresh = monotonic_now
+                if (
+                    self._last_state_save_at is None
+                    or (now - self._last_state_save_at).total_seconds() >= STATE_SAVE_SECONDS
+                ):
+                    self._record_account_snapshots(now)
+                    self._last_state_save_at = now
             except Exception as exc:  # noqa: BLE001 - user-facing paper loop should keep running
                 self.last_error = str(exc)
-            self._record_account_snapshots()
-            await asyncio.sleep(self._poll_seconds)
+            await asyncio.sleep(1)
+
+    async def _position_safety_loop(self) -> None:
+        """Manage restored and live positions independently from network scans."""
+        while self.running:
+            try:
+                self._manage_open_positions(fresh_only=True)
+                self._last_position_management_at = datetime.now(UTC)
+            except Exception as exc:  # noqa: BLE001 - safety loop must stay alive
+                self.last_error = f"持仓安全管理异常：{exc}"
+            self._price_update_event.clear()
+            try:
+                await asyncio.wait_for(
+                    self._price_update_event.wait(),
+                    timeout=POSITION_SAFETY_REFRESH_SECONDS,
+                )
+            except TimeoutError:
+                pass
+
+    async def _price_fallback_loop(self) -> None:
+        """Keep live prices fresh even while full market scans are blocked."""
+        force = True
+        while self.running:
+            try:
+                await self._refresh_rest_price_fallback(
+                    datetime.now(UTC),
+                    force=force,
+                )
+                force = False
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - retry without blocking scans
+                self.last_error = f"实时价格 REST 兜底刷新失败：{exc}"
+            await asyncio.sleep(1)
+
+    async def _warm_restored_positions(self) -> None:
+        symbols = list(self.account.positions)
+        if not symbols or self._scan_lock.locked():
+            return
+        await self._refresh_current_funding_cache(
+            symbols,
+            datetime.now(UTC),
+        )
+        async with self._scan_lock:
+            semaphore = asyncio.Semaphore(MARKET_REQUEST_CONCURRENCY)
+
+            async def warm(symbol: str) -> None:
+                async with semaphore:
+                    await self._refresh_symbol(symbol)
+
+            await asyncio.gather(
+                *(warm(symbol) for symbol in symbols),
+                return_exceptions=True,
+            )
+
+    async def _warm_configured_symbols(self) -> None:
+        if self._scan_lock.locked():
+            return
+        await self.refresh_once()
+        await self._restart_price_stream_if_needed()
+
+    async def _restart_price_stream_if_needed(self) -> None:
+        stream = getattr(self.market_data, "stream_mark_prices", None)
+        if stream is None or not self.running:
+            return
+        symbols = tuple(sorted(self._managed_symbols()))
+        if self._price_stream_task is not None and not self._price_stream_task.done() and symbols == self._stream_symbols:
+            return
+        old_task = self._price_stream_task
+        self._price_stream_task = None
+        if old_task is not None:
+            old_task.cancel()
+            try:
+                await old_task
+            except asyncio.CancelledError:
+                pass
+        self._stream_symbols = symbols
+        if symbols:
+            self._price_stream_task = asyncio.create_task(self._price_stream_loop(symbols))
+
+    async def _price_stream_loop(self, symbols: tuple[str, ...]) -> None:
+        delay = 1.0
+        while self.running and symbols == self._stream_symbols:
+            try:
+                async for prices in self.market_data.stream_mark_prices(symbols):
+                    now = datetime.now(UTC)
+                    for symbol, price in prices.items():
+                        self._remember_mark_price(symbol, float(price))
+                    self._last_ws_update_at = now
+                    self._last_price_stream_error = None
+                    self.last_market_update_at = now
+                    delay = 1.0
+                    if not self.running or symbols != self._stream_symbols:
+                        return
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - REST fallback keeps held positions safe
+                self._last_price_stream_error = str(exc)
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, 30.0)
+
+    async def _refresh_rest_price_fallback(
+        self,
+        now: datetime,
+        *,
+        force: bool = False,
+    ) -> None:
+        if (
+            not force
+            and self._last_rest_price_refresh_at is not None
+            and (now - self._last_rest_price_refresh_at).total_seconds() < LIVE_ENTRY_REFRESH_SECONDS
+        ):
+            return
+        symbols = self._managed_symbols()
+        stale_symbols = [
+            symbol
+            for symbol in symbols
+            if force
+            or (updated_at := self._price_updated_at.get(symbol)) is None
+            or (now - updated_at).total_seconds() > MARKET_PRICE_STALE_SECONDS
+        ]
+        if not stale_symbols:
+            return
+        self._last_rest_price_refresh_at = now
+        mark_prices = getattr(self.market_data, "mark_prices", None)
+        if mark_prices is not None:
+            prices = await mark_prices(stale_symbols)
+            for symbol, price in prices.items():
+                self._remember_mark_price(symbol, float(price))
+            if prices:
+                self.last_market_update_at = now
+            return
+        ticker_prices = getattr(self.market_data, "ticker_prices", None)
+        if ticker_prices is not None:
+            prices = await ticker_prices(stale_symbols)
+            for symbol, price in prices.items():
+                self._remember_mark_price(symbol, float(price))
+            if prices:
+                self.last_market_update_at = now
+            return
+        await self.refresh_open_position_prices()
+
+    def _refresh_live_entry_timing(self) -> None:
+        for symbol, signal in self.latest_signals.items():
+            score = int(signal.get("score") or 0)
+            if symbol not in self.account.positions and score < AUTO_ENTRY_MIN_SCORE:
+                continue
+            price = self.latest_prices.get(symbol)
+            if price is None:
+                continue
+            _clear_transient_auto_entry_blocks(signal)
+            signal["price"] = price
+            self._apply_live_m15_overlay(symbol, signal)
+            signal.pop("entry_timing", None)
+            signal.pop("entry_timing_reason", None)
+            timing, reason = _signal_entry_timing(signal)
+            signal["entry_timing"] = timing
+            signal["entry_timing_reason"] = reason
+            self.account.latest_signals[symbol] = dict(signal)
+
+    def _apply_live_m15_overlay(self, symbol: str, signal: dict[str, object]) -> None:
+        live_candle = self._live_m15_candles.get(symbol)
+        confirmed = self._timeframe_candles.get(symbol, {}).get("15m", [])
+        if live_candle is None or len(confirmed) < 60:
+            return
+        candles = _merge_candles(confirmed, [live_candle], max_length=max(240, self.settings.strategy.ma_trend + 40))
+        indicators = _build_price_only_indicators(candles, self.settings)
+        precision = _fifteen_minute_precision(candles, indicators, self.settings)
+        signal["m15_precision"] = precision
+        signal["live_rsi14"] = indicators[-1].rsi14 if indicators else None
+        levels = signal.get("entry_levels")
+        if not isinstance(levels, dict):
+            return
+        copied_levels = {
+            key: dict(value) if isinstance(value, dict) else value
+            for key, value in levels.items()
+        }
+        long_levels = copied_levels.get("long")
+        if isinstance(long_levels, dict):
+            long_levels["m15_ema20_ema60"] = _zone_from_object(precision.get("long_pullback_zone"))
+        short_levels = copied_levels.get("short")
+        if isinstance(short_levels, dict):
+            short_levels["m15_ema20_ema60"] = _zone_from_object(precision.get("short_retest_zone"))
+        signal["entry_levels"] = copied_levels
+
+    def _due_closed_timeframes(self, now: datetime) -> tuple[str, ...]:
+        if self._next_candle_retry_at is not None and now < self._next_candle_retry_at:
+            return ()
+        due: list[str] = []
+        for timeframe in SUPPORTED_TIMEFRAMES:
+            slot = _latest_closed_slot(timeframe, now)
+            previous = self._last_closed_candle_slot.get(timeframe)
+            if previous is None:
+                self._last_closed_candle_slot[timeframe] = slot
+            elif slot > previous:
+                due.append(timeframe)
+        return tuple(due)
+
+    async def _refresh_closed_timeframes(self, timeframes: tuple[str, ...]) -> None:
+        if self._scan_lock.locked():
+            return
+        async with self._scan_lock:
+            symbols = self._priority_symbols()
+            semaphore = asyncio.Semaphore(MARKET_REQUEST_CONCURRENCY)
+            errors: list[str] = []
+
+            async def refresh_symbol(symbol: str) -> None:
+                async with semaphore:
+                    try:
+                        changed = False
+                        for timeframe in timeframes:
+                            changed = await self._refresh_timeframe_incremental(symbol, timeframe) or changed
+                        if changed:
+                            if self.interval in timeframes or "4h" in timeframes:
+                                self._derivatives_updated_at.pop(symbol, None)
+                            self._publish_symbol_from_cache(symbol)
+                    except Exception as exc:  # noqa: BLE001
+                        errors.append(f"{symbol}: {exc}")
+
+            for start in range(0, len(symbols), WARMUP_BATCH_SIZE):
+                await asyncio.gather(*(refresh_symbol(symbol) for symbol in symbols[start : start + WARMUP_BATCH_SIZE]))
+            if errors:
+                self.last_error = _format_partial_market_errors(errors)
+                self._next_candle_retry_at = datetime.now(UTC) + timedelta(seconds=5)
+            else:
+                self._next_candle_retry_at = None
+                for timeframe in timeframes:
+                    self._last_closed_candle_slot[timeframe] = _latest_closed_slot(timeframe, datetime.now(UTC))
+
+    async def _refresh_timeframe_incremental(self, symbol: str, timeframe: str) -> bool:
+        rows = await self.market_data.klines(symbol, timeframe, limit=3)
+        closed = _closed_candles(rows, timeframe)
+        if not closed:
+            raise ValueError(f"{symbol} {timeframe} closed candle is not available yet")
+        expected_open = _latest_closed_slot(timeframe, datetime.now(UTC)) - timedelta(
+            seconds=_timeframe_seconds(timeframe)
+        )
+        if closed[-1].timestamp < expected_open:
+            raise ValueError(f"{symbol} {timeframe} latest closed candle is delayed")
+        existing = self._timeframe_candles.setdefault(symbol, {}).get(timeframe, [])
+        merged = _merge_candles(existing, closed, max_length=max(240, self.settings.strategy.ma_trend + 40))
+        if existing and merged[-1].timestamp == existing[-1].timestamp and merged[-1] == existing[-1]:
+            return False
+        self._timeframe_candles[symbol][timeframe] = merged
+        return True
+
+    async def _refresh_due_derivatives(self, now: datetime) -> None:
+        refresh = getattr(self.market_data, "derivatives_bundle", None)
+        if refresh is None or self._scan_lock.locked():
+            return
+        position_symbols = set(self.account.positions)
+        ranked_candidates = [
+            symbol
+            for symbol, signal in sorted(
+                self.latest_signals.items(),
+                key=lambda item: int(item[1].get("score") or 0),
+                reverse=True,
+            )
+            if int(signal.get("score") or 0) >= AUTO_ENTRY_MIN_SCORE
+            and symbol not in position_symbols
+        ]
+        fast_symbols = position_symbols | set(ranked_candidates[:10])
+        fast_due_symbols = [
+            symbol
+            for symbol in self._managed_symbols()
+            if symbol in fast_symbols
+            and (
+                self._oi_ratio_updated_at.get(symbol) is None
+                or (now - self._oi_ratio_updated_at[symbol]).total_seconds()
+                >= POSITION_DERIVATIVES_REFRESH_SECONDS
+            )
+        ]
+        background_due_symbols = [
+            symbol
+            for symbol in self._managed_symbols()
+            if symbol not in fast_symbols
+            and (
+                self._oi_ratio_updated_at.get(symbol) is None
+                or (now - self._oi_ratio_updated_at[symbol]).total_seconds()
+                >= BACKGROUND_DERIVATIVES_REFRESH_SECONDS
+            )
+        ]
+        due_symbols = fast_due_symbols + background_due_symbols[:WARMUP_BATCH_SIZE]
+        if not due_symbols:
+            return
+        funding_due_symbols = [
+            symbol
+            for symbol in due_symbols
+            if self._funding_updated_at.get(symbol) is None
+            or (now - self._funding_updated_at[symbol]).total_seconds()
+            >= FUNDING_REFRESH_SECONDS
+        ]
+        successful_refreshes = 0
+        async with self._scan_lock:
+            semaphore = asyncio.Semaphore(MARKET_REQUEST_CONCURRENCY)
+            funding_rates: dict[str, float] = {}
+            funding_error: Exception | None = None
+            current_funding_rates = getattr(
+                self.market_data,
+                "current_funding_rates",
+                None,
+            )
+            if funding_due_symbols and current_funding_rates is not None:
+                try:
+                    funding_rates = await current_funding_rates(
+                        funding_due_symbols
+                    )
+                    self._current_funding_rates.update(funding_rates)
+                except Exception as exc:  # noqa: BLE001 - OI/ratio refresh can still succeed
+                    funding_error = exc
+
+            async def refresh_symbol(symbol: str) -> bool:
+                async with semaphore:
+                    changed = False
+                    source_timestamps: list[datetime] = []
+                    for timeframe in {self.interval, "4h"}:
+                        candles = self._timeframe_candles.get(symbol, {}).get(timeframe, [])
+                        if not candles:
+                            continue
+                        snapshots = await refresh(
+                            symbol,
+                            timeframe,
+                            (candle.timestamp for candle in candles),
+                            include_funding=False,
+                        )
+                        existing = self._timeframe_derivatives.setdefault(symbol, {}).get(timeframe, [])
+                        merged = _merge_derivatives(
+                            existing,
+                            snapshots,
+                            preserve_funding=True,
+                        )
+                        if symbol in funding_rates:
+                            merged = _with_current_funding(
+                                merged,
+                                funding_rates[symbol],
+                            )
+                        self._timeframe_derivatives[symbol][timeframe] = merged
+                        source_timestamps.extend(
+                            snapshot.timestamp
+                            for snapshot in snapshots
+                            if snapshot.open_interest is not None
+                            and snapshot.long_short_ratio is not None
+                        )
+                        changed = changed or bool(snapshots)
+                    if changed:
+                        self._oi_ratio_updated_at[symbol] = now
+                        self._derivatives_updated_at[symbol] = now
+                        if source_timestamps:
+                            self._derivatives_source_at[symbol] = max(
+                                source_timestamps
+                            )
+                        if symbol in funding_rates:
+                            self._funding_updated_at[symbol] = now
+                        self._publish_symbol_from_cache(symbol)
+                    return changed
+
+            for start in range(0, len(due_symbols), WARMUP_BATCH_SIZE):
+                results = await asyncio.gather(
+                    *(refresh_symbol(symbol) for symbol in due_symbols[start : start + WARMUP_BATCH_SIZE]),
+                    return_exceptions=True,
+                )
+                successful_refreshes += sum(result is True for result in results)
+                errors = [result for result in results if isinstance(result, Exception)]
+                if errors:
+                    self.last_error = f"衍生品数据刷新失败：{errors[0]}"
+            if funding_error is not None:
+                self.last_error = f"当前资金费率刷新失败，已保留上次有效值：{funding_error}"
+        if funding_rates and successful_refreshes:
+            self._last_funding_refresh_at = now
+
+    async def _refresh_current_funding_cache(
+        self,
+        symbols: list[str],
+        now: datetime,
+    ) -> None:
+        due_symbols = [
+            symbol
+            for symbol in symbols
+            if self._funding_updated_at.get(symbol) is None
+            or (now - self._funding_updated_at[symbol]).total_seconds()
+            >= FUNDING_REFRESH_SECONDS
+        ]
+        current_funding_rates = getattr(
+            self.market_data,
+            "current_funding_rates",
+            None,
+        )
+        if not due_symbols or current_funding_rates is None:
+            return
+        async with self._funding_lock:
+            still_due = [
+                symbol
+                for symbol in due_symbols
+                if self._funding_updated_at.get(symbol) is None
+                or (now - self._funding_updated_at[symbol]).total_seconds()
+                >= FUNDING_REFRESH_SECONDS
+            ]
+            if not still_due:
+                return
+            try:
+                rates = await current_funding_rates(still_due)
+            except Exception as exc:  # noqa: BLE001 - stale funding blocks entries
+                self.last_error = (
+                    f"当前资金费率刷新失败，已保留上次有效值：{exc}"
+                )
+                return
+            self._current_funding_rates.update(rates)
+            for symbol in still_due:
+                if symbol in rates:
+                    self._funding_updated_at[symbol] = now
+            if rates:
+                self._last_funding_refresh_at = now
+
+    async def _refresh_universe_and_new_symbols(self, now: datetime) -> None:
+        if not self._auto_universe:
+            return
+        if (
+            self._last_universe_refresh_at is not None
+            and (now - self._last_universe_refresh_at).total_seconds() < UNIVERSE_REFRESH_SECONDS
+        ):
+            return
+        if self._scan_lock.locked():
+            return
+        async with self._scan_lock:
+            previous = set(self.symbols)
+            await self.refresh_universe_if_needed()
+            new_symbols = [
+                symbol
+                for symbol in self.symbols
+                if symbol not in previous or symbol not in self._timeframe_candles
+            ]
+            if not new_symbols:
+                return
+            semaphore = asyncio.Semaphore(MARKET_REQUEST_CONCURRENCY)
+
+            async def warm(symbol: str) -> None:
+                async with semaphore:
+                    await self._refresh_symbol(symbol)
+
+            for start in range(0, len(new_symbols), WARMUP_BATCH_SIZE):
+                await asyncio.gather(
+                    *(warm(symbol) for symbol in new_symbols[start : start + WARMUP_BATCH_SIZE]),
+                    return_exceptions=True,
+                )
+            await self._restart_price_stream_if_needed()
+
+    async def _validate_cached_market_data(self, now: datetime) -> None:
+        if (
+            self._last_full_data_check_at is not None
+            and (now - self._last_full_data_check_at).total_seconds() < FULL_DATA_CHECK_SECONDS
+        ):
+            return
+        self._last_full_data_check_at = now
+        invalid = [symbol for symbol in self._managed_symbols() if not self._symbol_cache_valid(symbol)]
+        if not invalid or self._scan_lock.locked():
+            return
+        async with self._scan_lock:
+            semaphore = asyncio.Semaphore(MARKET_REQUEST_CONCURRENCY)
+
+            async def repair(symbol: str) -> None:
+                async with semaphore:
+                    await self._refresh_symbol(symbol)
+
+            await asyncio.gather(*(repair(symbol) for symbol in invalid[:WARMUP_BATCH_SIZE]), return_exceptions=True)
+        if len(invalid) > WARMUP_BATCH_SIZE:
+            self._last_full_data_check_at = now - timedelta(
+                seconds=FULL_DATA_CHECK_SECONDS - TIMEFRAME_CLOSE_GRACE_SECONDS
+            )
+
+    def _symbol_cache_valid(self, symbol: str) -> bool:
+        cache = self._timeframe_candles.get(symbol, {})
+        return all(_candles_contiguous(cache.get(timeframe, []), timeframe) for timeframe in SUPPORTED_TIMEFRAMES)
+
+    def _priority_symbols(self) -> list[str]:
+        positions = list(self.account.positions)
+        candidates = [
+            symbol
+            for symbol, signal in sorted(
+                self.latest_signals.items(),
+                key=lambda item: int(item[1].get("score") or 0),
+                reverse=True,
+            )
+            if int(signal.get("score") or 0) >= AUTO_ENTRY_MIN_SCORE and symbol not in positions
+        ]
+        remainder = [
+            symbol for symbol in self._managed_symbols()
+            if symbol not in positions and symbol not in candidates
+        ]
+        return positions + candidates + remainder
 
     def _record_account_snapshots(self, now: datetime | None = None) -> None:
         total_pnl = self._current_total_pnl()
@@ -493,37 +1322,104 @@ class PaperTradingEngine:
 
     async def _refresh_symbol(self, symbol: str) -> bool:
         history_limit = max(240, self.settings.strategy.ma_trend + 40)
-        candles, derivatives = await self.market_data.historical_bundle(symbol, self.interval, limit=history_limit)
-        if not candles:
+        timeframe_candles: dict[str, list[Candle]] = {}
+        timeframe_derivatives: dict[str, list[DerivativesSnapshot]] = {}
+        for timeframe in SUPPORTED_TIMEFRAMES:
+            candles = await self.market_data.klines(
+                symbol,
+                timeframe,
+                limit=history_limit,
+            )
+            timeframe_candles[timeframe] = _closed_candles(candles, timeframe)
+        if not timeframe_candles.get(self.interval):
             return False
-        price = candles[-1].close
-        self._remember_mark_price(symbol, price)
-        indicators = build_indicators(
-            candles,
-            derivatives,
-            ema_fast=self.settings.strategy.ema_fast,
-            ema_slow=self.settings.strategy.ema_slow,
-            ma_trend=self.settings.strategy.ma_trend,
-            bollinger_window=self.settings.strategy.bollinger_window,
-            bollinger_stddev=self.settings.strategy.bollinger_stddev,
-            rsi_window=self.settings.strategy.rsi_window,
-            atr_window=self.settings.strategy.atr_window,
-            volume_window=self.settings.strategy.volume_window,
-            keltner_window=self.settings.strategy.keltner_window,
-            keltner_atr_multiplier=self.settings.strategy.keltner_atr_multiplier,
-            qps_window=self.settings.strategy.qps_window,
-        )
+        refresh_derivatives = getattr(self.market_data, "derivatives_bundle", None)
+        if refresh_derivatives is not None:
+            for timeframe in {self.interval, "4h"}:
+                closed = timeframe_candles.get(timeframe, [])
+                if not closed:
+                    continue
+                snapshots = await refresh_derivatives(
+                    symbol,
+                    timeframe,
+                    (candle.timestamp for candle in closed),
+                    include_funding=False,
+                )
+                existing = self._timeframe_derivatives.get(symbol, {}).get(
+                    timeframe,
+                    [],
+                )
+                timeframe_derivatives[timeframe] = _merge_derivatives(
+                    existing,
+                    snapshots,
+                    preserve_funding=True,
+                )
+
+        funding_rate = self._current_funding_rates.get(symbol.upper())
+        if funding_rate is not None:
+            for timeframe, snapshots in timeframe_derivatives.items():
+                timeframe_derivatives[timeframe] = _with_current_funding(
+                    snapshots,
+                    funding_rate,
+                )
+
+        self._timeframe_candles[symbol] = timeframe_candles
+        self._timeframe_derivatives[symbol] = timeframe_derivatives
+        now = datetime.now(UTC)
+        if all(
+            _derivatives_complete(timeframe_derivatives.get(timeframe, []))
+            for timeframe in {self.interval, "4h"}
+        ):
+            self._oi_ratio_updated_at[symbol] = now
+            self._derivatives_updated_at[symbol] = now
+            source_timestamps = [
+                snapshot.timestamp
+                for snapshots in timeframe_derivatives.values()
+                for snapshot in snapshots
+                if snapshot.open_interest is not None
+                and snapshot.long_short_ratio is not None
+            ]
+            if source_timestamps:
+                self._derivatives_source_at[symbol] = max(source_timestamps)
+        if symbol not in self.latest_prices:
+            self._remember_mark_price(
+                symbol,
+                float(timeframe_candles[self.interval][-1].close),
+                fresh=False,
+            )
+        return self._publish_symbol_from_cache(symbol)
+
+    def _publish_symbol_from_cache(self, symbol: str) -> bool:
+        timeframe_candles = self._timeframe_candles.get(symbol, {})
+        base_candles = timeframe_candles.get(self.interval, [])
+        if not base_candles:
+            return False
+        timeframe_indicators: dict[str, list[IndicatorSnapshot]] = {}
+        for timeframe in SUPPORTED_TIMEFRAMES:
+            candles = timeframe_candles.get(timeframe, [])
+            if not candles:
+                continue
+            derivatives = self._timeframe_derivatives.get(symbol, {}).get(timeframe, [])
+            timeframe_indicators[timeframe] = (
+                _build_indicators(candles, derivatives, self.settings)
+                if derivatives
+                else _build_price_only_indicators(candles, self.settings)
+            )
+        indicators = timeframe_indicators.get(self.interval, [])
+        if not indicators:
+            return False
+        mtf_context = _build_multi_timeframe_context(timeframe_candles, timeframe_indicators, self.settings)
         self.latest_indicators[symbol] = indicators
-        timeframe_indicators, mtf_context = await self._multi_timeframe_context(symbol, candles, indicators)
         self.latest_timeframe_indicators[symbol] = timeframe_indicators
         self.latest_timeframe_contexts[symbol] = mtf_context
         strategy = CompositeStrategy(replace(self.settings.strategy, smart_money_window=_bars_for_4h(self.interval)))
-        signal = strategy.generate_signal(symbol, candles, indicators)
-        cycle = strategy.smart_money_cycle(candles, indicators)
+        signal = strategy.generate_signal(symbol, base_candles, indicators)
+        cycle = strategy.smart_money_cycle(base_candles, indicators)
         signal_side = "LONG" if signal.action == SignalAction.ENTRY_LONG else "SHORT" if signal.action == SignalAction.ENTRY_SHORT else None
         trend_state = strategy.trend_state(signal_side, indicators)
         risk_state = strategy.risk_state(indicators)
         current = indicators[-1] if indicators else None
+        live_price = self.latest_prices.get(symbol) or (current.close if current else base_candles[-1].close)
         payload = {
             "timestamp": signal.timestamp.isoformat(),
             "action": signal.action.value,
@@ -535,7 +1431,7 @@ class PaperTradingEngine:
             "oi_change": current.oi_change if current else None,
             "long_short_ratio": current.long_short_ratio if current else None,
             "funding_rate": current.funding_rate if current else None,
-            "price": current.close if current else price,
+            "price": live_price,
             "score": signal.score,
             "reasons": signal.reasons,
             "vetoes": signal.vetoes,
@@ -543,6 +1439,7 @@ class PaperTradingEngine:
         }
         self.latest_signals[symbol] = _apply_multi_timeframe_context(payload, mtf_context)
         self.account.latest_signals[symbol] = dict(self.latest_signals[symbol])
+        self._signal_updated_at[symbol] = datetime.now(UTC)
         return True
 
     async def _multi_timeframe_context(
@@ -551,62 +1448,67 @@ class PaperTradingEngine:
         base_candles: list[Candle],
         base_indicators: list[IndicatorSnapshot],
     ) -> tuple[dict[str, list[IndicatorSnapshot]], dict[str, object]]:
-        timeframe_candles: dict[str, list[Candle]] = {}
-        timeframe_indicators: dict[str, list[IndicatorSnapshot]] = {}
-        timeframes = ("15m", "1h", "4h", "1d")
-
-        async def fetch_timeframe(timeframe: str) -> tuple[str, list[Candle], list[IndicatorSnapshot]] | Exception:
-            if timeframe == self.interval:
-                return timeframe, base_candles, base_indicators
-            if timeframe == "4h":
-                candles, derivatives = await self.market_data.historical_bundle(symbol, timeframe, limit=max(240, self.settings.strategy.ma_trend + 40))
-                return timeframe, candles, build_indicators(
-                    candles,
-                    derivatives,
-                    ema_fast=self.settings.strategy.ema_fast,
-                    ema_slow=self.settings.strategy.ema_slow,
-                    ma_trend=self.settings.strategy.ma_trend,
-                    bollinger_window=self.settings.strategy.bollinger_window,
-                    bollinger_stddev=self.settings.strategy.bollinger_stddev,
-                    rsi_window=self.settings.strategy.rsi_window,
-                    atr_window=self.settings.strategy.atr_window,
-                    volume_window=self.settings.strategy.volume_window,
-                    keltner_window=self.settings.strategy.keltner_window,
-                    keltner_atr_multiplier=self.settings.strategy.keltner_atr_multiplier,
-                    qps_window=self.settings.strategy.qps_window,
-                )
-            candles = await self.market_data.klines(symbol, timeframe, limit=max(240, self.settings.strategy.ma_trend + 40))
-            return timeframe, candles, _build_price_only_indicators(candles, self.settings)
-
-        results = await asyncio.gather(*(fetch_timeframe(timeframe) for timeframe in timeframes), return_exceptions=True)
-        previous_indicators = self.latest_timeframe_indicators.get(symbol, {})
-        for result in results:
-            if isinstance(result, Exception):
-                continue
-            timeframe, candles, indicators = result
-            timeframe_candles[timeframe] = candles
-            timeframe_indicators[timeframe] = indicators
-        for timeframe in timeframes:
-            if timeframe not in timeframe_indicators and timeframe in previous_indicators:
-                timeframe_indicators[timeframe] = previous_indicators[timeframe]
-        if not timeframe_candles:
-            return previous_indicators, self.latest_timeframe_contexts.get(symbol, {})
+        timeframe_candles = self._timeframe_candles.get(symbol, {self.interval: base_candles})
+        timeframe_indicators = self.latest_timeframe_indicators.get(symbol, {self.interval: base_indicators})
         return timeframe_indicators, _build_multi_timeframe_context(timeframe_candles, timeframe_indicators, self.settings)
 
     async def _price(self, symbol: str) -> float:
         symbol = symbol.upper()
         if symbol not in self.latest_prices:
-            candles = await self.market_data.klines(symbol, self.interval, limit=2)
-            if not candles:
-                raise ValueError(f"cannot fetch price for {symbol}")
-            self._remember_mark_price(symbol, float(candles[-1].close))
+            mark_prices = getattr(self.market_data, "mark_prices", None)
+            if mark_prices is not None:
+                prices = await mark_prices([symbol])
+                if symbol in prices:
+                    self._remember_mark_price(symbol, float(prices[symbol]))
+            if symbol not in self.latest_prices:
+                candles = await self.market_data.klines(
+                    symbol,
+                    self.interval,
+                    limit=2,
+                )
+                if not candles:
+                    raise ValueError(f"cannot fetch price for {symbol}")
+                self._remember_mark_price(symbol, float(candles[-1].close))
         return self.latest_prices[symbol]
 
-    def _remember_mark_price(self, symbol: str, price: float) -> None:
+    def _remember_mark_price(self, symbol: str, price: float, *, fresh: bool = True) -> None:
         if not math.isfinite(price) or price <= 0:
             return
         symbol = symbol.upper()
         self.latest_prices[symbol] = price
+        now = datetime.now(UTC)
+        if not fresh:
+            position = self.account.positions.get(symbol)
+            if position is not None:
+                position.metadata["last_mark_price"] = price
+            return
+        self._price_updated_at[symbol] = now
+        self._price_update_event.set()
+        slot = _current_candle_slot("15m", now)
+        live = self._live_m15_candles.get(symbol)
+        if live is None or live.timestamp != slot:
+            previous_close = (
+                self._timeframe_candles.get(symbol, {}).get("15m", [])[-1].close
+                if self._timeframe_candles.get(symbol, {}).get("15m")
+                else price
+            )
+            self._live_m15_candles[symbol] = Candle(
+                timestamp=slot,
+                open=previous_close,
+                high=max(previous_close, price),
+                low=min(previous_close, price),
+                close=price,
+                volume=0.0,
+            )
+        else:
+            self._live_m15_candles[symbol] = Candle(
+                timestamp=slot,
+                open=live.open,
+                high=max(live.high, price),
+                low=min(live.low, price),
+                close=price,
+                volume=live.volume,
+            )
         position = self.account.positions.get(symbol)
         if position is not None:
             position.metadata["last_mark_price"] = price
@@ -614,23 +1516,43 @@ class PaperTradingEngine:
     async def _auto_trade_once(self) -> None:
         if await self._btc_4h_extreme_volatility():
             self.last_error = "BTC 4h extreme volatility; pause new altcoin entries"
+            for symbol, signal in self.latest_signals.items():
+                if symbol not in self.account.positions and signal.get("action") in {
+                    SignalAction.ENTRY_LONG.value,
+                    SignalAction.ENTRY_SHORT.value,
+                }:
+                    _record_auto_entry_block(signal, "BTC 4h extreme volatility; pause new altcoin entries")
             return
         max_positions = min(self.settings.risk.max_open_positions, 5)
-        candidates = [
-            (symbol, signal)
-            for symbol, signal in self.latest_signals.items()
-            if symbol not in self.account.positions
-            and symbol.upper() not in AUTO_UNIVERSE_EXCLUDED_SYMBOLS
-            and signal.get("action") in {SignalAction.ENTRY_LONG.value, SignalAction.ENTRY_SHORT.value}
-            and _auto_signal_allowed(signal)
-        ]
+        candidates: list[tuple[str, dict[str, object]]] = []
+        for symbol, signal in self.latest_signals.items():
+            _clear_transient_auto_entry_blocks(signal)
+            if symbol in self.account.positions:
+                continue
+            if symbol.upper() in AUTO_UNIVERSE_EXCLUDED_SYMBOLS:
+                _record_auto_entry_block(signal, "symbol excluded from automatic universe")
+                continue
+            for reason in _auto_entry_prerequisite_blocks(signal):
+                _record_auto_entry_block(signal, reason)
+            if self.running:
+                for reason in self._data_freshness_blocks(symbol):
+                    _record_auto_entry_block(signal, reason)
+            if signal.get("vetoes"):
+                continue
+            candidates.append((symbol, signal))
         candidates.sort(key=lambda item: int(item[1].get("score") or 0), reverse=True)
         if len(self.account.positions) >= max_positions:
             await self._rebalance_for_better_candidate(candidates)
         slots = max_positions - len(self.account.positions)
         if slots <= 0:
+            for _, signal in candidates:
+                _record_auto_entry_block(signal, f"position capacity full: {max_positions} open positions")
             return
-        for index, (symbol, signal) in enumerate(candidates[:slots]):
+        opened_count = 0
+        for symbol, signal in candidates:
+            if opened_count >= slots:
+                _record_auto_entry_block(signal, f"position capacity full: {max_positions} open positions")
+                continue
             if symbol in self.account.positions:
                 continue
             action = signal.get("action")
@@ -644,11 +1566,17 @@ class PaperTradingEngine:
             score = int(signal.get("score") or 0)
             max_total_margin = equity * INITIAL_ENTRY_MARGIN_CAP
             remaining_total_margin = max(max_total_margin - used_margin, 0.0)
-            slots_remaining = max(slots - index, 1)
+            slots_remaining = max(slots - opened_count, 1)
             margin = _margin_for_signal(score, equity, remaining_total_margin, slots_remaining)
             margin *= _daily_bias_margin_factor(side, signal)
             margin = min(margin, available, remaining_total_margin)
-            if margin >= 20:
+            if margin < 20:
+                _record_auto_entry_block(
+                    signal,
+                    f"available entry margin {margin:.2f} USDT below minimum 20.00 USDT",
+                )
+                continue
+            try:
                 indicators = self.latest_indicators.get(symbol, [])
                 precision = self.latest_timeframe_contexts.get(symbol, {}).get("m15_precision", {})
                 mtf_context = self.latest_timeframe_contexts.get(symbol, {})
@@ -711,9 +1639,15 @@ class PaperTradingEngine:
                         stop_loss = refined_stop
                         stop_basis = "15m_precision_structure"
                     elif precision_entry_only:
-                        signal["entry_timing"] = ENTRY_TIMING_WAIT
-                        signal["entry_timing_reason"] = "entry timing wait: 15m tactical entry needs a valid 15m structure stop or 1h/4h entry zone"
+                        _record_auto_entry_block(
+                            signal,
+                            "15m tactical entry lacks a valid 15m structure stop or 1h/4h entry zone",
+                        )
                         continue
+                stop_error = _entry_stop_error(PositionSide(side), entry_price, stop_loss)
+                if stop_error:
+                    _record_auto_entry_block(signal, f"invalid entry stop: {stop_error}")
+                    continue
                 take_profit_1, take_profit_2 = _refine_take_profit_with_ma_cluster(
                     PositionSide(side),
                     entry_price,
@@ -724,8 +1658,10 @@ class PaperTradingEngine:
                 )
                 reward_r = _entry_reward_r(signal, PositionSide(side), entry_price, stop_loss)
                 if reward_r is not None and reward_r < MIN_ENTRY_REWARD_R:
-                    signal["entry_timing"] = ENTRY_TIMING_BLOCK
-                    signal["entry_timing_reason"] = "entry timing blocked: reward/risk too low"
+                    _record_auto_entry_block(
+                        signal,
+                        f"entry reward/risk {reward_r:.2f}R below minimum {MIN_ENTRY_REWARD_R:.2f}R",
+                    )
                     continue
                 entry_context = _entry_context_from_signal(signal)
                 entry_context["stop_basis"] = stop_basis
@@ -743,6 +1679,9 @@ class PaperTradingEngine:
                     entry_reasons=tuple(str(reason) for reason in (signal.get("reasons") or ())),
                     entry_context=entry_context,
                 )
+                opened_count += 1
+            except Exception as exc:  # noqa: BLE001 - one rejected candidate must not block later candidates
+                _record_auto_entry_block(signal, f"auto entry execution failed: {exc}")
         self._add_to_strong_positions()
 
     async def _rebalance_for_better_candidate(self, candidates: list[tuple[str, dict[str, object]]]) -> None:
@@ -797,22 +1736,73 @@ class PaperTradingEngine:
         return best_target
 
     async def _btc_4h_extreme_volatility(self) -> bool:
+        now = datetime.now(UTC)
+        if (
+            self._last_btc_extreme_check_at is not None
+            and (now - self._last_btc_extreme_check_at).total_seconds() < FULL_DATA_CHECK_SECONDS
+        ):
+            return self._btc_extreme_cached
         try:
             candles = await self.market_data.klines("BTCUSDT", "4h", limit=2)
         except Exception:  # noqa: BLE001 - do not block trading on missing public filter data
-            return False
+            return self._btc_extreme_cached
+        self._last_btc_extreme_check_at = now
         if not candles:
-            return False
+            return self._btc_extreme_cached
         candle = candles[-1]
         amplitude = (candle.high - candle.low) / candle.open if candle.open else 0.0
         body_move = abs(candle.close - candle.open) / candle.open if candle.open else 0.0
-        return amplitude >= BTC_EXTREME_4H_AMPLITUDE or body_move >= BTC_EXTREME_4H_AMPLITUDE * 0.75
+        self._btc_extreme_cached = (
+            amplitude >= BTC_EXTREME_4H_AMPLITUDE
+            or body_move >= BTC_EXTREME_4H_AMPLITUDE * 0.75
+        )
+        return self._btc_extreme_cached
 
-    def _manage_open_positions(self) -> None:
+    def _data_freshness_blocks(self, symbol: str) -> tuple[str, ...]:
+        now = datetime.now(UTC)
+        blocks: list[str] = []
+        if not self._warmup_complete:
+            blocks.append("market warm-up is still running")
+        price_updated_at = self._price_updated_at.get(symbol)
+        if (
+            price_updated_at is None
+            or (now - price_updated_at).total_seconds() > MARKET_PRICE_STALE_SECONDS
+        ):
+            blocks.append("latest price is stale for more than 15 seconds")
+        derivatives_updated_at = (
+            self._oi_ratio_updated_at.get(symbol)
+            or self._derivatives_updated_at.get(symbol)
+        )
+        if (
+            derivatives_updated_at is None
+            or (now - derivatives_updated_at).total_seconds() > DERIVATIVES_STALE_SECONDS
+        ):
+            blocks.append("OI/long-short ratio data is stale for more than 180 seconds")
+        if getattr(self.market_data, "current_funding_rates", None) is not None:
+            funding_updated_at = self._funding_updated_at.get(symbol)
+            if (
+                funding_updated_at is None
+                or (now - funding_updated_at).total_seconds()
+                > FUNDING_REFRESH_SECONDS * 1.5
+            ):
+                blocks.append("current funding rate data is stale for more than 15 minutes")
+        if not self._symbol_cache_valid(symbol):
+            blocks.append("required multi-timeframe K-line context is missing or discontinuous")
+        return tuple(blocks)
+
+    def _manage_open_positions(self, *, fresh_only: bool = False) -> None:
+        now = datetime.now(UTC)
         for position in list(self.account.positions.values()):
             price = self.latest_prices.get(position.symbol)
             if price is None:
                 continue
+            if fresh_only:
+                updated_at = self._price_updated_at.get(position.symbol)
+                if (
+                    updated_at is None
+                    or (now - updated_at).total_seconds() > MARKET_PRICE_STALE_SECONDS
+                ):
+                    continue
             indicators = self.latest_indicators.get(position.symbol, [])
             tf_indicators = self.latest_timeframe_indicators.get(position.symbol, {})
             trend_state = self.strategy.trend_state(position.side.value, indicators) if indicators else "CHOP"
@@ -1020,7 +2010,18 @@ class PaperTradingEngine:
         payload = _paper_account_payload(self.account)
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
         temp_path = self.state_path.with_name(f"{self.state_path.name}.tmp")
-        temp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        backup_path = self.state_path.with_name(f"{self.state_path.name}.bak")
+        backup_temp_path = backup_path.with_name(f"{backup_path.name}.tmp")
+        serialized = json.dumps(payload, ensure_ascii=False, indent=2)
+        _write_text_synced(temp_path, serialized)
+        if self.state_path.exists():
+            try:
+                json.loads(self.state_path.read_text(encoding="utf-8"))
+            except (OSError, TypeError, ValueError, json.JSONDecodeError):
+                pass
+            else:
+                shutil.copy2(self.state_path, backup_temp_path)
+                backup_temp_path.replace(backup_path)
         temp_path.replace(self.state_path)
 
 
@@ -1214,30 +2215,73 @@ def _paper_account_payload(account: PaperAccount) -> dict[str, Any]:
 
 
 def _load_paper_account(path: Path | None) -> PaperAccount | None:
-    if path is None or not path.exists():
+    if path is None:
         return None
-    try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
-        return PaperAccount(
-            starting_balance=float(raw.get("starting_balance", PAPER_DEFAULT_BALANCE)),
-            wallet_balance=float(raw.get("wallet_balance", raw.get("starting_balance", PAPER_DEFAULT_BALANCE))),
-            realized_pnl=float(raw.get("realized_pnl", 0.0)),
-            fees_paid=float(raw.get("fees_paid", 0.0)),
-            positions={
-                symbol: _position_from_payload(payload)
-                for symbol, payload in dict(raw.get("positions") or {}).items()
-            },
-            fills=[_fill_from_payload(payload) for payload in list(raw.get("fills") or [])],
-            daily_pnl_baselines={str(key): float(value) for key, value in dict(raw.get("daily_pnl_baselines") or {}).items()},
-            pnl_history={str(key): float(value) for key, value in dict(raw.get("pnl_history") or {}).items()},
-            latest_signals={
-                str(symbol).upper(): dict(signal)
-                for symbol, signal in dict(raw.get("latest_signals") or {}).items()
-                if isinstance(signal, dict)
-            },
-        )
-    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+    backup_path = path.with_name(f"{path.name}.bak")
+    if not path.exists() and not backup_path.exists():
         return None
+    errors: list[str] = []
+    for candidate in (path, backup_path):
+        if not candidate.exists():
+            continue
+        try:
+            raw = json.loads(candidate.read_text(encoding="utf-8"))
+            if not isinstance(raw, dict):
+                raise TypeError("state root must be a JSON object")
+            return _paper_account_from_payload(raw)
+        except (OSError, TypeError, ValueError, KeyError, json.JSONDecodeError) as exc:
+            errors.append(f"{candidate.name}: {exc}")
+    detail = "; ".join(errors) or "no readable state or backup"
+    raise PaperStateError(f"模拟账户状态损坏，已停止启动以防止资金重置：{detail}")
+
+
+def _paper_account_from_payload(raw: dict[str, Any]) -> PaperAccount:
+    starting_balance = float(raw.get("starting_balance", PAPER_DEFAULT_BALANCE))
+    wallet_balance = float(raw.get("wallet_balance", starting_balance))
+    if (
+        not math.isfinite(starting_balance)
+        or starting_balance <= 0
+        or not math.isfinite(wallet_balance)
+    ):
+        raise ValueError("invalid account balance")
+    return PaperAccount(
+        starting_balance=starting_balance,
+        wallet_balance=wallet_balance,
+        realized_pnl=float(raw.get("realized_pnl", 0.0)),
+        fees_paid=float(raw.get("fees_paid", 0.0)),
+        positions={
+            symbol: _position_from_payload(payload)
+            for symbol, payload in dict(raw.get("positions") or {}).items()
+        },
+        fills=[
+            _fill_from_payload(payload)
+            for payload in list(raw.get("fills") or [])
+        ],
+        daily_pnl_baselines={
+            str(key): float(value)
+            for key, value in dict(
+                raw.get("daily_pnl_baselines") or {}
+            ).items()
+        },
+        pnl_history={
+            str(key): float(value)
+            for key, value in dict(raw.get("pnl_history") or {}).items()
+        },
+        latest_signals={
+            str(symbol).upper(): dict(signal)
+            for symbol, signal in dict(
+                raw.get("latest_signals") or {}
+            ).items()
+            if isinstance(signal, dict)
+        },
+    )
+
+
+def _write_text_synced(path: Path, text: str) -> None:
+    with path.open("w", encoding="utf-8") as handle:
+        handle.write(text)
+        handle.flush()
+        os.fsync(handle.fileno())
 
 
 def _position_payload(position: Position) -> dict[str, Any]:
@@ -1991,15 +3035,108 @@ def _structure_target_candidates(mapping: dict[str, object], side: PositionSide,
 
 
 def _auto_signal_allowed(signal: dict[str, object]) -> bool:
-    score = int(signal.get("score") or 0)
     if signal.get("vetoes"):
         return False
-    entry_timing, _ = _signal_entry_timing(signal)
-    if _trend_stage_from_signal(signal) == TREND_STAGE_LATE:
-        return False
-    if score >= 82 and entry_timing == ENTRY_TIMING_GOOD:
-        return True
-    return False
+    return not _auto_entry_prerequisite_blocks(signal)
+
+
+def _auto_entry_prerequisite_blocks(signal: dict[str, object]) -> tuple[str, ...]:
+    blocks: list[str] = []
+    action = str(signal.get("action") or "")
+    score = int(signal.get("score") or 0)
+    is_entry = action in {SignalAction.ENTRY_LONG.value, SignalAction.ENTRY_SHORT.value}
+    if not is_entry:
+        blocks.append("directional entry signal not established")
+    if score < AUTO_ENTRY_MIN_SCORE:
+        blocks.append(f"final score {score} below auto-entry minimum {AUTO_ENTRY_MIN_SCORE}")
+    if is_entry:
+        if _trend_stage_from_signal(signal) == TREND_STAGE_LATE:
+            blocks.append("late trend stage blocks fresh entry")
+        else:
+            entry_timing, entry_reason = _signal_entry_timing(signal)
+            if entry_timing != ENTRY_TIMING_GOOD:
+                detail = entry_reason or entry_timing
+                existing_vetoes = {str(reason) for reason in (signal.get("vetoes") or ())}
+                if detail not in existing_vetoes:
+                    blocks.append(f"current entry timing is not excellent: {detail}")
+    return tuple(dict.fromkeys(blocks))
+
+
+def _auto_entry_status_signal(
+    symbol: str,
+    signal: dict[str, object],
+    *,
+    auto_trade: bool,
+    has_position: bool,
+) -> dict[str, object]:
+    payload = dict(signal)
+    _clear_transient_auto_entry_blocks(payload)
+    for reason in _auto_entry_prerequisite_blocks(payload):
+        _record_auto_entry_block(payload, reason)
+    if symbol.upper() in AUTO_UNIVERSE_EXCLUDED_SYMBOLS:
+        _record_auto_entry_block(payload, "symbol excluded from automatic universe")
+    if has_position:
+        _record_auto_entry_block(payload, "symbol already has an open position")
+    if not auto_trade:
+        _record_auto_entry_block(payload, "auto strategy disabled; new entries are paused")
+    return payload
+
+
+def _record_auto_entry_block(signal: dict[str, object], reason: str) -> None:
+    vetoes = list(signal.get("vetoes") or ())
+    if reason not in vetoes:
+        vetoes.append(reason)
+    signal["vetoes"] = tuple(vetoes)
+    signal["entry_timing"] = ENTRY_TIMING_BLOCK
+    signal["entry_timing_reason"] = reason
+
+
+_TRANSIENT_AUTO_ENTRY_BLOCK_PREFIXES = (
+    "directional entry signal not established",
+    "final score ",
+    "late trend stage",
+    "current entry timing is not excellent",
+    "symbol already has an open position",
+    "auto strategy disabled",
+    "position capacity full",
+    "available entry margin ",
+    "invalid entry stop",
+    "entry reward/risk ",
+    "auto entry execution failed",
+    "BTC 4h extreme volatility",
+    "market warm-up",
+    "latest price is stale",
+    "OI/long-short ratio data is stale",
+    "current funding rate data is stale",
+    "required multi-timeframe K-line context",
+)
+
+
+def _clear_transient_auto_entry_blocks(signal: dict[str, object]) -> None:
+    vetoes = [
+        str(reason)
+        for reason in (signal.get("vetoes") or ())
+        if not str(reason).startswith(_TRANSIENT_AUTO_ENTRY_BLOCK_PREFIXES)
+    ]
+    signal["vetoes"] = tuple(vetoes)
+    timing_reason = str(signal.get("entry_timing_reason") or "")
+    if timing_reason.startswith(_TRANSIENT_AUTO_ENTRY_BLOCK_PREFIXES):
+        signal.pop("entry_timing", None)
+        signal.pop("entry_timing_reason", None)
+
+
+def _entry_stop_error(side: PositionSide, entry_price: float, stop_price: float) -> str | None:
+    if not math.isfinite(entry_price) or entry_price <= 0:
+        return "entry price is not positive and finite"
+    if not math.isfinite(stop_price) or stop_price <= 0:
+        return "stop price is not positive and finite"
+    if side == PositionSide.LONG and stop_price >= entry_price:
+        return "long stop must be below entry price"
+    if side == PositionSide.SHORT and stop_price <= entry_price:
+        return "short stop must be above entry price"
+    if abs(entry_price - stop_price) <= entry_price * 1e-8:
+        return "stop distance is effectively zero"
+    return None
 
 
 def _rotation_candidate_allowed(signal: dict[str, object], indicator: IndicatorSnapshot | None) -> bool:
@@ -2269,9 +3406,17 @@ def _rotation_efficiency_better(candidate: IndicatorSnapshot | None, current: In
 
 
 def _build_price_only_indicators(candles: list[Candle], settings: AppSettings) -> list[IndicatorSnapshot]:
+    return _build_indicators(candles, [], settings)
+
+
+def _build_indicators(
+    candles: list[Candle],
+    derivatives: list[DerivativesSnapshot],
+    settings: AppSettings,
+) -> list[IndicatorSnapshot]:
     return build_indicators(
         candles,
-        [],
+        derivatives,
         ema_fast=settings.strategy.ema_fast,
         ema_slow=settings.strategy.ema_slow,
         ma_trend=settings.strategy.ma_trend,
@@ -2283,6 +3428,127 @@ def _build_price_only_indicators(candles: list[Candle], settings: AppSettings) -
         keltner_window=settings.strategy.keltner_window,
         keltner_atr_multiplier=settings.strategy.keltner_atr_multiplier,
         qps_window=settings.strategy.qps_window,
+    )
+
+
+_TIMEFRAME_SECONDS = {
+    "15m": 15 * 60,
+    "1h": 60 * 60,
+    "4h": 4 * 60 * 60,
+    "1d": 24 * 60 * 60,
+}
+
+
+def _timeframe_seconds(timeframe: str) -> int:
+    try:
+        return _TIMEFRAME_SECONDS[timeframe]
+    except KeyError as exc:
+        raise ValueError(f"unsupported timeframe: {timeframe}") from exc
+
+
+def _latest_closed_slot(timeframe: str, now: datetime) -> datetime:
+    seconds = _timeframe_seconds(timeframe)
+    timestamp = max(now.timestamp() - TIMEFRAME_CLOSE_GRACE_SECONDS, 0.0)
+    return datetime.fromtimestamp(int(timestamp // seconds) * seconds, tz=UTC)
+
+
+def _current_candle_slot(timeframe: str, now: datetime) -> datetime:
+    seconds = _timeframe_seconds(timeframe)
+    return datetime.fromtimestamp(int(now.timestamp() // seconds) * seconds, tz=UTC)
+
+
+def _closed_candles(candles: list[Candle], timeframe: str, now: datetime | None = None) -> list[Candle]:
+    if not candles:
+        return []
+    cutoff = (now or datetime.now(UTC)) - timedelta(seconds=TIMEFRAME_CLOSE_GRACE_SECONDS)
+    duration = timedelta(seconds=_timeframe_seconds(timeframe))
+    closed = [candle for candle in candles if candle.timestamp + duration <= cutoff]
+    return closed or candles[:-1]
+
+
+def _merge_candles(existing: list[Candle], incoming: list[Candle], *, max_length: int) -> list[Candle]:
+    merged = {candle.timestamp: candle for candle in existing}
+    merged.update({candle.timestamp: candle for candle in incoming})
+    return [merged[timestamp] for timestamp in sorted(merged)][-max_length:]
+
+
+def _derivatives_for_candles(
+    derivatives: list[DerivativesSnapshot],
+    candles: list[Candle],
+) -> list[DerivativesSnapshot]:
+    wanted = {candle.timestamp for candle in candles}
+    return [snapshot for snapshot in derivatives if snapshot.timestamp in wanted]
+
+
+def _derivatives_complete(derivatives: list[DerivativesSnapshot]) -> bool:
+    recent = derivatives[-12:]
+    return bool(recent) and any(snapshot.open_interest is not None for snapshot in recent) and any(
+        snapshot.long_short_ratio is not None for snapshot in recent
+    )
+
+
+def _merge_derivatives(
+    existing: list[DerivativesSnapshot],
+    incoming: list[DerivativesSnapshot],
+    *,
+    preserve_funding: bool,
+) -> list[DerivativesSnapshot]:
+    existing_by_time = {snapshot.timestamp: snapshot for snapshot in existing}
+    incoming_by_time = {snapshot.timestamp: snapshot for snapshot in incoming}
+    latest_funding: float | None = None
+    merged: dict[datetime, DerivativesSnapshot] = dict(existing_by_time)
+    for timestamp in sorted(set(existing_by_time) | set(incoming_by_time)):
+        old = existing_by_time.get(timestamp)
+        new = incoming_by_time.get(timestamp)
+        if old and old.funding_rate is not None:
+            latest_funding = old.funding_rate
+        funding = (
+            new.funding_rate
+            if new and new.funding_rate is not None
+            else old.funding_rate
+            if old and old.funding_rate is not None
+            else latest_funding
+        )
+        if new is None:
+            continue
+        merged[timestamp] = DerivativesSnapshot(
+            timestamp=timestamp,
+            open_interest=new.open_interest if new.open_interest is not None else old.open_interest if old else None,
+            long_short_ratio=(
+                new.long_short_ratio
+                if new.long_short_ratio is not None
+                else old.long_short_ratio
+                if old
+                else None
+            ),
+            funding_rate=funding if preserve_funding else new.funding_rate,
+        )
+    return [merged[timestamp] for timestamp in sorted(merged)][-500:]
+
+
+def _with_current_funding(
+    snapshots: list[DerivativesSnapshot],
+    funding_rate: float,
+) -> list[DerivativesSnapshot]:
+    return [
+        DerivativesSnapshot(
+            timestamp=snapshot.timestamp,
+            open_interest=snapshot.open_interest,
+            long_short_ratio=snapshot.long_short_ratio,
+            funding_rate=funding_rate,
+        )
+        for snapshot in snapshots
+    ]
+
+
+def _candles_contiguous(candles: list[Candle], timeframe: str) -> bool:
+    if len(candles) < 50:
+        return False
+    expected = timedelta(seconds=_timeframe_seconds(timeframe))
+    recent = candles[-12:]
+    return all(
+        current.timestamp - previous.timestamp == expected
+        for previous, current in zip(recent, recent[1:])
     )
 
 

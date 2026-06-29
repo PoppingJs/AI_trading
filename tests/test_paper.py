@@ -11,16 +11,23 @@ from ai_trading.api import create_app
 from ai_trading.config import AppSettings
 from ai_trading.models import Candle, IndicatorSnapshot, PositionSide, SignalAction
 from ai_trading.paper import (
+    MARKET_PRICE_STALE_SECONDS,
+    PaperStateError,
     PaperTradingEngine,
+    _clear_transient_auto_entry_blocks,
+    _closed_candles,
     _adaptive_exits,
     _apply_multi_timeframe_context,
+    _auto_entry_prerequisite_blocks,
     _auto_signal_allowed,
     _confirmed_structure_exit_reason,
     _daily_bias_margin_factor,
     _daily_pnl_payload,
     _entry_reward_r,
+    _entry_stop_error,
     _leverage_for_signal,
     _margin_for_signal,
+    _merge_candles,
     _ma_cluster_signal_adjustment,
     _pnl_history_payload,
     _profit_drawdown_exit_reason,
@@ -262,6 +269,188 @@ def test_stop_disables_entries_without_stopping_background_worker() -> None:
     asyncio.run(scenario())
 
 
+def test_auto_universe_configuration_keeps_resolved_pool() -> None:
+    engine = PaperTradingEngine(AppSettings(), starting_balance=1000, market_data=FakeMarketData())
+    asyncio.run(engine.refresh_universe_if_needed())
+    resolved = list(engine.symbols)
+
+    engine.configure_symbols(["AUTO_TOP30"])
+
+    assert engine.symbols == resolved
+    assert engine._auto_universe is True
+
+
+def test_live_entry_timing_rechecks_when_price_reaches_zone() -> None:
+    engine = PaperTradingEngine(AppSettings(), starting_balance=1000, market_data=FakeMarketData())
+    engine.latest_signals["TESTUSDT"] = {
+        "action": "ENTRY_LONG",
+        "score": 90,
+        "trend_state": "TREND_LONG",
+        "risk_state": "NORMAL",
+        "price": 110.0,
+        "entry_levels": {
+            "long": {
+                "h1_support": {"low": 99.0, "high": 101.0, "price": 100.0},
+            }
+        },
+    }
+    engine._remember_mark_price("TESTUSDT", 110.0)
+    engine._refresh_live_entry_timing()
+    assert engine.latest_signals["TESTUSDT"]["entry_timing"] == "WAIT"
+
+    engine._remember_mark_price("TESTUSDT", 100.0)
+    engine._refresh_live_entry_timing()
+
+    assert engine.latest_signals["TESTUSDT"]["entry_timing"] == "GOOD"
+
+
+def test_transient_entry_blocks_are_removed_but_strategy_veto_remains() -> None:
+    signal = {
+        "vetoes": (
+            "latest price is stale for more than 15 seconds",
+            "current funding rate data is stale for more than 15 minutes",
+            "funding rate too hot for long entry",
+        ),
+        "entry_timing": "BLOCK",
+        "entry_timing_reason": "latest price is stale for more than 15 seconds",
+    }
+
+    _clear_transient_auto_entry_blocks(signal)
+
+    assert signal["vetoes"] == ("funding rate too hot for long entry",)
+    assert "entry_timing" not in signal
+    assert "entry_timing_reason" not in signal
+
+
+def test_stale_price_is_recorded_as_auto_entry_veto_and_clears_after_refresh() -> None:
+    engine = PaperTradingEngine(
+        AppSettings(),
+        starting_balance=1000,
+        market_data=FakeMarketData(),
+    )
+    symbol = "TESTUSDT"
+    now = datetime.now(UTC)
+    engine.running = True
+    engine._warmup_complete = True
+    engine._symbol_cache_valid = lambda _symbol: True
+    engine.latest_prices[symbol] = 100.0
+    engine._price_updated_at[symbol] = now - timedelta(
+        seconds=MARKET_PRICE_STALE_SECONDS + 1
+    )
+    engine._oi_ratio_updated_at[symbol] = now
+    engine.latest_signals[symbol] = {
+        "action": SignalAction.ENTRY_LONG.value,
+        "score": 90,
+        "trend_state": "TREND_LONG",
+        "risk_state": "NORMAL",
+        "price": 100.0,
+        "entry_levels": {
+            "long": {
+                "h1_support": {"low": 99.0, "high": 101.0, "price": 100.0},
+            }
+        },
+    }
+
+    asyncio.run(engine._auto_trade_once())
+
+    stale_reason = "latest price is stale for more than 15 seconds"
+    assert symbol not in engine.account.positions
+    assert stale_reason in engine.latest_signals[symbol]["vetoes"]
+    assert stale_reason in engine.status()["latest_signals"][symbol]["vetoes"]
+
+    engine._remember_mark_price(symbol, 100.0)
+    asyncio.run(engine._auto_trade_once())
+
+    assert symbol in engine.account.positions
+    assert stale_reason not in engine.latest_signals[symbol]["vetoes"]
+
+
+def test_status_surfaces_stale_derivatives_vetoes_when_auto_trade_is_off() -> None:
+    class FundingAwareMarket(FakeMarketData):
+        async def current_funding_rates(self, symbols):
+            return {symbol: 0.0 for symbol in symbols}
+
+    engine = PaperTradingEngine(
+        AppSettings(),
+        starting_balance=1000,
+        market_data=FundingAwareMarket(),
+    )
+    now = datetime.now(UTC)
+    engine.running = True
+    engine.auto_trade = False
+    engine._warmup_complete = True
+    engine._symbol_cache_valid = lambda _symbol: True
+    engine.latest_signals["TESTUSDT"] = {
+        "action": SignalAction.ENTRY_LONG.value,
+        "score": 90,
+        "vetoes": (),
+        "reasons": (),
+        "entry_timing": "GOOD",
+    }
+    engine._price_updated_at["TESTUSDT"] = now
+    engine._oi_ratio_updated_at["TESTUSDT"] = now - timedelta(seconds=181)
+    engine._funding_updated_at["TESTUSDT"] = now - timedelta(minutes=16)
+
+    vetoes = engine.status()["latest_signals"]["TESTUSDT"]["vetoes"]
+
+    assert "OI/long-short ratio data is stale for more than 180 seconds" in vetoes
+    assert "current funding rate data is stale for more than 15 minutes" in vetoes
+
+
+def test_status_clears_persisted_stale_price_veto_after_price_refresh() -> None:
+    engine = PaperTradingEngine(
+        AppSettings(),
+        starting_balance=1000,
+        market_data=FakeMarketData(),
+    )
+    now = datetime.now(UTC)
+    engine.running = True
+    engine._warmup_complete = True
+    engine._symbol_cache_valid = lambda _symbol: True
+    engine.latest_signals["TESTUSDT"] = {
+        "action": SignalAction.ENTRY_LONG.value,
+        "score": 90,
+        "vetoes": ("latest price is stale for more than 15 seconds",),
+    }
+    engine._price_updated_at["TESTUSDT"] = now
+    engine._oi_ratio_updated_at["TESTUSDT"] = now
+
+    vetoes = engine.status()["latest_signals"]["TESTUSDT"]["vetoes"]
+
+    assert "latest price is stale for more than 15 seconds" not in vetoes
+
+
+def test_closed_candle_cache_ignores_open_bar_and_merges_incrementally() -> None:
+    now = datetime(2026, 1, 1, 1, 15, 6, tzinfo=UTC)
+    candles = [
+        Candle(
+            timestamp=datetime(2026, 1, 1, 0, minute, tzinfo=UTC),
+            open=100.0,
+            high=101.0,
+            low=99.0,
+            close=100.0 + minute,
+            volume=1000.0,
+        )
+        for minute in (30, 45)
+    ]
+    candles.append(
+        Candle(
+            timestamp=datetime(2026, 1, 1, 1, 15, tzinfo=UTC),
+            open=102.0,
+            high=103.0,
+            low=101.0,
+            close=102.5,
+            volume=500.0,
+        )
+    )
+
+    closed = _closed_candles(candles, "15m", now)
+    merged = _merge_candles(closed[:1], closed[1:], max_length=240)
+
+    assert [candle.timestamp.minute for candle in closed] == [30, 45]
+    assert merged == closed
+
+
 def test_disabled_entries_still_manage_and_close_existing_position() -> None:
     async def scenario() -> None:
         engine = PaperTradingEngine(AppSettings(), starting_balance=1000, market_data=FakeMarketData())
@@ -295,6 +484,205 @@ def test_disabled_entries_still_manage_and_close_existing_position() -> None:
         assert status["fees_paid"] > 0
 
         await engine.shutdown()
+
+    asyncio.run(scenario())
+
+
+def test_position_safety_continues_while_market_scan_is_blocked() -> None:
+    async def scenario() -> None:
+        engine = PaperTradingEngine(
+            AppSettings(),
+            starting_balance=1000,
+            market_data=FakeMarketData(),
+        )
+        await engine.open_position(
+            "BTCUSDT",
+            "LONG",
+            margin_usdt=100,
+            leverage=5,
+            stop_loss=99.0,
+            take_profit_1=110.0,
+            take_profit_2=120.0,
+        )
+        scan_started = asyncio.Event()
+
+        async def blocked_refresh() -> None:
+            scan_started.set()
+            await asyncio.Event().wait()
+
+        engine.refresh_once = blocked_refresh  # type: ignore[method-assign]
+        await engine.start(auto_trade=False)
+        await asyncio.wait_for(scan_started.wait(), timeout=1)
+
+        engine._remember_mark_price("BTCUSDT", 98.0)
+        for _ in range(50):
+            if not engine.account.positions:
+                break
+            await asyncio.sleep(0.01)
+
+        assert engine.status()["positions"] == []
+        assert engine.status()["fills"][-1]["action"] == "CLOSE"
+        await engine.shutdown()
+
+    asyncio.run(scenario())
+
+
+def test_rest_price_fallback_continues_while_market_scan_is_blocked() -> None:
+    class MarkPriceMarket(FakeMarketData):
+        async def mark_prices(self, symbols):
+            return {symbol: 101.0 for symbol in symbols}
+
+    async def scenario() -> None:
+        engine = PaperTradingEngine(
+            AppSettings(),
+            starting_balance=1000,
+            market_data=MarkPriceMarket(),
+        )
+        engine.latest_signals["TESTUSDT"] = {
+            "action": "ENTRY_LONG",
+            "score": 90,
+        }
+        scan_started = asyncio.Event()
+
+        async def blocked_refresh() -> None:
+            scan_started.set()
+            await asyncio.Event().wait()
+
+        engine.refresh_once = blocked_refresh  # type: ignore[method-assign]
+        await engine.start(auto_trade=False)
+        await asyncio.wait_for(scan_started.wait(), timeout=1)
+        for _ in range(50):
+            if engine.latest_prices.get("TESTUSDT") == 101.0:
+                break
+            await asyncio.sleep(0.01)
+
+        assert engine.latest_prices["TESTUSDT"] == 101.0
+        assert engine.health_status()["price_fallback_alive"] is True
+        await engine.shutdown()
+
+    asyncio.run(scenario())
+
+
+def test_rest_fallback_refreshes_only_stale_symbols() -> None:
+    class MarkPriceMarket(FakeMarketData):
+        def __init__(self) -> None:
+            super().__init__()
+            self.requested: list[str] = []
+
+        async def mark_prices(self, symbols):
+            self.requested = list(symbols)
+            return {symbol: 101.0 for symbol in self.requested}
+
+    async def scenario() -> None:
+        market = MarkPriceMarket()
+        engine = PaperTradingEngine(
+            AppSettings(),
+            starting_balance=1000,
+            market_data=market,
+        )
+        await engine.open_position(
+            "FRESHUSDT",
+            "LONG",
+            margin_usdt=50,
+            leverage=5,
+        )
+        await engine.open_position(
+            "STALEUSDT",
+            "LONG",
+            margin_usdt=50,
+            leverage=5,
+        )
+        now = datetime.now(UTC)
+        engine._price_updated_at["FRESHUSDT"] = now
+        engine._price_updated_at["STALEUSDT"] = now - timedelta(
+            seconds=MARKET_PRICE_STALE_SECONDS + 1
+        )
+
+        await engine._refresh_rest_price_fallback(now)
+
+        assert market.requested == ["STALEUSDT"]
+        assert engine.latest_prices["STALEUSDT"] == 101.0
+
+    asyncio.run(scenario())
+
+
+def test_historical_warmup_does_not_overwrite_live_mark_price() -> None:
+    async def scenario() -> None:
+        engine = PaperTradingEngine(
+            AppSettings(),
+            starting_balance=1000,
+            market_data=FakeMarketData(),
+        )
+        engine._remember_mark_price("TESTUSDT", 111.0)
+
+        assert await engine._refresh_symbol("TESTUSDT") is True
+        assert engine.latest_prices["TESTUSDT"] == 111.0
+
+    asyncio.run(scenario())
+
+
+def test_corrupt_state_recovers_from_backup(tmp_path: Path) -> None:
+    state_path = tmp_path / "paper_state.json"
+    engine = PaperTradingEngine(
+        AppSettings(),
+        starting_balance=1000,
+        market_data=FakeMarketData(),
+        state_path=state_path,
+    )
+    asyncio.run(
+        engine.open_position(
+            "BTCUSDT",
+            "LONG",
+            margin_usdt=100,
+            leverage=5,
+        )
+    )
+    engine._save_state_unlocked()
+    state_path.write_text("{broken", encoding="utf-8")
+
+    restored = PaperTradingEngine(
+        AppSettings(),
+        starting_balance=500,
+        market_data=FakeMarketData(),
+        state_path=state_path,
+    )
+
+    assert restored.status()["starting_balance"] == 1000
+    assert restored.status()["positions"][0]["symbol"] == "BTCUSDT"
+
+
+def test_corrupt_state_without_backup_fails_closed(tmp_path: Path) -> None:
+    state_path = tmp_path / "paper_state.json"
+    state_path.write_text("{broken", encoding="utf-8")
+
+    with pytest.raises(PaperStateError, match="状态损坏"):
+        PaperTradingEngine(
+            AppSettings(),
+            starting_balance=1000,
+            market_data=FakeMarketData(),
+            state_path=state_path,
+        )
+
+
+def test_state_file_allows_only_one_running_engine(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        state_path = tmp_path / "paper_state.json"
+        first = PaperTradingEngine(
+            AppSettings(),
+            market_data=FakeMarketData(),
+            state_path=state_path,
+        )
+        second = PaperTradingEngine(
+            AppSettings(),
+            market_data=FakeMarketData(),
+            state_path=state_path,
+        )
+        await first.start(auto_trade=False)
+        try:
+            with pytest.raises(PaperStateError, match="另一个交易进程"):
+                await second.start(auto_trade=False)
+        finally:
+            await first.shutdown()
 
     asyncio.run(scenario())
 
@@ -548,6 +936,8 @@ def test_risk_exit_reason_is_specific_to_one_way_position_risk() -> None:
 
 def test_auto_top30_universe_refreshes_symbols() -> None:
     engine = PaperTradingEngine(AppSettings(), starting_balance=1000, market_data=FakeMarketData())
+    engine.latest_signals["STALEUSDT"] = {"score": 99}
+    engine.account.latest_signals["STALEUSDT"] = {"score": 99}
 
     import asyncio
 
@@ -559,6 +949,8 @@ def test_auto_top30_universe_refreshes_symbols() -> None:
     assert "ETHUSDT" not in engine.symbols
     assert "SOLUSDT" not in engine.symbols
     assert engine.symbols[0] == "TEST0USDT"
+    assert "STALEUSDT" not in engine.latest_signals
+    assert "STALEUSDT" not in engine.account.latest_signals
 
 
 def test_auto_signal_score_tiers_and_margins() -> None:
@@ -580,6 +972,47 @@ def test_auto_signal_score_tiers_and_margins() -> None:
     assert _margin_for_signal(76, 1000) == 180
     assert _margin_for_signal(90, 1000, 950, 5) == 190
     assert _margin_for_signal(76, 1000, 950, 5) == 180
+
+
+def test_auto_entry_prerequisites_explain_score_direction_and_timing_blocks() -> None:
+    wait_signal = {
+        "action": SignalAction.ENTRY_LONG.value,
+        "score": 81,
+        "risk_state": "NORMAL",
+        "price": 106.0,
+        "entry_levels": {"long": {"h1_support": {"low": 99.0, "high": 101.0, "price": 100.0}}},
+    }
+
+    blocks = _auto_entry_prerequisite_blocks(wait_signal)
+
+    assert "final score 81 below auto-entry minimum 82" in blocks
+    assert any(reason.startswith("current entry timing is not excellent:") for reason in blocks)
+    assert _auto_entry_prerequisite_blocks({"action": SignalAction.WATCH.value, "score": 90}) == (
+        "directional entry signal not established",
+    )
+
+
+def test_status_exposes_strategy_switch_without_mutating_live_signal() -> None:
+    engine = PaperTradingEngine(AppSettings(), starting_balance=1000, market_data=FakeMarketData())
+    engine.latest_signals["TESTUSDT"] = {
+        "action": SignalAction.ENTRY_LONG.value,
+        "score": 90,
+        "risk_state": "NORMAL",
+        "price": 100.0,
+        "entry_levels": {"long": {"h1_support": {"low": 99.0, "high": 101.0, "price": 100.0}}},
+    }
+
+    status_signal = engine.status()["latest_signals"]["TESTUSDT"]
+
+    assert "auto strategy disabled; new entries are paused" in status_signal["vetoes"]
+    assert not engine.latest_signals["TESTUSDT"].get("vetoes")
+
+
+def test_entry_stop_validation_requires_stop_on_loss_side() -> None:
+    assert _entry_stop_error(PositionSide.LONG, 100.0, 99.0) is None
+    assert _entry_stop_error(PositionSide.SHORT, 100.0, 101.0) is None
+    assert _entry_stop_error(PositionSide.LONG, 100.0, 100.0) == "long stop must be below entry price"
+    assert _entry_stop_error(PositionSide.SHORT, 100.0, 99.0) == "short stop must be above entry price"
 
 
 def test_auto_signal_requires_real_entry_zone_for_ordinary_short() -> None:
@@ -1319,6 +1752,59 @@ def test_auto_trade_caps_positions_and_prefers_highest_scores() -> None:
     assert engine.account.positions["TEST5USDT"].metadata["margin_usdt"] >= 180
 
 
+def test_auto_trade_backfills_slot_when_higher_score_candidate_has_low_reward_risk() -> None:
+    settings = AppSettings()
+    settings.risk.max_open_positions = 1
+    engine = PaperTradingEngine(settings, starting_balance=1000, market_data=FakeMarketData())
+    engine.latest_prices = {"HIGHUSDT": 100.0, "NEXTUSDT": 100.0}
+    common = {
+        "action": "ENTRY_LONG",
+        "trend_state": "TREND_LONG",
+        "risk_state": "NORMAL",
+        "price": 100.0,
+        "entry_levels": {"long": {"h1_support": {"low": 99.0, "high": 101.0, "price": 100.0}}},
+    }
+    engine.latest_signals["HIGHUSDT"] = {
+        **common,
+        "score": 95,
+        "h1_structure": {"resistance_zone_low": 100.5, "resistance": 100.6},
+    }
+    engine.latest_signals["NEXTUSDT"] = {
+        **common,
+        "score": 90,
+        "h1_structure": {"resistance_zone_low": 105.0, "resistance": 106.0},
+    }
+
+    asyncio.run(engine._auto_trade_once())
+
+    assert set(engine.account.positions) == {"NEXTUSDT"}
+    blocked = engine.latest_signals["HIGHUSDT"]
+    assert blocked["entry_timing"] == "BLOCK"
+    assert any("entry reward/risk" in reason for reason in blocked["vetoes"])
+
+
+def test_auto_trade_marks_ready_candidates_blocked_after_position_capacity_is_filled() -> None:
+    settings = AppSettings()
+    settings.risk.max_open_positions = 1
+    engine = PaperTradingEngine(settings, starting_balance=1000, market_data=FakeMarketData())
+    engine.latest_prices = {"BESTUSDT": 100.0, "SECONDUSDT": 100.0}
+    for symbol, score in (("BESTUSDT", 95), ("SECONDUSDT", 90)):
+        engine.latest_signals[symbol] = {
+            "action": "ENTRY_LONG",
+            "score": score,
+            "trend_state": "TREND_LONG",
+            "risk_state": "NORMAL",
+            "price": 100.0,
+            "entry_levels": {"long": {"h1_support": {"low": 99.0, "high": 101.0, "price": 100.0}}},
+            "h1_structure": {"resistance_zone_low": 105.0, "resistance": 106.0},
+        }
+
+    asyncio.run(engine._auto_trade_once())
+
+    assert set(engine.account.positions) == {"BESTUSDT"}
+    assert "position capacity full: 1 open positions" in engine.latest_signals["SECONDUSDT"]["vetoes"]
+
+
 def test_auto_trade_pauses_altcoin_entries_when_btc_4h_is_extreme() -> None:
     market = FakeMarketData()
     market.btc_4h_extreme = True
@@ -1337,6 +1823,8 @@ def test_auto_trade_pauses_altcoin_entries_when_btc_4h_is_extreme() -> None:
     asyncio.run(engine._auto_trade_once())
 
     assert not engine.account.positions
+    assert engine.latest_signals["TESTUSDT"]["entry_timing"] == "BLOCK"
+    assert "BTC 4h extreme volatility; pause new altcoin entries" in engine.latest_signals["TESTUSDT"]["vetoes"]
 
 
 def test_auto_trade_rotates_weak_position_for_much_stronger_candidate() -> None:

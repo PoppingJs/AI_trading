@@ -30,7 +30,7 @@ class BacktestRequest(BaseModel):
 class PaperStartRequest(BaseModel):
     starting_balance: float | None = Field(default=None, gt=0)
     symbols: list[str] | None = None
-    interval: str = "15m"
+    interval: str = "1h"
     auto_trade: bool = False
     poll_seconds: int = Field(default=20, ge=5, le=300)
     reset_account: bool = False
@@ -56,16 +56,9 @@ def create_app(settings_path: str | Path = "config/strategy.yaml", state_path: s
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         await app.state.paper_engine.start(auto_trade=False)
-        startup_refresh = asyncio.create_task(app.state.paper_engine.refresh_open_position_prices())
         try:
             yield
         finally:
-            if not startup_refresh.done():
-                startup_refresh.cancel()
-                try:
-                    await startup_refresh
-                except asyncio.CancelledError:
-                    pass
             await app.state.paper_engine.close()
 
     app = FastAPI(
@@ -89,7 +82,7 @@ def create_app(settings_path: str | Path = "config/strategy.yaml", state_path: s
     @app.get("/api/health")
     def health() -> dict[str, object]:
         return {
-            "status": "ok",
+            **app.state.paper_engine.health_status(),
             "paper_trading": settings.execution.paper_trading,
             "symbols_mode": settings.symbols_mode,
             "timeframes": settings.timeframes,
@@ -157,10 +150,10 @@ def create_app(settings_path: str | Path = "config/strategy.yaml", state_path: s
         engine: PaperTradingEngine = app.state.paper_engine
         requested_symbols = [symbol.upper() for symbol in request.symbols or []]
         if not requested_symbols or _uses_default_symbol_pool(requested_symbols):
-            engine.symbols = ["AUTO_TOP30"]
+            engine.configure_symbols(["AUTO_TOP30"])
         else:
-            engine.symbols = requested_symbols
-        engine.interval = request.interval
+            engine.configure_symbols(requested_symbols)
+        engine.configure_interval(request.interval)
         if request.reset_account:
             await engine.reset(starting_balance=request.starting_balance or PAPER_DEFAULT_BALANCE)
         elif request.starting_balance is not None and not engine.account.fills and not engine.account.positions:
@@ -285,7 +278,7 @@ PAPER_DASHBOARD_HTML = """
     .metrics { grid-template-columns: repeat(7, minmax(0, 1fr)); flex: 0 0 auto; }
     .layout { grid-template-columns: 460px minmax(0, 1fr); align-items: stretch; flex: 1 1 auto; min-height: 0; margin-top: 0 !important; }
     .layout > .card { min-height: 0; overflow: hidden; display: flex; flex-direction: column; }
-    .layout > .grid { display: grid; grid-template-rows: 230px minmax(70px, 1fr) 210px; min-height: 0; }
+    .layout > .grid { display: grid; grid-template-rows: 230px 405px minmax(210px, 1fr); min-height: 0; }
     .layout > .grid > .card { min-height: 0; overflow: hidden; }
     .layout > .grid > .card:nth-child(1) { display: flex; flex-direction: column; overflow: hidden; }
     .layout > .grid > .card:nth-child(1) .scroll { flex: 1 1 auto; min-height: 0; overflow-y: auto; scrollbar-gutter: stable; }
@@ -803,6 +796,77 @@ PAPER_DASHBOARD_HTML = """
       OI_ABNORMAL: '风险：OI异常平仓',
       FUNDING_HOT: '风险：资金费率过热平仓'
     };
+    const vetoText = {
+      'directional entry signal not established': '未达到82分',
+      'late trend stage blocks fresh entry': '趋势末段',
+      'auto strategy disabled; new entries are paused': '策略已关闭',
+      'symbol already has an open position': '已开仓',
+      'symbol excluded from automatic universe': '不在标的池',
+      '15m tactical entry lacks a valid 15m structure stop or 1h/4h entry zone': '缺少有效止损或入场区',
+      'BTC 4h extreme volatility; pause new altcoin entries': 'BTC极端波动',
+      'market warm-up is still running': '行情预热中',
+      'latest price is stale for more than 15 seconds': '实时价格超过15秒未更新',
+      'OI/long-short ratio data is stale for more than 180 seconds': 'OI/多空比超过180秒未更新',
+      'current funding rate data is stale for more than 15 minutes': '资金费率超过15分钟未更新',
+      'required multi-timeframe K-line context is missing or discontinuous': '多周期K线缺失或不连续',
+      'extreme volatility: skip new long entry': '极端波动',
+      'extreme volatility: skip new short entry': '极端波动',
+      'long side overcrowded': '多头拥挤',
+      'short side overcrowded': '空头拥挤',
+      'funding too hot for long entry': '多单资金费率过热',
+      'funding rate too hot for long entry': '多单资金费率过热',
+      'funding too negative for short entry': '空单资金费率过低',
+      'open interest spike risks liquidation sweep': 'OI激增，扫损风险',
+      'RSI overheated for long entry': 'RSI过热',
+      'RSI oversold for short entry': 'RSI超卖',
+      'price closed above upper BOLL; no chase': '价格突破BOLL上轨',
+      'price closed below lower BOLL; no chase': '价格跌破BOLL下轨',
+      'upper wick sweep rejected; avoid chasing long': '上插针回落',
+      'lower wick sweep reclaimed; avoid chasing short': '下插针收回',
+      'smart money accumulation after OI flush; avoid chasing shorts': 'OI爆减后疑似吸筹',
+      'short crowd is vulnerable to a squeeze': '空头拥挤，逼空风险',
+      'smart money distribution after upper wick sweeps': '上插针后疑似派发',
+      'trapped longs are increasing while price falls': '价格下跌且多头拥挤',
+      'capitulation OI flush; avoid late shorts': '下跌尾段OI爆减',
+      'strict long blocked: EMA20/EMA50/EMA200 not bullish': 'EMA未多头排列',
+      'strict long blocked: BOLL mid not confirmed twice': 'BOLL中轨未连续确认',
+      'strict long blocked: RSI not in 52-72': 'RSI不在52-72',
+      'strict long blocked: volume below 1.5x average': '成交量低于均量1.5倍',
+      'strict long blocked: 4h OI increase below 3%': '4小时OI增幅不足3%',
+      'strict long blocked: top long/short ratio below 1.1': '大户多空比低于1.1',
+      'strict long blocked: funding outside long range': '资金费率不在多单区间',
+      'strict long blocked: EMA lines are too compressed': 'EMA三线粘合',
+      'strict long blocked: RSI neutral zone': 'RSI处于中性区',
+      'strict long blocked: 1h candle amplitude above 5%': '1小时振幅超过5%',
+      'strict short blocked: EMA20/EMA50/EMA200 not bearish': 'EMA未空头排列',
+      'strict short blocked: BOLL mid not confirmed twice': 'BOLL中轨未连续确认',
+      'strict short blocked: RSI not in 28-48': 'RSI不在28-48',
+      'strict short blocked: volume below 1.5x average': '成交量低于均量1.5倍',
+      'strict short blocked: 4h OI increase below 3%': '4小时OI增幅不足3%',
+      'strict short blocked: top long/short ratio above 0.9': '大户多空比高于0.9',
+      'strict short blocked: funding outside short range': '资金费率不在空单区间',
+      'strict short blocked: EMA lines are too compressed': 'EMA三线粘合',
+      'strict short blocked: RSI neutral zone': 'RSI处于中性区',
+      'strict short blocked: 1h candle amplitude above 5%': '1小时振幅超过5%',
+      '1h trigger opposes long entry': '1小时方向冲突',
+      '1h trigger opposes short entry': '1小时方向冲突',
+      '4h OI drained and volume is weak; EMA/BOLL bounce is not a clean long pullback': 'OI下降且量能不足',
+      'high pullback with OI/funding/crowd risk; avoid long entry': '高位回踩风险',
+      'low pullback with OI/funding/crowd risk; avoid short entry': '低位反抽风险',
+      'high area without pullback confirmation; wait for 1h/4h pullback before long': '高位回踩未确认',
+      'low area without bounce confirmation; wait for 1h/4h retest before short': '低位反抽未确认',
+      'low area without 1h/4h resistance retest; wait for higher-timeframe bounce before short': '低位反抽未确认',
+      '4h OI deleverage with price breakdown; avoid long entry': '4小时OI去杠杆破位',
+      '4h OI deleverage breakdown; wait for resistance retest or upper-wick rejection before short': '4小时OI破位反抽未确认',
+      '4h OI deleveraged but 1h support held; avoid chasing short': '1小时支撑仍有效',
+      '4h OI drained; wait for 1h resistance retest or upper-wick rejection before short': 'OI下降且反抽未确认',
+      'one-way uptrend RSI above 92; skip fresh long and protect existing profit': '单边上涨RSI超过92',
+      'one-way uptrend RSI hot without 1h/15m pullback; wait before long': 'RSI过热且回踩未确认',
+      'normal/chop trend RSI overheated; wait for 1h/4h pullback before long': 'RSI过热且回踩未确认',
+      'one-way downtrend RSI below 8; skip fresh short and protect existing profit': '单边下跌RSI低于8',
+      'one-way downtrend RSI cold without 1h/15m bounce rejection; wait before short': 'RSI超卖且反抽未确认',
+      'normal/chop trend RSI oversold; wait for 1h/4h retest before short': 'RSI超卖且反抽未确认'
+    };
     const mtfText = {
       BULL: '偏多',
       BEAR: '偏空',
@@ -878,6 +942,68 @@ PAPER_DASHBOARD_HTML = """
       for (const [prefix, text] of dynamicPrefixes) {
         if (reason.startsWith(prefix)) return text;
       }
+      if (reason.startsWith('entry reward/risk ')) {
+        const values = reason.match(/entry reward\\/risk ([0-9.]+)R below minimum ([0-9.]+)R/);
+        return values ? `实际盈亏比${values[1]}R，低于最低${values[2]}R` : '实际盈亏比低于最低要求';
+      }
+      if (reason.startsWith('final score ')) {
+        const values = reason.match(/final score (\\d+) below auto-entry minimum (\\d+)/);
+        return values ? `最终评分${values[1]}，未达到自动开仓最低${values[2]}分` : '最终评分未达到自动开仓门槛';
+      }
+      if (reason === 'directional entry signal not established') {
+        return '多空方向信号尚未成立';
+      }
+      if (reason.startsWith('current entry timing is not excellent:')) {
+        const detail = reason.replace('current entry timing is not excellent:', '').trim();
+        return `当前入场时机未达到优秀${detail ? `：${tEntryTimingReason(detail)}` : ''}`;
+      }
+      if (reason === 'late trend stage blocks fresh entry') {
+        return '趋势已进入末段，禁止新开仓';
+      }
+      if (reason === 'auto strategy disabled; new entries are paused') {
+        return '策略总开关已关闭，暂停新开仓';
+      }
+      if (reason === 'symbol already has an open position') {
+        return '该币种已有持仓，禁止重复开仓';
+      }
+      if (reason === 'symbol excluded from automatic universe') {
+        return '该币种不属于自动交易标的池';
+      }
+      if (reason.startsWith('invalid entry stop:')) {
+        return `止损结构无效：${reason.replace('invalid entry stop:', '').trim()}`;
+      }
+      if (reason.startsWith('available entry margin ')) {
+        const values = reason.match(/available entry margin ([0-9.]+) USDT below minimum ([0-9.]+) USDT/);
+        return values ? `可用开仓保证金${values[1]}U，低于最低${values[2]}U` : '可用开仓保证金不足';
+      }
+      if (reason.startsWith('position capacity full:')) {
+        const value = (reason.match(/position capacity full: (\\d+)/) || [])[1] || '';
+        return `持仓已满${value ? `（上限${value}个）` : ''}，等待空余仓位或满足调仓条件`;
+      }
+      if (reason === '15m tactical entry lacks a valid 15m structure stop or 1h/4h entry zone') {
+        return '15分钟战术入场缺少有效止损结构，且未处于1H/4H入场区';
+      }
+      if (reason === 'BTC 4h extreme volatility; pause new altcoin entries') {
+        return 'BTC 4小时极端波动，暂停山寨币新开仓';
+      }
+      if (reason === 'market warm-up is still running') {
+        return '多周期行情正在预热，完成前禁止新开仓';
+      }
+      if (reason === 'latest price is stale for more than 15 seconds') {
+        return '实时价格超过15秒未更新';
+      }
+      if (reason === 'OI/long-short ratio data is stale for more than 180 seconds') {
+        return 'OI/多空比超过180秒未更新';
+      }
+      if (reason === 'current funding rate data is stale for more than 15 minutes') {
+        return '资金费率超过15分钟未更新';
+      }
+      if (reason === 'required multi-timeframe K-line context is missing or discontinuous') {
+        return '多周期K线缺失或不连续，禁止新开仓';
+      }
+      if (reason.startsWith('auto entry execution failed:')) {
+        return `自动开仓执行失败：${reason.replace('auto entry execution failed:', '').trim()}`;
+      }
       if (String(value).startsWith('risk exit:')) {
         const key = String(value).replace('risk exit:', '').trim();
         return riskExitReasonText[key] || `风险：${key}平仓`;
@@ -896,6 +1022,36 @@ PAPER_DASHBOARD_HTML = """
       if (String(value).startsWith('auto strategy score=')) return String(value).replace('auto strategy score=', '自动策略开仓，评分=');
       if (String(value).startsWith('MTF:')) return tMtfSummary(value);
       return value;
+    }
+    function tVeto(value) {
+      const reason = String(value || '').trim();
+      if (!reason) return '';
+      if (vetoText[reason]) return vetoText[reason];
+      if (
+        reason === 'directional entry signal not established'
+        || reason.startsWith('final score ')
+      ) {
+        return '未达到82分';
+      }
+      if (reason.startsWith('current entry timing is not excellent:')) {
+        return '入场时机非优秀';
+      }
+      if (reason.startsWith('entry reward/risk ')) {
+        const minimum = (reason.match(/below minimum ([0-9.]+)R/) || [])[1] || '';
+        return minimum ? `盈亏比低于${minimum}R` : '盈亏比不足';
+      }
+      if (reason.startsWith('available entry margin ')) return '可用保证金不足';
+      if (reason.startsWith('position capacity full:')) return '持仓已满';
+      if (reason.startsWith('invalid entry stop:')) return '止损结构无效';
+      if (reason.startsWith('auto entry execution failed:')) return '自动开仓执行失败';
+      if (
+        reason.startsWith('MA cluster dense; wait for breakout or MA20 retest')
+        || reason.startsWith('MA cluster dense; wait for breakdown or MA20 retest')
+      ) {
+        return '均线密集，方向未确认';
+      }
+      if (/[\u3400-\u9fff]/.test(reason)) return reason;
+      return '其他风控条件未满足';
     }
     function tMtfSummary(value) {
       const text = String(value || '');
@@ -954,7 +1110,19 @@ PAPER_DASHBOARD_HTML = """
         return chunks;
       }).map(escapeHtml).join('<br>');
     }
+    function flowTableText(value) {
+      return escapeHtml(String(value || '').replace(/\\s*\\r?\\n\\s*/g, ' ').trim());
+    }
+    function flowReasonText(value) {
+      return String(value || '')
+        .split(/\\r?\\n/)
+        .map(line => escapeHtml(line.trim()))
+        .join('<br>');
+    }
     function tReasons(values) { return (values || []).map(tReason).join('；'); }
+    function tVetoes(values) {
+      return [...new Set((values || []).map(tVeto).filter(Boolean))].join('；');
+    }
     function reasonList(values) {
       return (values || []).map(value => String(value || '').trim()).filter(Boolean);
     }
@@ -1361,7 +1529,7 @@ PAPER_DASHBOARD_HTML = """
         interval: document.getElementById('interval').value,
         auto_trade: autoTrade,
         reset_account: false,
-        poll_seconds: 20
+        poll_seconds: 5
       }) }));
     }
     async function stopPaper() { await call(() => api('/api/paper/stop', { method: 'POST' })); }
@@ -1403,6 +1571,43 @@ PAPER_DASHBOARD_HTML = """
     async function load() {
       try { render(await api('/api/paper/status')); } catch (err) { showError(err.message); }
     }
+    function captureTableScrollAnchor(tableElement) {
+      const scrollElement = tableElement?.closest('.scroll');
+      if (!tableElement || !scrollElement) return null;
+      if (scrollElement.scrollTop <= 1) return { scrollTop: 0, key: '', offset: 0 };
+      const viewportTop = Math.max(
+        scrollElement.getBoundingClientRect().top,
+        tableElement.tHead?.getBoundingClientRect().bottom || 0
+      );
+      const row = [...tableElement.querySelectorAll('tbody tr')].find(
+        item => item.getBoundingClientRect().bottom > viewportTop
+      );
+      return {
+        scrollTop: scrollElement.scrollTop,
+        key: row?.cells[0]?.textContent?.trim() || '',
+        offset: row ? row.getBoundingClientRect().top - viewportTop : 0
+      };
+    }
+    function restoreTableScrollAnchor(tableElement, anchor) {
+      const scrollElement = tableElement?.closest('.scroll');
+      if (!tableElement || !scrollElement || !anchor) return;
+      if (!anchor.key) {
+        scrollElement.scrollTop = anchor.scrollTop;
+        return;
+      }
+      const row = [...tableElement.querySelectorAll('tbody tr')].find(
+        item => item.cells[0]?.textContent?.trim() === anchor.key
+      );
+      if (!row) {
+        scrollElement.scrollTop = anchor.scrollTop;
+        return;
+      }
+      const viewportTop = Math.max(
+        scrollElement.getBoundingClientRect().top,
+        tableElement.tHead?.getBoundingClientRect().bottom || 0
+      );
+      scrollElement.scrollTop += row.getBoundingClientRect().top - viewportTop - anchor.offset;
+    }
     function render(data) {
       const marketAge = data.market_updated_at ? (Date.now() - new Date(data.market_updated_at).getTime()) / 1000 : Infinity;
       const marketState = marketAge > 60 ? '行情延迟' : '行情正常';
@@ -1438,9 +1643,12 @@ PAPER_DASHBOARD_HTML = """
           const reasons = s.reasons || [];
           return !(s.action === 'NO_TRADE' && reasons.includes('score below trading threshold'));
         })
-        .map(([symbol, s]) => [displaySymbol(symbol), `<span class="pill">${tAction(s.action)}</span>`, tTrendState(s.trend_state || s.regime), tRiskState(s.risk_state), tSmartMoneyPhase(s.smart_money_phase), s.score, signalEntryTiming(s), wrapReason(signalReasonText(s), 100), tReasons(s.vetoes)]);
-      document.getElementById('signals').className = 'signals-table';
-      document.getElementById('signals').innerHTML = table(['币种','动作','状态','风险','主力周期','分数','入场时机','原因','否决'], signalRows);
+        .map(([symbol, s]) => [displaySymbol(symbol), `<span class="pill">${tAction(s.action)}</span>`, tTrendState(s.trend_state || s.regime), tRiskState(s.risk_state), tSmartMoneyPhase(s.smart_money_phase), s.score, signalEntryTiming(s), flowReasonText(signalReasonText(s)), tVetoes(s.vetoes)]);
+      const signalsTable = document.getElementById('signals');
+      const signalsScrollAnchor = captureTableScrollAnchor(signalsTable);
+      signalsTable.className = 'signals-table';
+      signalsTable.innerHTML = table(['币种','动作','状态','风险','主力周期','分数','入场时机','原因','否决'], signalRows);
+      restoreTableScrollAnchor(signalsTable, signalsScrollAnchor);
       balanceSignalAndFillPanels();
       const fillHeaders = ['币种','方向','杠杆','开仓均价','平仓均价','数量','止损','止盈','收益率','实现盈亏','手续费','开仓时间','平仓时间','入场位置','出场原因'];
       const allFills = [...(data.fills || [])].filter(f => f.action === 'CLOSE' || f.closed_at).reverse();
@@ -1458,7 +1666,7 @@ PAPER_DASHBOARD_HTML = """
         money(f.fee),
         timeText(f.opened_at),
         timeText(f.closed_at),
-        wrapReason(f.entry_position || '--', 50),
+        flowTableText(f.entry_position || '--'),
         wrapReason(tReason(f.reason), 50)
       ]);
       const fillPages = paginateFillRows(fillHeaders, fillRows);
@@ -1478,45 +1686,10 @@ PAPER_DASHBOARD_HTML = """
       return `<thead><tr>${headers.map((h, i) => `<th class="${classes[i]}">${h}</th>`).join('')}</tr></thead><tbody>${rows.map(row => `<tr>${row.map((v, i) => `<td class="${classes[i]}">${v}</td>`).join('')}</tr>`).join('')}</tbody>`;
     }
     function balanceSignalAndFillPanels() {
-      const tableElement = document.getElementById('signals');
-      const scrollElement = tableElement.closest('.scroll');
-      const signalCard = tableElement.closest('.card');
+      const signalCard = document.getElementById('signals')?.closest('.card');
       const dataGrid = signalCard?.parentElement;
-      if (!scrollElement || !signalCard || !dataGrid) return;
-
-      const rows = [...tableElement.querySelectorAll('tbody tr')];
-      if (!rows.length) return;
-
-      dataGrid.style.gridTemplateRows = '230px minmax(70px, 1fr) 210px';
-      const headerHeight = Math.ceil(tableElement.tHead?.getBoundingClientRect().height || 0);
-      const chromeHeight = signalCard.clientHeight - scrollElement.clientHeight;
-      const targetRowsHeight = Math.max(scrollElement.clientHeight - headerHeight - 22, 22);
-      let rowsHeight = 0;
-      let fittedRows = 0;
-      for (const row of rows) {
-        const rowHeight = Math.max(Math.ceil(row.getBoundingClientRect().height), 22);
-        if (fittedRows && rowsHeight + rowHeight > targetRowsHeight) break;
-        rowsHeight += rowHeight;
-        fittedRows += 1;
-      }
-      const maxSignalHeight = Math.max(dataGrid.clientHeight - 230 - 210 - 20, 70);
-      let signalHeight = Math.min(
-        Math.max(Math.ceil(chromeHeight + headerHeight + rowsHeight), 70),
-        maxSignalHeight
-      );
-      dataGrid.style.gridTemplateRows = `230px ${signalHeight}px minmax(210px, 1fr)`;
-      const scrollRect = scrollElement.getBoundingClientRect();
-      const partialRow = rows.find(row => {
-        const rect = row.getBoundingClientRect();
-        return rect.top < scrollRect.bottom && rect.bottom > scrollRect.bottom;
-      });
-      if (partialRow) {
-        const overlap = scrollRect.bottom - partialRow.getBoundingClientRect().top;
-        if (overlap > 0) {
-          signalHeight = Math.max(signalHeight - Math.ceil(overlap) - 1, 70);
-          dataGrid.style.gridTemplateRows = `230px ${signalHeight}px minmax(210px, 1fr)`;
-        }
-      }
+      if (!dataGrid) return;
+      dataGrid.style.gridTemplateRows = '230px 405px minmax(210px, 1fr)';
     }
     function fillsTable(headers, rows) {
       const classes = headers.map(tableClass);
@@ -1808,7 +1981,7 @@ PAPER_DASHBOARD_HTML = """
 
     }
     load();
-    setInterval(load, 3000);
+    setInterval(load, 5000);
     window.addEventListener('resize', drawPnlChart);
   </script>
 </body>
