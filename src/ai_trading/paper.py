@@ -58,6 +58,7 @@ PROFIT_LOCK_SLIPPAGE_PCT = 0.0008
 MIN_PRECISION_STOP_PCT = 0.012
 MIN_PRECISION_STOP_ATR_MULTIPLE = 0.65
 MARKET_PRICE_STALE_SECONDS = 15.0
+MARKET_PRICE_FALLBACK_SECONDS = 10.0
 WEBSOCKET_STALE_SECONDS = 15.0
 DERIVATIVES_STALE_SECONDS = 180.0
 LIVE_RISK_REFRESH_SECONDS = 3.0
@@ -77,6 +78,10 @@ POSITION_SAFETY_REFRESH_SECONDS = 1.0
 
 class PaperStateError(RuntimeError):
     """Raised when persisted paper-account state cannot be loaded safely."""
+
+
+class ExitPlanAssertionError(ValueError):
+    """Raised when generated stop-loss/take-profit prices violate execution invariants."""
 
 
 class _StateFileLock:
@@ -478,15 +483,7 @@ class PaperTradingEngine:
         top_symbols = await self.market_data.top_usdt_perpetuals(limit=80)
         eligible = [item for item in top_symbols if item.symbol.upper() not in AUTO_UNIVERSE_EXCLUDED_SYMBOLS]
         filtered = [item.symbol for item in eligible if _candidate_prefilter_allowed(item)]
-        if len(filtered) < 30:
-            seen = set(filtered)
-            for item in eligible:
-                if item.symbol not in seen:
-                    filtered.append(item.symbol)
-                    seen.add(item.symbol)
-                if len(filtered) >= 30:
-                    break
-        self.symbols = filtered[:30] or ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
+        self.symbols = filtered[:30]
         self._last_universe_refresh_at = now
         self._prune_market_cache()
         await self._restart_price_stream_if_needed()
@@ -496,7 +493,7 @@ class PaperTradingEngine:
             symbol for symbol in self.symbols
             if symbol != "AUTO_TOP30"
         ]
-        if self._auto_universe and not symbols:
+        if self._auto_universe and self.symbols == ["AUTO_TOP30"]:
             symbols.extend(self.latest_signals)
         for symbol in self.account.positions:
             if symbol not in symbols:
@@ -562,6 +559,13 @@ class PaperTradingEngine:
             stop_loss = stop_loss or _default_stop(side_enum, price, leverage)
             take_profit_1 = take_profit_1 or _default_take_profit(side_enum, price, stop_loss, 1)
             take_profit_2 = take_profit_2 or _default_take_profit(side_enum, price, stop_loss, 2)
+            _assert_valid_exit_plan(
+                side_enum,
+                price,
+                stop_loss,
+                take_profit_1,
+                take_profit_2,
+            )
             normalized_entry_context = _normalize_entry_context(entry_context)
             entry_position = _entry_position_text(side_enum, price, normalized_entry_context, reason)
             position = Position(
@@ -690,7 +694,7 @@ class PaperTradingEngine:
                 has_position=symbol in self.account.positions,
             )
             if self.running:
-                for reason in self._data_freshness_blocks(symbol):
+                for reason in self._data_freshness_blocks(symbol, payload):
                     _record_auto_entry_block(payload, reason)
             latest_signals[symbol] = payload
         latest_timeframe_contexts = {symbol: dict(context) for symbol, context in self.latest_timeframe_contexts.items()}
@@ -933,7 +937,7 @@ class PaperTradingEngine:
             for symbol in symbols
             if force
             or (updated_at := self._price_updated_at.get(symbol)) is None
-            or (now - updated_at).total_seconds() > MARKET_PRICE_STALE_SECONDS
+            or (now - updated_at).total_seconds() > MARKET_PRICE_FALLBACK_SECONDS
         ]
         if not stale_symbols:
             return
@@ -967,11 +971,7 @@ class PaperTradingEngine:
             _clear_transient_auto_entry_blocks(signal)
             signal["price"] = price
             self._apply_live_m15_overlay(symbol, signal)
-            signal.pop("entry_timing", None)
-            signal.pop("entry_timing_reason", None)
-            timing, reason = _signal_entry_timing(signal)
-            signal["entry_timing"] = timing
-            signal["entry_timing_reason"] = reason
+            _update_entry_position_fields(signal)
             self.account.latest_signals[symbol] = dict(signal)
 
     def _apply_live_m15_overlay(self, symbol: str, signal: dict[str, object]) -> None:
@@ -994,9 +994,6 @@ class PaperTradingEngine:
         long_levels = copied_levels.get("long")
         if isinstance(long_levels, dict):
             long_levels["m15_ema20_ema60"] = _zone_from_object(precision.get("long_pullback_zone"))
-        short_levels = copied_levels.get("short")
-        if isinstance(short_levels, dict):
-            short_levels["m15_ema20_ema60"] = _zone_from_object(precision.get("short_retest_zone"))
         signal["entry_levels"] = copied_levels
 
     def _due_closed_timeframes(self, now: datetime) -> tuple[str, ...]:
@@ -1391,7 +1388,8 @@ class PaperTradingEngine:
 
     def _publish_symbol_from_cache(self, symbol: str) -> bool:
         timeframe_candles = self._timeframe_candles.get(symbol, {})
-        base_candles = timeframe_candles.get(self.interval, [])
+        signal_timeframe = _entry_signal_timeframe(self.interval)
+        base_candles = timeframe_candles.get(signal_timeframe, [])
         if not base_candles:
             return False
         timeframe_indicators: dict[str, list[IndicatorSnapshot]] = {}
@@ -1405,14 +1403,19 @@ class PaperTradingEngine:
                 if derivatives
                 else _build_price_only_indicators(candles, self.settings)
             )
-        indicators = timeframe_indicators.get(self.interval, [])
+        indicators = timeframe_indicators.get(signal_timeframe, [])
         if not indicators:
             return False
         mtf_context = _build_multi_timeframe_context(timeframe_candles, timeframe_indicators, self.settings)
         self.latest_indicators[symbol] = indicators
         self.latest_timeframe_indicators[symbol] = timeframe_indicators
         self.latest_timeframe_contexts[symbol] = mtf_context
-        strategy = CompositeStrategy(replace(self.settings.strategy, smart_money_window=_bars_for_4h(self.interval)))
+        strategy = CompositeStrategy(
+            replace(
+                self.settings.strategy,
+                smart_money_window=_bars_for_4h(signal_timeframe),
+            )
+        )
         signal = strategy.generate_signal(symbol, base_candles, indicators)
         cycle = strategy.smart_money_cycle(base_candles, indicators)
         signal_side = "LONG" if signal.action == SignalAction.ENTRY_LONG else "SHORT" if signal.action == SignalAction.ENTRY_SHORT else None
@@ -1422,6 +1425,7 @@ class PaperTradingEngine:
         live_price = self.latest_prices.get(symbol) or (current.close if current else base_candles[-1].close)
         payload = {
             "timestamp": signal.timestamp.isoformat(),
+            "signal_timeframe": signal_timeframe,
             "action": signal.action.value,
             "regime": signal.regime.value,
             "trend_state": trend_state,
@@ -1514,28 +1518,40 @@ class PaperTradingEngine:
             position.metadata["last_mark_price"] = price
 
     async def _auto_trade_once(self) -> None:
+        baseline_signals = {
+            symbol: dict(signal)
+            for symbol, signal in self.latest_signals.items()
+        }
+        evaluated_signals = {
+            symbol: dict(signal)
+            for symbol, signal in baseline_signals.items()
+        }
+        for signal in evaluated_signals.values():
+            _update_entry_position_fields(signal)
         if await self._btc_4h_extreme_volatility():
             self.last_error = "BTC 4h extreme volatility; pause new altcoin entries"
-            for symbol, signal in self.latest_signals.items():
+            for symbol, signal in evaluated_signals.items():
                 if symbol not in self.account.positions and signal.get("action") in {
                     SignalAction.ENTRY_LONG.value,
                     SignalAction.ENTRY_SHORT.value,
                 }:
                     _record_auto_entry_block(signal, "BTC 4h extreme volatility; pause new altcoin entries")
+            self._commit_auto_entry_signal_snapshot(
+                baseline_signals,
+                evaluated_signals,
+            )
             return
         max_positions = min(self.settings.risk.max_open_positions, 5)
         candidates: list[tuple[str, dict[str, object]]] = []
-        for symbol, signal in self.latest_signals.items():
+        for symbol, signal in evaluated_signals.items():
+            signal.pop("exit_plan_error", None)
             _clear_transient_auto_entry_blocks(signal)
             if symbol in self.account.positions:
-                continue
-            if symbol.upper() in AUTO_UNIVERSE_EXCLUDED_SYMBOLS:
-                _record_auto_entry_block(signal, "symbol excluded from automatic universe")
                 continue
             for reason in _auto_entry_prerequisite_blocks(signal):
                 _record_auto_entry_block(signal, reason)
             if self.running:
-                for reason in self._data_freshness_blocks(symbol):
+                for reason in self._data_freshness_blocks(symbol, signal):
                     _record_auto_entry_block(signal, reason)
             if signal.get("vetoes"):
                 continue
@@ -1547,6 +1563,10 @@ class PaperTradingEngine:
         if slots <= 0:
             for _, signal in candidates:
                 _record_auto_entry_block(signal, f"position capacity full: {max_positions} open positions")
+            self._commit_auto_entry_signal_snapshot(
+                baseline_signals,
+                evaluated_signals,
+            )
             return
         opened_count = 0
         for symbol, signal in candidates:
@@ -1581,7 +1601,19 @@ class PaperTradingEngine:
                 precision = self.latest_timeframe_contexts.get(symbol, {}).get("m15_precision", {})
                 mtf_context = self.latest_timeframe_contexts.get(symbol, {})
                 trend_state = str(signal.get("trend_state") or "CHOP")
-                preferred_indicator = _preferred_exit_indicator(self.latest_timeframe_indicators.get(symbol, {}), indicators)
+                side_enum = PositionSide(side)
+                entry_price = self.latest_prices.get(symbol) or await self._price(symbol)
+                entry_timeframe = _entry_timeframe_for_signal(
+                    signal,
+                    side_enum,
+                    entry_price,
+                )
+                timeframe_indicators = self.latest_timeframe_indicators.get(symbol, {})
+                preferred_indicator = _indicator_for_entry_timeframe(
+                    timeframe_indicators,
+                    entry_timeframe,
+                    indicators,
+                )
                 trend_stage = str(signal.get("trend_stage_phase") or _trend_stage_from_signal(signal, preferred_indicator))
                 leverage = min(
                     _leverage_for_signal(
@@ -1593,71 +1625,102 @@ class PaperTradingEngine:
                     ),
                     int(signal.get("leverage_cap") or self.settings.risk.leverage_max),
                 )
-                entry_price = self.latest_prices.get(symbol) or await self._price(symbol)
                 stop_loss, take_profit_1, take_profit_2 = _adaptive_exits(
-                    PositionSide(side),
+                    side_enum,
                     entry_price,
                     leverage,
                     trend_state,
                     preferred_indicator,
                 )
                 stop_basis = "volatility_structure"
-                kc_stop = _refine_stop_with_keltner(
-                    PositionSide(side),
-                    stop_loss,
-                    entry_price,
-                    preferred_indicator,
-                    trend_state,
-                )
-                if kc_stop != stop_loss:
-                    stop_loss = kc_stop
-                    stop_basis = "kc_atr_volatility"
-                stop_loss = _refine_stop_with_ma_cluster(PositionSide(side), stop_loss, mtf_context)
-                structure_stop = _refine_stop_with_retest_structure(
-                    PositionSide(side),
-                    stop_loss,
-                    entry_price,
-                    mtf_context,
-                    preferred_indicator,
-                )
-                if structure_stop != stop_loss:
-                    stop_loss = structure_stop
-                    stop_basis = "1h_4h_retest_structure"
                 precision_entry_only = (
-                    _entry_level_group_hit(signal, entry_price, PositionSide(side), include_m15=True)
-                    and not _entry_level_group_hit(signal, entry_price, PositionSide(side), include_m15=False)
+                    entry_timeframe == "15m"
                 )
-                if _precision_stop_allowed(PositionSide(side), trend_state, str(signal.get("risk_state") or "NORMAL"), score, precision):
-                    refined_stop = _refine_stop_with_precision(
-                        PositionSide(side),
-                        stop_loss,
+                if precision_entry_only:
+                    if not _precision_stop_allowed(
+                        side_enum,
+                        trend_state,
+                        str(signal.get("risk_state") or "NORMAL"),
+                        score,
                         precision,
+                        str(signal.get("smart_money_phase") or ""),
+                    ) or not _m15_precision_stop_distance_ok(
+                        side_enum,
                         entry_price,
+                        precision,
                         preferred_indicator,
-                    )
-                    if refined_stop != stop_loss:
-                        stop_loss = refined_stop
-                        stop_basis = "15m_precision_structure"
-                    elif precision_entry_only:
+                    ):
                         _record_auto_entry_block(
                             signal,
                             "15m tactical entry lacks a valid 15m structure stop or 1h/4h entry zone",
                         )
                         continue
-                stop_error = _entry_stop_error(PositionSide(side), entry_price, stop_loss)
-                if stop_error:
-                    _record_auto_entry_block(signal, f"invalid entry stop: {stop_error}")
-                    continue
+                    refined_stop = _refine_stop_with_precision(
+                        side_enum,
+                        stop_loss,
+                        precision,
+                        entry_price,
+                        preferred_indicator,
+                    )
+                    stop_loss = refined_stop
+                    stop_basis = "15m_precision_structure"
+                else:
+                    structure_stop = _refine_stop_with_retest_structure(
+                        side_enum,
+                        stop_loss,
+                        entry_price,
+                        mtf_context,
+                        preferred_indicator,
+                        timeframe=entry_timeframe,
+                    )
+                    if structure_stop != stop_loss:
+                        stop_loss = structure_stop
+                        stop_basis = f"{entry_timeframe}_retest_structure"
+                    else:
+                        kc_stop = _refine_stop_with_keltner(
+                            side_enum,
+                            stop_loss,
+                            entry_price,
+                            preferred_indicator,
+                            trend_state,
+                        )
+                        if kc_stop != stop_loss:
+                            stop_loss = kc_stop
+                            stop_basis = f"{entry_timeframe}_kc_atr_volatility"
                 take_profit_1, take_profit_2 = _refine_take_profit_with_ma_cluster(
-                    PositionSide(side),
+                    side_enum,
                     entry_price,
                     stop_loss,
                     take_profit_1,
                     take_profit_2,
                     mtf_context,
+                    timeframe=entry_timeframe,
                 )
-                reward_r = _entry_reward_r(signal, PositionSide(side), entry_price, stop_loss)
-                if reward_r is not None and reward_r < MIN_ENTRY_REWARD_R:
+                try:
+                    _assert_valid_exit_plan(
+                        side_enum,
+                        entry_price,
+                        stop_loss,
+                        take_profit_1,
+                        take_profit_2,
+                    )
+                except ExitPlanAssertionError as exc:
+                    signal["exit_plan_error"] = str(exc)
+                    self.last_error = f"{symbol} exit plan assertion failed: {exc}"
+                    continue
+                reward_r = _entry_reward_r(
+                    signal,
+                    side_enum,
+                    entry_price,
+                    stop_loss,
+                    timeframe=entry_timeframe,
+                    planned_target=take_profit_2,
+                )
+                if reward_r is None:
+                    signal["exit_plan_error"] = "reward/risk calculation unavailable after exit-plan generation"
+                    self.last_error = f"{symbol} exit plan assertion failed: reward/risk calculation unavailable"
+                    continue
+                if reward_r < MIN_ENTRY_REWARD_R:
                     _record_auto_entry_block(
                         signal,
                         f"entry reward/risk {reward_r:.2f}R below minimum {MIN_ENTRY_REWARD_R:.2f}R",
@@ -1665,6 +1728,8 @@ class PaperTradingEngine:
                     continue
                 entry_context = _entry_context_from_signal(signal)
                 entry_context["stop_basis"] = stop_basis
+                entry_context["stop_timeframe"] = entry_timeframe
+                entry_context["entry_setup"] = f"{entry_timeframe}_entry"
                 entry_context["trend_stage_phase"] = trend_stage
                 entry_context["entry_reward_r"] = reward_r
                 await self.open_position(
@@ -1682,7 +1747,26 @@ class PaperTradingEngine:
                 opened_count += 1
             except Exception as exc:  # noqa: BLE001 - one rejected candidate must not block later candidates
                 _record_auto_entry_block(signal, f"auto entry execution failed: {exc}")
+        self._commit_auto_entry_signal_snapshot(
+            baseline_signals,
+            evaluated_signals,
+        )
         self._add_to_strong_positions()
+
+    def _commit_auto_entry_signal_snapshot(
+        self,
+        baseline_signals: dict[str, dict[str, object]],
+        evaluated_signals: dict[str, dict[str, object]],
+    ) -> None:
+        """Publish one completed auto-entry pass without exposing partial veto states."""
+        for symbol, evaluated in evaluated_signals.items():
+            baseline = baseline_signals.get(symbol)
+            current = self.latest_signals.get(symbol)
+            if baseline is None or current != baseline:
+                continue
+            committed = dict(evaluated)
+            self.latest_signals[symbol] = committed
+            self.account.latest_signals[symbol] = dict(committed)
 
     async def _rebalance_for_better_candidate(self, candidates: list[tuple[str, dict[str, object]]]) -> None:
         if not candidates or not self.account.positions:
@@ -1758,7 +1842,11 @@ class PaperTradingEngine:
         )
         return self._btc_extreme_cached
 
-    def _data_freshness_blocks(self, symbol: str) -> tuple[str, ...]:
+    def _data_freshness_blocks(
+        self,
+        symbol: str,
+        signal: dict[str, object] | None = None,
+    ) -> tuple[str, ...]:
         now = datetime.now(UTC)
         blocks: list[str] = []
         if not self._warmup_complete:
@@ -1787,7 +1875,10 @@ class PaperTradingEngine:
             ):
                 blocks.append("current funding rate data is stale for more than 15 minutes")
         if not self._symbol_cache_valid(symbol):
-            blocks.append("required multi-timeframe K-line context is missing or discontinuous")
+            cache = self._timeframe_candles.get(symbol, {})
+            for timeframe in _required_entry_timeframes(signal):
+                if not _candles_contiguous(cache.get(timeframe, []), timeframe):
+                    blocks.append(f"{timeframe} K-line context is missing or discontinuous")
         return tuple(blocks)
 
     def _manage_open_positions(self, *, fresh_only: bool = False) -> None:
@@ -2178,6 +2269,7 @@ def _stop_timeframe_from_context(context: dict[str, object]) -> str:
 def _entry_context_from_signal(signal: dict[str, object]) -> dict[str, object]:
     keys = (
         "action",
+        "signal_timeframe",
         "trend_state",
         "regime",
         "risk_state",
@@ -2938,10 +3030,22 @@ def _trend_stage_from_signal(signal: dict[str, object], indicator: IndicatorSnap
     rsi14 = _float_or_none(signal.get("rsi14"))
     price = _float_or_none(signal.get("price"))
     reasons_text = " | ".join(str(reason).lower() for reason in signal.get("reasons") or ())
+    smart_money_phase = str(signal.get("smart_money_phase") or "")
     if indicator is not None:
         rsi14 = rsi14 if rsi14 is not None else indicator.rsi14
         price = price if price is not None else indicator.close
-    if _late_stage_risk(side, risk_state, rsi14, price, indicator, reasons_text):
+    if _late_stage_risk(
+        side,
+        risk_state,
+        rsi14,
+        price,
+        indicator,
+        reasons_text,
+        allow_short_squeeze=(
+            side == PositionSide.LONG
+            and smart_money_phase == "SHORT_SQUEEZE_MARKUP"
+        ),
+    ):
         return TREND_STAGE_LATE
     h1 = signal.get("h1_trigger") if isinstance(signal.get("h1_trigger"), dict) else {}
     h1_pullback = signal.get("h1_pullback") if isinstance(signal.get("h1_pullback"), dict) else {}
@@ -2979,8 +3083,12 @@ def _late_stage_risk(
     price: float | None,
     indicator: IndicatorSnapshot | None,
     reasons_text: str,
+    *,
+    allow_short_squeeze: bool = False,
 ) -> bool:
-    if risk_state in {"LONG_CROWD", "SHORT_CROWD", "OI_ABNORMAL", "FUNDING_HOT"}:
+    if risk_state in {"LONG_CROWD", "OI_ABNORMAL", "FUNDING_HOT"}:
+        return True
+    if risk_state == "SHORT_CROWD" and not allow_short_squeeze:
         return True
     if side == PositionSide.LONG and rsi14 is not None and rsi14 >= RSI_STRONG_LONG_HARD:
         return True
@@ -2997,11 +3105,26 @@ def _late_stage_risk(
     return False
 
 
-def _entry_reward_r(signal: dict[str, object], side: PositionSide, price: float, stop: float) -> float | None:
+def _entry_reward_r(
+    signal: dict[str, object],
+    side: PositionSide,
+    price: float,
+    stop: float,
+    *,
+    timeframe: str = "1h",
+    planned_target: float | None = None,
+) -> float | None:
     risk = abs(price - stop)
     if risk <= 0:
         return None
-    target = _nearest_structure_target(signal, side, price)
+    target = _nearest_structure_target(
+        signal,
+        side,
+        price,
+        timeframe=timeframe,
+    )
+    if target is None and _target_is_profitable(side, price, planned_target):
+        target = planned_target
     if target is None:
         return None
     reward = target - price if side == PositionSide.LONG else price - target
@@ -3010,20 +3133,55 @@ def _entry_reward_r(signal: dict[str, object], side: PositionSide, price: float,
     return reward / risk
 
 
-def _nearest_structure_target(signal: dict[str, object], side: PositionSide, price: float) -> float | None:
+def _nearest_structure_target(
+    signal: dict[str, object],
+    side: PositionSide,
+    price: float,
+    *,
+    timeframe: str = "1h",
+) -> float | None:
+    primary_timeframe = "4h" if timeframe == "4h" else "1h"
+    candidates = _timeframe_target_candidates(
+        signal,
+        side,
+        price,
+        primary_timeframe,
+    )
+    if not candidates and primary_timeframe == "1h":
+        candidates = _timeframe_target_candidates(
+            signal,
+            side,
+            price,
+            "4h",
+        )
+    if not candidates:
+        return None
+    return min(candidates) if side == PositionSide.LONG else max(candidates)
+
+
+def _timeframe_target_candidates(
+    signal: dict[str, object],
+    side: PositionSide,
+    price: float,
+    timeframe: str,
+) -> list[float]:
     candidates: list[float] = []
-    for key in ("h1_structure", "h4_structure", "h1_trigger"):
+    structure_keys = (
+        ("h4_structure",)
+        if timeframe == "4h"
+        else ("h1_structure", "h1_trigger")
+    )
+    for key in structure_keys:
         mapping = signal.get(key) if isinstance(signal.get(key), dict) else {}
         candidates.extend(_structure_target_candidates(mapping, side, price))
-    for key in ("h1_ma_cluster", "h4_ma_cluster"):
+    cluster_key = "h4_ma_cluster" if timeframe == "4h" else "h1_ma_cluster"
+    for key in (cluster_key,):
         cluster = signal.get(key) if isinstance(signal.get(key), dict) else {}
         target_key = "target_up" if side == PositionSide.LONG else "target_down"
         target = _float_or_none(cluster.get(target_key))
         if target is not None and ((side == PositionSide.LONG and target > price) or (side == PositionSide.SHORT and target < price)):
             candidates.append(target)
-    if not candidates:
-        return None
-    return min(candidates) if side == PositionSide.LONG else max(candidates)
+    return candidates
 
 
 def _structure_target_candidates(mapping: dict[str, object], side: PositionSide, price: float) -> list[float]:
@@ -3050,15 +3208,12 @@ def _auto_entry_prerequisite_blocks(signal: dict[str, object]) -> tuple[str, ...
     if score < AUTO_ENTRY_MIN_SCORE:
         blocks.append(f"final score {score} below auto-entry minimum {AUTO_ENTRY_MIN_SCORE}")
     if is_entry:
-        if _trend_stage_from_signal(signal) == TREND_STAGE_LATE:
-            blocks.append("late trend stage blocks fresh entry")
-        else:
-            entry_timing, entry_reason = _signal_entry_timing(signal)
-            if entry_timing != ENTRY_TIMING_GOOD:
-                detail = entry_reason or entry_timing
-                existing_vetoes = {str(reason) for reason in (signal.get("vetoes") or ())}
-                if detail not in existing_vetoes:
-                    blocks.append(f"current entry timing is not excellent: {detail}")
+        entry_position, entry_reason = _signal_entry_timing(signal)
+        if entry_position != ENTRY_TIMING_GOOD:
+            detail = entry_reason or entry_position
+            existing_vetoes = {str(reason) for reason in (signal.get("vetoes") or ())}
+            if detail not in existing_vetoes:
+                blocks.append(f"current entry position is not excellent: {detail}")
     return tuple(dict.fromkeys(blocks))
 
 
@@ -3070,11 +3225,13 @@ def _auto_entry_status_signal(
     has_position: bool,
 ) -> dict[str, object]:
     payload = dict(signal)
-    _clear_transient_auto_entry_blocks(payload)
+    _clear_transient_auto_entry_blocks(
+        payload,
+        preserve_evaluation_results=True,
+    )
+    _update_entry_position_fields(payload)
     for reason in _auto_entry_prerequisite_blocks(payload):
         _record_auto_entry_block(payload, reason)
-    if symbol.upper() in AUTO_UNIVERSE_EXCLUDED_SYMBOLS:
-        _record_auto_entry_block(payload, "symbol excluded from automatic universe")
     if has_position:
         _record_auto_entry_block(payload, "symbol already has an open position")
     if not auto_trade:
@@ -3087,7 +3244,11 @@ def _record_auto_entry_block(signal: dict[str, object], reason: str) -> None:
     if reason not in vetoes:
         vetoes.append(reason)
     signal["vetoes"] = tuple(vetoes)
-    signal["entry_timing"] = ENTRY_TIMING_BLOCK
+
+
+def _update_entry_position_fields(signal: dict[str, object]) -> None:
+    entry_position, reason = _signal_entry_timing(signal)
+    signal["entry_timing"] = entry_position
     signal["entry_timing_reason"] = reason
 
 
@@ -3095,11 +3256,13 @@ _TRANSIENT_AUTO_ENTRY_BLOCK_PREFIXES = (
     "directional entry signal not established",
     "final score ",
     "late trend stage",
-    "current entry timing is not excellent",
+    "current entry position is not excellent",
     "symbol already has an open position",
+    "symbol excluded from automatic universe",
     "auto strategy disabled",
     "position capacity full",
     "available entry margin ",
+    "15m tactical entry lacks ",
     "invalid entry stop",
     "entry reward/risk ",
     "auto entry execution failed",
@@ -3109,20 +3272,43 @@ _TRANSIENT_AUTO_ENTRY_BLOCK_PREFIXES = (
     "OI/long-short ratio data is stale",
     "current funding rate data is stale",
     "required multi-timeframe K-line context",
+    "15m K-line context",
+    "1h K-line context",
+    "4h K-line context",
 )
 
 
-def _clear_transient_auto_entry_blocks(signal: dict[str, object]) -> None:
+_AUTO_ENTRY_EVALUATION_RESULT_PREFIXES = (
+    "position capacity full",
+    "available entry margin ",
+    "15m tactical entry lacks ",
+    "invalid entry stop",
+    "entry reward/risk ",
+    "auto entry execution failed",
+)
+
+
+def _clear_transient_auto_entry_blocks(
+    signal: dict[str, object],
+    *,
+    preserve_evaluation_results: bool = False,
+) -> None:
+    def should_clear(reason: str) -> bool:
+        if reason == "entry reward/risk target unavailable" or reason.startswith("invalid entry stop"):
+            return True
+        if not reason.startswith(_TRANSIENT_AUTO_ENTRY_BLOCK_PREFIXES):
+            return False
+        return not (
+            preserve_evaluation_results
+            and reason.startswith(_AUTO_ENTRY_EVALUATION_RESULT_PREFIXES)
+        )
+
     vetoes = [
         str(reason)
         for reason in (signal.get("vetoes") or ())
-        if not str(reason).startswith(_TRANSIENT_AUTO_ENTRY_BLOCK_PREFIXES)
+        if not should_clear(str(reason))
     ]
     signal["vetoes"] = tuple(vetoes)
-    timing_reason = str(signal.get("entry_timing_reason") or "")
-    if timing_reason.startswith(_TRANSIENT_AUTO_ENTRY_BLOCK_PREFIXES):
-        signal.pop("entry_timing", None)
-        signal.pop("entry_timing_reason", None)
 
 
 def _entry_stop_error(side: PositionSide, entry_price: float, stop_price: float) -> str | None:
@@ -3137,6 +3323,50 @@ def _entry_stop_error(side: PositionSide, entry_price: float, stop_price: float)
     if abs(entry_price - stop_price) <= entry_price * 1e-8:
         return "stop distance is effectively zero"
     return None
+
+
+def _exit_plan_error(
+    side: PositionSide,
+    entry_price: float,
+    stop_price: float,
+    take_profit_1: float,
+    take_profit_2: float,
+) -> str | None:
+    stop_error = _entry_stop_error(side, entry_price, stop_price)
+    if stop_error:
+        return f"invalid stop loss: {stop_error}"
+    for label, target in (
+        ("take profit 1", take_profit_1),
+        ("take profit 2", take_profit_2),
+    ):
+        if not math.isfinite(target) or target <= 0:
+            return f"{label} is not positive and finite"
+        if not _target_is_profitable(side, entry_price, target):
+            direction = "above" if side == PositionSide.LONG else "below"
+            return f"{label} must be {direction} entry price"
+    if side == PositionSide.LONG and take_profit_2 <= take_profit_1:
+        return "take profit 2 must be above take profit 1"
+    if side == PositionSide.SHORT and take_profit_2 >= take_profit_1:
+        return "take profit 2 must be below take profit 1"
+    return None
+
+
+def _assert_valid_exit_plan(
+    side: PositionSide,
+    entry_price: float,
+    stop_price: float,
+    take_profit_1: float,
+    take_profit_2: float,
+) -> None:
+    error = _exit_plan_error(
+        side,
+        entry_price,
+        stop_price,
+        take_profit_1,
+        take_profit_2,
+    )
+    if error:
+        raise ExitPlanAssertionError(error)
 
 
 def _rotation_candidate_allowed(signal: dict[str, object], indicator: IndicatorSnapshot | None) -> bool:
@@ -3163,22 +3393,19 @@ def _rotation_candidate_allowed(signal: dict[str, object], indicator: IndicatorS
 
 
 def _signal_entry_timing(signal: dict[str, object]) -> tuple[str, str]:
-    stored = str(signal.get("entry_timing") or "")
-    if stored in {ENTRY_TIMING_GOOD, ENTRY_TIMING_WAIT, ENTRY_TIMING_BLOCK}:
-        return stored, str(signal.get("entry_timing_reason") or "")
     action = str(signal.get("action") or "")
     if action == SignalAction.WATCH.value:
-        return ENTRY_TIMING_WAIT, "entry timing wait: watch signal needs entry confirmation"
+        return ENTRY_TIMING_BLOCK, "entry position blocked: directional entry signal not established"
     if action == SignalAction.NO_TRADE.value:
-        return ENTRY_TIMING_BLOCK, "entry timing blocked: no trade signal"
+        return ENTRY_TIMING_BLOCK, "entry position blocked: no trade signal"
     if action not in {SignalAction.ENTRY_LONG.value, SignalAction.ENTRY_SHORT.value}:
-        return ENTRY_TIMING_BLOCK, "entry timing blocked: not an entry signal"
+        return ENTRY_TIMING_BLOCK, "entry position blocked: not an entry signal"
     price = _float_or_none(signal.get("price"))
     entry_levels = signal.get("entry_levels") if isinstance(signal.get("entry_levels"), dict) else {}
     if not entry_levels:
-        return ENTRY_TIMING_WAIT, "entry timing wait: suggested entry zone unavailable"
+        return ENTRY_TIMING_BLOCK, "entry position blocked: suggested entry zone unavailable"
     if price is None:
-        return ENTRY_TIMING_WAIT, "entry timing wait: latest price unavailable"
+        return ENTRY_TIMING_WAIT, "entry position wait: latest price unavailable"
     side = PositionSide.LONG if action == SignalAction.ENTRY_LONG.value else PositionSide.SHORT
     return _side_entry_timing(side, price, signal)
 
@@ -3187,33 +3414,25 @@ def _side_entry_timing(side: PositionSide, price: float, signal: dict[str, objec
     score = int(signal.get("score") or 0)
     risk_state = str(signal.get("risk_state") or "NORMAL")
     trend_state = str(signal.get("trend_state") or signal.get("regime") or "")
-    h1 = signal.get("h1_trigger") if isinstance(signal.get("h1_trigger"), dict) else {}
     m15_precision = signal.get("m15_precision") if isinstance(signal.get("m15_precision"), dict) else {}
-    h1_direction = str(h1.get("direction") or "NONE")
-    h1_state = str(h1.get("state") or "UNKNOWN")
-    if _trend_stage_from_signal(signal) == TREND_STAGE_LATE:
-        return ENTRY_TIMING_BLOCK, "entry timing blocked: late trend stage needs a new pullback"
-    if risk_state in {"LONG_CROWD", "SHORT_CROWD", "OI_ABNORMAL", "FUNDING_HOT"}:
-        return ENTRY_TIMING_BLOCK, "entry timing blocked: crowding/OI/funding risk not clean"
+    smart_money_phase = str(signal.get("smart_money_phase") or "")
     include_m15 = _strong_m15_pullback_allowed(
         side,
         trend_state,
         risk_state,
         score,
         m15_precision,
-    ) and _m15_precision_stop_distance_ok(side, price, m15_precision)
+        smart_money_phase,
+    )
     if _entry_level_group_hit(signal, price, side, include_m15=include_m15):
         return ENTRY_TIMING_GOOD, _entry_zone_reason(side)
-    expected_direction = "LONG" if side == PositionSide.LONG else "SHORT"
-    if h1_direction == expected_direction and h1_state in {"BREAKOUT", "BREAKDOWN"}:
-        return ENTRY_TIMING_WAIT, _breakout_wait_reason(side)
     return ENTRY_TIMING_WAIT, _wait_retest_reason(side)
 
 
 def _entry_zone_reason(side: PositionSide) -> str:
     if side == PositionSide.LONG:
-        return "entry timing good: price is inside 1h/4h support, EMA/BOLL, VWAP, or retest entry zone"
-    return "entry timing good: price is inside 1h/4h resistance, EMA/BOLL, VWAP, or retest entry zone"
+        return "entry position good: live price is inside a scored long entry zone"
+    return "entry position good: live price is inside a scored short entry zone"
 
 
 def _pullback_reason(side: PositionSide) -> str:
@@ -3236,8 +3455,8 @@ def _breakout_wait_reason(side: PositionSide) -> str:
 
 def _wait_retest_reason(side: PositionSide) -> str:
     if side == PositionSide.LONG:
-        return "entry timing wait: long needs 1h/4h support, EMA/BOLL, VWAP, or breakout retest"
-    return "entry timing wait: short needs 1h/4h resistance, EMA/BOLL, VWAP, or breakdown retest"
+        return "entry position wait: live price has not reached a scored long entry zone"
+    return "entry position wait: live price has not reached a scored short entry zone"
 
 
 def _entry_level_group_hit(signal: dict[str, object], price: float, side: PositionSide, *, include_m15: bool) -> bool:
@@ -3280,12 +3499,187 @@ def _entry_level_group_hit(signal: dict[str, object], price: float, side: Positi
     return any(_entry_level_hit(price, side_levels.get(key)) for key in keys)
 
 
-def _m15_precision_stop_distance_ok(side: PositionSide, price: float, precision: dict[str, object]) -> bool:
+def _scored_entry_levels(
+    signal: dict[str, object],
+    all_levels: dict[str, object],
+) -> dict[str, object]:
+    """Keep only entry zones supported by conditions that contributed to the signal."""
+    side = _signal_side(signal)
+    if side is None:
+        return {}
+    side_key = "long" if side == PositionSide.LONG else "short"
+    source = all_levels.get(side_key) if isinstance(all_levels.get(side_key), dict) else {}
+    selected: dict[str, object] = {}
+    reason_text = " | ".join(str(reason).lower() for reason in signal.get("reasons") or ())
+
+    def add(*keys: str) -> None:
+        for key in keys:
+            level = source.get(key)
+            if _entry_level_has_values(level):
+                selected[key] = level
+
+    if side == PositionSide.LONG:
+        precision = signal.get("m15_precision") if isinstance(signal.get("m15_precision"), dict) else {}
+        if _strong_m15_pullback_allowed(
+            side,
+            str(signal.get("trend_state") or ""),
+            str(signal.get("risk_state") or "NORMAL"),
+            int(signal.get("score") or 0),
+            precision,
+            str(signal.get("smart_money_phase") or ""),
+        ):
+            add("m15_ema20_ema60")
+        if "vwap pullback held" in reason_text:
+            add("vwap_pullback")
+        if "close confirmed near ema20/boll mid" in reason_text or "1h boll/ema pullback held" in reason_text:
+            add("h1_support", "h1_boll_mid", "h1_ema20_ema60")
+        if any(token in reason_text for token in ("market structure confirms long", "resistance grind broke upward", "volume pattern confirms long", "volume breakout above resistance", "breakout retest held quietly")):
+            add("breakout_retest", "h1_support")
+        if any(token in reason_text for token in ("washout confirmed: downside", "downside sweep reclaimed")):
+            add("sweep_reclaim_support")
+        if any(token in reason_text for token in ("oi flushed", "oi deleveraged", "oi rebounds after deleverage")):
+            add("oi_valley_recovery")
+        if "ma cluster breakout up" in reason_text:
+            add("ma_cluster_breakout")
+        if "ma cluster retest held" in reason_text:
+            add("ma20_retest")
+        if "4h structure supports upside" in reason_text:
+            add("h4_support", "h4_ema20_ema60")
+        if not selected:
+            if str(signal.get("signal_timeframe") or "1h") == "4h":
+                add("h4_support", "h4_ema20_ema60")
+            else:
+                add("h1_support", "h1_boll_mid", "h1_ema20_ema60", "breakout_retest")
+    else:
+        if "vwap retest rejected" in reason_text:
+            add("vwap_retest")
+        if "close confirmed failed retest" in reason_text or "1h boll/ema pullback rejected" in reason_text:
+            add("h1_resistance", "h1_boll_mid", "h1_ema20_ema60")
+        if any(token in reason_text for token in ("market structure confirms short", "support grind broke downward", "volume pattern confirms short", "volume breakdown below support", "breakdown retest rejected quietly")):
+            add("breakdown_retest", "h1_resistance")
+        if any(token in reason_text for token in ("washout confirmed: upside", "upside sweep rejected")):
+            add("sweep_reject_resistance")
+        if any(token in reason_text for token in ("oi drained", "distribution", "deleverage")):
+            add("oi_distribution")
+        if "ma cluster breakdown down" in reason_text:
+            add("ma_cluster_breakdown")
+        if "ma cluster retest rejected" in reason_text:
+            add("ma20_retest")
+        if "4h structure supports downside" in reason_text:
+            add("h4_resistance", "h4_ema20_ema60")
+        if not selected:
+            if str(signal.get("signal_timeframe") or "1h") == "4h":
+                add("h4_resistance", "h4_ema20_ema60")
+            else:
+                add("h1_resistance", "h1_boll_mid", "h1_ema20_ema60", "breakdown_retest")
+    return {side_key: selected} if selected else {}
+
+
+def _entry_level_has_values(level: object) -> bool:
+    if not isinstance(level, dict):
+        return False
+    return any(
+        _float_or_none(level.get(key)) is not None
+        for key in ("low", "high", "price")
+    )
+
+
+def _required_entry_timeframes(
+    signal: dict[str, object] | None,
+) -> tuple[str, ...]:
+    if not isinstance(signal, dict):
+        return ()
+    side = _signal_side(signal)
+    if side is None:
+        return ()
+    price = _float_or_none(signal.get("price"))
+    if price is None:
+        return (str(signal.get("signal_timeframe") or "1h"),)
+    return (_entry_timeframe_for_signal(signal, side, price),)
+
+
+def _entry_timeframe_for_signal(
+    signal: dict[str, object],
+    side: PositionSide,
+    price: float,
+) -> str:
+    """Resolve the stop/target timeframe from the entry zone actually being traded."""
+    levels = signal.get("entry_levels") if isinstance(signal.get("entry_levels"), dict) else {}
+    side_key = "long" if side == PositionSide.LONG else "short"
+    side_levels = levels.get(side_key) if isinstance(levels.get(side_key), dict) else {}
+    precision = signal.get("m15_precision") if isinstance(signal.get("m15_precision"), dict) else {}
+    m15_hit = (
+        _strong_m15_pullback_allowed(
+            side,
+            str(signal.get("trend_state") or signal.get("regime") or ""),
+            str(signal.get("risk_state") or "NORMAL"),
+            int(signal.get("score") or 0),
+            precision,
+            str(signal.get("smart_money_phase") or ""),
+        )
+        and _entry_level_hit(price, side_levels.get("m15_ema20_ema60"))
+    )
+    h1_keys = (
+        ("h1_support", "h1_boll_mid", "h1_ema20_ema60", "vwap_pullback")
+        if side == PositionSide.LONG
+        else ("h1_resistance", "h1_boll_mid", "h1_ema20_ema60", "vwap_retest")
+    )
+    h4_keys = (
+        ("h4_support", "h4_ema20_ema60")
+        if side == PositionSide.LONG
+        else ("h4_resistance", "h4_ema20_ema60")
+    )
+    h1_hit = any(_entry_level_hit(price, side_levels.get(key)) for key in h1_keys)
+    h4_hit = any(_entry_level_hit(price, side_levels.get(key)) for key in h4_keys)
+    if m15_hit and not h1_hit and not h4_hit:
+        return "15m"
+    if h1_hit:
+        return "1h"
+    if h4_hit:
+        return "4h"
+    generic_keys = (
+        ("sweep_reclaim_support", "oi_valley_recovery", "ma_cluster_breakout", "ma20_retest", "breakout_retest")
+        if side == PositionSide.LONG
+        else ("sweep_reject_resistance", "oi_distribution", "ma_cluster_breakdown", "ma20_retest", "breakdown_retest")
+    )
+    generic_hit = any(
+        _entry_level_hit(price, side_levels.get(key))
+        for key in generic_keys
+    )
+    h1_cluster = signal.get("h1_ma_cluster") if isinstance(signal.get("h1_ma_cluster"), dict) else {}
+    h4_cluster = signal.get("h4_ma_cluster") if isinstance(signal.get("h4_ma_cluster"), dict) else {}
+    if (
+        generic_hit
+        and str(h1_cluster.get("state") or "UNKNOWN") == "UNKNOWN"
+        and str(h4_cluster.get("state") or "UNKNOWN") != "UNKNOWN"
+    ):
+        return "4h"
+    return "1h"
+
+
+def _indicator_for_entry_timeframe(
+    timeframe_indicators: dict[str, list[IndicatorSnapshot]],
+    timeframe: str,
+    fallback: list[IndicatorSnapshot],
+) -> IndicatorSnapshot | None:
+    indicators = timeframe_indicators.get(timeframe) or []
+    if indicators:
+        return indicators[-1]
+    return _preferred_exit_indicator(timeframe_indicators, fallback)
+
+
+def _m15_precision_stop_distance_ok(
+    side: PositionSide,
+    price: float,
+    precision: dict[str, object],
+    indicator: IndicatorSnapshot | None = None,
+) -> bool:
+    minimum_distance = _minimum_precision_stop_distance(price, indicator)
     if side == PositionSide.LONG:
         anchor = _float_or_none(precision.get("long_stop_anchor"))
-        return anchor is not None and anchor < price and price - anchor >= price * MIN_PRECISION_STOP_PCT
+        return anchor is not None and anchor < price and price - anchor >= minimum_distance
     anchor = _float_or_none(precision.get("short_stop_anchor"))
-    return anchor is not None and anchor > price and anchor - price >= price * MIN_PRECISION_STOP_PCT
+    return anchor is not None and anchor > price and anchor - price >= minimum_distance
 
 
 def _entry_level_hit(price: float, level: object) -> bool:
@@ -3299,9 +3693,7 @@ def _entry_level_hit(price: float, level: object) -> bool:
         return False
     zone_low = min(values)
     zone_high = max(values)
-    width = max(zone_high - zone_low, 0.0)
-    pad = max(width * 0.25, price * 0.0025)
-    return zone_low - pad <= price <= zone_high + pad
+    return zone_low <= price <= zone_high
 
 
 def _position_structure_failed(position: Position, signal: dict[str, object]) -> bool:
@@ -3962,7 +4354,6 @@ def _entry_level_context(
             "h1_boll_mid": _indicator_band(h1_indicator, h1_indicator.boll_mid if h1_indicator else None),
             "h1_ema20_ema60": _ema20_ema60_band(h1_indicator, h1_ma_cluster),
             "h4_ema20_ema60": _ema20_ema60_band(h4_indicator, h4_ma_cluster),
-            "m15_ema20_ema60": _zone_from_object(m15.get("short_retest_zone")),
             "sweep_reject_resistance": _zone_from_mapping(h1_structure, "resistance") or _zone_from_mapping(h4_structure, "resistance"),
             "oi_distribution": _recovery_band(h1_indicator) or _zone_from_mapping(h1_structure, "resistance"),
             "ma_cluster_breakdown": _cluster_band(h1_ma_cluster) or _cluster_band(h4_ma_cluster),
@@ -4137,6 +4528,7 @@ def _apply_multi_timeframe_context(signal: dict[str, object], context: dict[str,
     h4_oi_state = str(h4_oi.get("state") or "UNKNOWN")
     risk_state = str(out.get("risk_state") or "NORMAL")
     trend_state = str(out.get("trend_state") or "")
+    smart_money_phase = str(out.get("smart_money_phase") or "")
     rsi14 = _float_or_none(out.get("rsi14"))
     weak_deleverage_rebound = _weak_deleverage_rebound(out, h4_oi, h1_pullback)
     distribution_short_retest_setup = _distribution_short_retest_setup(
@@ -4179,7 +4571,14 @@ def _apply_multi_timeframe_context(signal: dict[str, object], context: dict[str,
                 score -= 20
                 vetoes.append("high pullback with OI/funding/crowd risk; avoid long entry")
         elif _high_area_needs_long_pullback(h4_state, h1_direction, h1_state):
-            if _strong_m15_pullback_allowed(PositionSide.LONG, trend_state, risk_state, score, m15_precision):
+            if _strong_m15_pullback_allowed(
+                PositionSide.LONG,
+                trend_state,
+                risk_state,
+                score,
+                m15_precision,
+                smart_money_phase,
+            ):
                 score += 6
                 reasons.append("one-way uptrend 15m BOLL/EMA9 pullback confirmed; allow tactical long")
             else:
@@ -4212,6 +4611,7 @@ def _apply_multi_timeframe_context(signal: dict[str, object], context: dict[str,
             pullback_direction,
             pullback_state,
             m15_precision,
+            smart_money_phase,
         )
         score += rsi_score
         reasons.extend(rsi_reasons)
@@ -4274,6 +4674,7 @@ def _apply_multi_timeframe_context(signal: dict[str, object], context: dict[str,
             pullback_direction,
             pullback_state,
             m15_precision,
+            smart_money_phase,
         )
         score += rsi_score
         reasons.extend(rsi_reasons)
@@ -4281,6 +4682,7 @@ def _apply_multi_timeframe_context(signal: dict[str, object], context: dict[str,
     reasons.append(str(context.get("summary") or "multi-timeframe context neutral"))
     stage_probe = {
         **out,
+        "score": max(0, score),
         "reasons": tuple(reasons),
         "h1_trigger": h1,
         "h1_pullback": h1_pullback,
@@ -4289,6 +4691,7 @@ def _apply_multi_timeframe_context(signal: dict[str, object], context: dict[str,
         "h4_structure": h4,
         "h1_ma_cluster": h1_ma_cluster,
         "h4_ma_cluster": h4_ma_cluster,
+        "m15_precision": m15_precision,
     }
     trend_stage_phase = _trend_stage_from_signal(stage_probe)
     if trend_stage_phase == TREND_STAGE_LATE and action in {SignalAction.ENTRY_LONG.value, SignalAction.ENTRY_SHORT.value}:
@@ -4306,11 +4709,9 @@ def _apply_multi_timeframe_context(signal: dict[str, object], context: dict[str,
     out["h1_trigger"] = h1
     out["h1_pullback"] = h1_pullback
     out["m15_precision"] = m15_precision
-    out["entry_levels"] = entry_levels
+    out["entry_levels"] = _scored_entry_levels(stage_probe, entry_levels)
     out["trend_stage_phase"] = trend_stage_phase
-    entry_timing, entry_timing_reason = _signal_entry_timing(out)
-    out["entry_timing"] = entry_timing
-    out["entry_timing_reason"] = entry_timing_reason
+    _update_entry_position_fields(out)
     return out
 
 
@@ -4323,6 +4724,7 @@ def _rsi_entry_adjustment(
     pullback_direction: str,
     pullback_state: str,
     m15_precision: dict[str, object],
+    smart_money_phase: str = "",
 ) -> tuple[int, list[str], list[str]]:
     if rsi14 is None:
         return 0, [], []
@@ -4333,7 +4735,15 @@ def _rsi_entry_adjustment(
             if rsi14 >= RSI_STRONG_LONG_HARD:
                 return -18, [], ["one-way uptrend RSI above 92; skip fresh long and protect existing profit"]
             if rsi14 > RSI_STRONG_LONG_PULLBACK:
-                pullback_ok = _strong_rsi_pullback_ok(side, risk_state, score, pullback_direction, pullback_state, m15_precision)
+                pullback_ok = _strong_rsi_pullback_ok(
+                    side,
+                    risk_state,
+                    score,
+                    pullback_direction,
+                    pullback_state,
+                    m15_precision,
+                    smart_money_phase,
+                )
                 if not pullback_ok:
                     return -12, [], ["one-way uptrend RSI hot without 1h/15m pullback; wait before long"]
                 if rsi14 >= RSI_STRONG_LONG_SEVERE:
@@ -4349,7 +4759,15 @@ def _rsi_entry_adjustment(
         if rsi14 <= RSI_STRONG_SHORT_HARD:
             return -18, [], ["one-way downtrend RSI below 8; skip fresh short and protect existing profit"]
         if rsi14 < RSI_STRONG_SHORT_PULLBACK:
-            pullback_ok = _strong_rsi_pullback_ok(side, risk_state, score, pullback_direction, pullback_state, m15_precision)
+            pullback_ok = _strong_rsi_pullback_ok(
+                side,
+                risk_state,
+                score,
+                pullback_direction,
+                pullback_state,
+                m15_precision,
+                smart_money_phase,
+            )
             if not pullback_ok:
                 return -12, [], ["one-way downtrend RSI cold without 1h/15m bounce rejection; wait before short"]
             if rsi14 <= RSI_STRONG_SHORT_SEVERE:
@@ -4370,6 +4788,7 @@ def _strong_rsi_pullback_ok(
     pullback_direction: str,
     pullback_state: str,
     m15_precision: dict[str, object],
+    smart_money_phase: str = "",
 ) -> bool:
     if risk_state != "NORMAL":
         return False
@@ -4377,7 +4796,14 @@ def _strong_rsi_pullback_ok(
         return (
             pullback_direction == "LONG"
             and pullback_state == "HEALTHY_PULLBACK"
-        ) or _strong_m15_pullback_allowed(side, "ONE_WAY_UP", risk_state, score, m15_precision)
+        ) or _strong_m15_pullback_allowed(
+            side,
+            "ONE_WAY_UP",
+            risk_state,
+            score,
+            m15_precision,
+            smart_money_phase,
+        )
     return (
         pullback_direction == "SHORT"
         and pullback_state == "HEALTHY_PULLBACK"
@@ -4441,14 +4867,21 @@ def _strong_m15_pullback_allowed(
     risk_state: str,
     score: int,
     precision: dict[str, object],
+    smart_money_phase: str = "",
 ) -> bool:
-    if score < 85 or risk_state != "NORMAL":
+    if side != PositionSide.LONG:
+        return False
+    if score < 85 or smart_money_phase != "SHORT_SQUEEZE_MARKUP":
+        return False
+    if risk_state not in {"NORMAL", "SHORT_CROWD"}:
         return False
     pullback = str(precision.get("pullback") or "")
     m15_trend = str(precision.get("trend") or "")
-    if side == PositionSide.LONG:
-        return trend_state == "ONE_WAY_UP" and m15_trend == "UP" and pullback == "M15_LONG_PULLBACK"
-    return False
+    return (
+        trend_state == "ONE_WAY_UP"
+        and m15_trend == "UP"
+        and pullback == "M15_LONG_PULLBACK"
+    )
 
 
 def _precision_stop_allowed(
@@ -4457,8 +4890,16 @@ def _precision_stop_allowed(
     risk_state: str,
     score: int,
     precision: dict[str, object],
+    smart_money_phase: str = "",
 ) -> bool:
-    return _strong_m15_pullback_allowed(side, trend_state, risk_state, score, precision)
+    return _strong_m15_pullback_allowed(
+        side,
+        trend_state,
+        risk_state,
+        score,
+        precision,
+        smart_money_phase,
+    )
 
 
 def _deleverage_short_failure_confirmed(
@@ -4611,20 +5052,22 @@ def _refine_stop_with_keltner(
         return stop
     buffer = indicator.atr14 * 0.35
     if side == PositionSide.LONG:
-        candidates = [stop]
+        candidates: list[float] = []
         if indicator.kc_lower is not None and indicator.kc_lower < entry:
             candidates.append(indicator.kc_lower - buffer)
         if trend_state in {"TREND_LONG", "ONE_WAY_UP"} and indicator.kc_mid < entry:
             candidates.append(indicator.kc_mid - buffer)
-        valid = [candidate for candidate in candidates if candidate < entry]
-        return min(valid) if valid else stop
-    candidates = [stop]
+        min_distance = _minimum_precision_stop_distance(entry, indicator)
+        valid = [candidate for candidate in candidates if candidate <= entry - min_distance]
+        return max(valid) if valid else stop
+    candidates: list[float] = []
     if indicator.kc_upper is not None and indicator.kc_upper > entry:
         candidates.append(indicator.kc_upper + buffer)
     if trend_state in {"TREND_SHORT", "ONE_WAY_DOWN"} and indicator.kc_mid > entry:
         candidates.append(indicator.kc_mid + buffer)
-    valid = [candidate for candidate in candidates if candidate > entry]
-    return max(valid) if valid else stop
+    min_distance = _minimum_precision_stop_distance(entry, indicator)
+    valid = [candidate for candidate in candidates if candidate >= entry + min_distance]
+    return min(valid) if valid else stop
 
 
 def _refine_stop_with_retest_structure(
@@ -4633,6 +5076,8 @@ def _refine_stop_with_retest_structure(
     entry: float,
     context: dict[str, object],
     indicator: IndicatorSnapshot | None,
+    *,
+    timeframe: str = "1h",
 ) -> float:
     h1 = context.get("h1_structure") if isinstance(context.get("h1_structure"), dict) else {}
     h4 = context.get("h4_structure") if isinstance(context.get("h4_structure"), dict) else {}
@@ -4640,7 +5085,24 @@ def _refine_stop_with_retest_structure(
     h1_pullback = context.get("h1_pullback") if isinstance(context.get("h1_pullback"), dict) else {}
     h1_cluster = context.get("h1_ma_cluster") if isinstance(context.get("h1_ma_cluster"), dict) else {}
     h4_cluster = context.get("h4_ma_cluster") if isinstance(context.get("h4_ma_cluster"), dict) else {}
-    relevant = _retest_structure_stop_relevant(side, h1_trigger, h1_pullback, h1_cluster, h4_cluster)
+    if timeframe == "4h":
+        h1 = {}
+        h1_cluster = {}
+        relevant = bool(
+            _short_structure_stop_candidates(entry, {}, h4, {}, h4_cluster)
+            if side == PositionSide.SHORT
+            else _long_structure_stop_candidates(entry, {}, h4, {}, h4_cluster)
+        )
+    else:
+        h4 = {}
+        h4_cluster = {}
+        relevant = _retest_structure_stop_relevant(
+            side,
+            h1_trigger,
+            h1_pullback,
+            h1_cluster,
+            {},
+        )
     if not relevant:
         return stop
     buffer = _structure_stop_buffer(entry, indicator)
@@ -4649,13 +5111,13 @@ def _refine_stop_with_retest_structure(
         candidates = _short_structure_stop_candidates(entry, h1, h4, h1_cluster, h4_cluster)
         if not candidates:
             return stop
-        structure_stop = min(candidates) + buffer
-        return max(stop, structure_stop, entry + min_distance)
+        structure_stop = max(candidates) + buffer
+        return max(structure_stop, entry + min_distance)
     candidates = _long_structure_stop_candidates(entry, h1, h4, h1_cluster, h4_cluster)
     if not candidates:
         return stop
-    structure_stop = max(candidates) - buffer
-    return min(stop, structure_stop, entry - min_distance)
+    structure_stop = min(candidates) - buffer
+    return min(structure_stop, entry - min_distance)
 
 
 def _retest_structure_stop_relevant(
@@ -4742,12 +5204,17 @@ def _refine_take_profit_with_ma_cluster(
     take_profit_1: float,
     take_profit_2: float,
     context: dict[str, object],
+    *,
+    timeframe: str = "1h",
 ) -> tuple[float, float]:
+    h1 = context.get("h1_structure") if isinstance(context.get("h1_structure"), dict) else {}
     h4 = context.get("h4_structure") if isinstance(context.get("h4_structure"), dict) else {}
     h1_cluster = context.get("h1_ma_cluster") if isinstance(context.get("h1_ma_cluster"), dict) else {}
     h4_cluster = context.get("h4_ma_cluster") if isinstance(context.get("h4_ma_cluster"), dict) else {}
-    target = _cluster_target(side, h1_cluster) or _cluster_target(side, h4_cluster)
-    horizontal = _float_or_none(h4.get("resistance" if side == PositionSide.LONG else "support"))
+    structure = h4 if timeframe == "4h" else h1
+    cluster = h4_cluster if timeframe == "4h" else h1_cluster
+    target = _cluster_target(side, cluster)
+    horizontal = _float_or_none(structure.get("resistance" if side == PositionSide.LONG else "support"))
     candidates = [value for value in (target, horizontal) if _target_is_profitable(side, entry, value)]
     if not candidates:
         return take_profit_1, take_profit_2
@@ -4905,6 +5372,10 @@ def _indicator_atr_pct(indicator: IndicatorSnapshot | None) -> float:
     if indicator is None or not indicator.close or not indicator.atr14:
         return 0.0
     return indicator.atr14 / indicator.close
+
+
+def _entry_signal_timeframe(configured_interval: str) -> str:
+    return configured_interval if configured_interval in {"1h", "4h"} else "1h"
 
 
 def _bars_for_4h(interval: str) -> int:

@@ -797,18 +797,16 @@ PAPER_DASHBOARD_HTML = """
       FUNDING_HOT: '风险：资金费率过热平仓'
     };
     const vetoText = {
-      'directional entry signal not established': '未达到82分',
+      'directional entry signal not established': '多/空方向未成立',
       'late trend stage blocks fresh entry': '趋势末段',
       'auto strategy disabled; new entries are paused': '策略已关闭',
       'symbol already has an open position': '已开仓',
-      'symbol excluded from automatic universe': '不在标的池',
       '15m tactical entry lacks a valid 15m structure stop or 1h/4h entry zone': '缺少有效止损或入场区',
       'BTC 4h extreme volatility; pause new altcoin entries': 'BTC极端波动',
       'market warm-up is still running': '行情预热中',
       'latest price is stale for more than 15 seconds': '实时价格超过15秒未更新',
       'OI/long-short ratio data is stale for more than 180 seconds': 'OI/多空比超过180秒未更新',
       'current funding rate data is stale for more than 15 minutes': '资金费率超过15分钟未更新',
-      'required multi-timeframe K-line context is missing or discontinuous': '多周期K线缺失或不连续',
       'extreme volatility: skip new long entry': '极端波动',
       'extreme volatility: skip new short entry': '极端波动',
       'long side overcrowded': '多头拥挤',
@@ -947,15 +945,13 @@ PAPER_DASHBOARD_HTML = """
         return values ? `实际盈亏比${values[1]}R，低于最低${values[2]}R` : '实际盈亏比低于最低要求';
       }
       if (reason.startsWith('final score ')) {
-        const values = reason.match(/final score (\\d+) below auto-entry minimum (\\d+)/);
-        return values ? `最终评分${values[1]}，未达到自动开仓最低${values[2]}分` : '最终评分未达到自动开仓门槛';
+        return '评分低于82';
       }
       if (reason === 'directional entry signal not established') {
         return '多空方向信号尚未成立';
       }
-      if (reason.startsWith('current entry timing is not excellent:')) {
-        const detail = reason.replace('current entry timing is not excellent:', '').trim();
-        return `当前入场时机未达到优秀${detail ? `：${tEntryTimingReason(detail)}` : ''}`;
+      if (reason.startsWith('current entry position is not excellent:')) {
+        return '当前入场位置不优秀';
       }
       if (reason === 'late trend stage blocks fresh entry') {
         return '趋势已进入末段，禁止新开仓';
@@ -965,12 +961,6 @@ PAPER_DASHBOARD_HTML = """
       }
       if (reason === 'symbol already has an open position') {
         return '该币种已有持仓，禁止重复开仓';
-      }
-      if (reason === 'symbol excluded from automatic universe') {
-        return '该币种不属于自动交易标的池';
-      }
-      if (reason.startsWith('invalid entry stop:')) {
-        return `止损结构无效：${reason.replace('invalid entry stop:', '').trim()}`;
       }
       if (reason.startsWith('available entry margin ')) {
         const values = reason.match(/available entry margin ([0-9.]+) USDT below minimum ([0-9.]+) USDT/);
@@ -999,7 +989,11 @@ PAPER_DASHBOARD_HTML = """
         return '资金费率超过15分钟未更新';
       }
       if (reason === 'required multi-timeframe K-line context is missing or discontinuous') {
-        return '多周期K线缺失或不连续，禁止新开仓';
+        return '交易周期缺失或不连续';
+      }
+      const timeframeGap = reason.match(/^(15m|1h|4h) K-line context is missing or discontinuous$/);
+      if (timeframeGap) {
+        return `${timeframeGap[1]}周期缺失或不连续`;
       }
       if (reason.startsWith('auto entry execution failed:')) {
         return `自动开仓执行失败：${reason.replace('auto entry execution failed:', '').trim()}`;
@@ -1027,22 +1021,19 @@ PAPER_DASHBOARD_HTML = """
       const reason = String(value || '').trim();
       if (!reason) return '';
       if (vetoText[reason]) return vetoText[reason];
-      if (
-        reason === 'directional entry signal not established'
-        || reason.startsWith('final score ')
-      ) {
-        return '未达到82分';
+      if (reason === 'directional entry signal not established') return '多/空方向未成立';
+      if (reason.startsWith('final score ')) return '评分低于82';
+      if (reason.startsWith('current entry position is not excellent:')) {
+        return '当前入场位置不优秀';
       }
-      if (reason.startsWith('current entry timing is not excellent:')) {
-        return '入场时机非优秀';
-      }
+      const timeframeGap = reason.match(/^(15m|1h|4h) K-line context is missing or discontinuous$/);
+      if (timeframeGap) return `${timeframeGap[1]}周期缺失或不连续`;
       if (reason.startsWith('entry reward/risk ')) {
         const minimum = (reason.match(/below minimum ([0-9.]+)R/) || [])[1] || '';
         return minimum ? `盈亏比低于${minimum}R` : '盈亏比不足';
       }
       if (reason.startsWith('available entry margin ')) return '可用保证金不足';
       if (reason.startsWith('position capacity full:')) return '持仓已满';
-      if (reason.startsWith('invalid entry stop:')) return '止损结构无效';
       if (reason.startsWith('auto entry execution failed:')) return '自动开仓执行失败';
       if (
         reason.startsWith('MA cluster dense; wait for breakout or MA20 retest')
@@ -1427,76 +1418,24 @@ PAPER_DASHBOARD_HTML = """
     function signalReasonText(signal) {
       return conciseReason(signal.reasons || [], signal, { entryLabel: '建议入场位置' });
     }
-    function signalEntryTiming(signal) {
+    function signalEntryPosition(signal) {
       if (signal.entry_timing) {
         const timingText = { GOOD: '优秀', WAIT: '等待', BLOCK: '禁止' };
         const timingClass = signal.entry_timing === 'GOOD' ? 'pos' : signal.entry_timing === 'BLOCK' ? 'neg' : 'muted';
         return `<span class="${timingClass}">${timingText[signal.entry_timing] || signal.entry_timing}</span>`;
       }
-      const vetoes = reasonList(signal.vetoes || []);
-      if (vetoes.length) return '禁止';
-      const score = Number(signal.score || 0);
       const action = String(signal.action || '');
-      const reasons = reasonList(signal.reasons || []);
-      const h1 = objectValue(signal.h1_trigger);
-      const pullback = objectValue(signal.h1_pullback);
-      const m15 = objectValue(signal.m15_precision);
-      const h1Direction = String(h1.direction || '');
-      const h1State = String(h1.state || '');
-      const pullbackDirection = String(pullback.direction || '');
-      const pullbackState = String(pullback.state || '');
-      const m15Pullback = String(m15.pullback || '');
-      const wantsLong = action === 'ENTRY_LONG' || action === 'WATCH' && reasonHas(reasons, ['EMA20 above EMA50', 'supports long', 'long']);
-      const wantsShort = action === 'ENTRY_SHORT' || action === 'WATCH' && reasonHas(reasons, ['EMA20 below EMA50', 'supports short', 'short']);
-      const longPositionReady =
-        h1Direction === 'LONG' && ['BREAKOUT', 'RETEST', 'FAKE_BREAKDOWN'].includes(h1State) ||
-        pullbackDirection === 'LONG' && ['HEALTHY_PULLBACK', 'HIGH_PULLBACK'].includes(pullbackState) ||
-        m15Pullback === 'M15_LONG_PULLBACK' ||
-        reasonHas(reasons, [
-          'close confirmed near EMA20/BOLL mid',
-          '1h BOLL/EMA pullback held',
-          'VWAP pullback held',
-          'volume pattern confirms long',
-          'breakout retest held quietly',
-          'K线突破均线密集',
-        ]);
-      const shortPositionReady =
-        h1Direction === 'SHORT' && ['BREAKDOWN', 'RETEST', 'FAKE_BREAKOUT'].includes(h1State) ||
-        pullbackDirection === 'SHORT' && ['HEALTHY_PULLBACK', 'LOW_PULLBACK'].includes(pullbackState) ||
-        reasonHas(reasons, [
-          'close confirmed failed retest',
-          '1h BOLL/EMA pullback rejected',
-          'VWAP retest rejected',
-          'volume pattern confirms short',
-          'breakdown retest rejected quietly',
-          'K线跌破均线密集',
-        ]);
-      const positionReady = wantsShort ? shortPositionReady : wantsLong ? longPositionReady : longPositionReady || shortPositionReady;
-      if (score >= 82 && positionReady) return '优秀';
-      if (score >= 82) return wantsShort ? '等反抽' : wantsLong ? '等回踩' : '等待位置';
-      if (positionReady) return '观察';
-      return '等待';
+      return action === 'ENTRY_LONG' || action === 'ENTRY_SHORT' ? '等待' : '禁止';
     }
-    function tEntryTimingReason(value) {
+    function tEntryPositionReason(value) {
       const text = String(value || '');
       const map = {
-        'entry timing not required': '无需入场时机判断',
-        'legacy signal without entry levels': '旧信号缺少入场区间，兼容通过',
-        'entry timing wait: latest price unavailable': '等待最新价格',
-        'entry timing good: strong one-way 15m pullback/rejection confirmed': '强单边，15分钟回踩/反抽确认',
-        'entry timing good: price is inside 1h/4h support, EMA/BOLL, VWAP, or retest entry zone': '价格已到1H/4H支撑、EMA/BOLL、VWAP或回踩确认区',
-        'entry timing good: price is inside 1h/4h resistance, EMA/BOLL, VWAP, or retest entry zone': '价格已到1H/4H压力、EMA/BOLL、VWAP或反抽确认区',
-        'entry timing good: 1h pullback held support/EMA/BOLL': '1H回踩支撑/EMA/BOLL不破',
-        'entry timing good: 1h bounce rejected resistance/EMA/BOLL': '1H反抽压力/EMA/BOLL失败',
-        'entry timing good: 1h retest or fake breakdown reclaimed support': '1H回踩或假跌破后收回支撑',
-        'entry timing good: 1h retest or fake breakout rejected resistance': '1H反抽或假突破后跌回压力',
-        'entry timing wait: breakout needs pullback confirmation before fresh long': '突破后等待回踩确认再做多',
-        'entry timing wait: breakdown needs resistance retest before fresh short': '跌破后等待反抽确认再做空',
-        'entry timing blocked: crowding/OI/funding risk not clean': '情绪/OI/资金费率风险不干净',
-        'entry timing blocked: late trend stage needs a new pullback': '趋势末段，等待新的回踩/反抽确认',
-        'entry timing blocked: reward/risk too low': '目标空间不足，盈亏比不够',
-        'entry timing wait: long needs 1h/4h support, EMA/BOLL, VWAP, or breakout retest': '做多等待1H/4H支撑、EMA/BOLL、VWAP或突破回踩区',
-        'entry timing wait: short needs 1h/4h resistance, EMA/BOLL, VWAP, or breakdown retest': '做空等待1H/4H压力、EMA/BOLL、VWAP或跌破反抽区'
+        'entry position wait: latest price unavailable': '等待最新价格',
+        'entry position good: live price is inside a scored long entry zone': '实时价格已进入评分认可的做多区间',
+        'entry position good: live price is inside a scored short entry zone': '实时价格已进入评分认可的做空区间',
+        'entry position wait: live price has not reached a scored long entry zone': '实时价格尚未进入评分认可的做多区间',
+        'entry position wait: live price has not reached a scored short entry zone': '实时价格尚未进入评分认可的做空区间',
+        'entry position blocked: suggested entry zone unavailable': '评分未生成有效建议入场区'
       };
       return map[text] || text;
     }
@@ -1643,11 +1582,15 @@ PAPER_DASHBOARD_HTML = """
           const reasons = s.reasons || [];
           return !(s.action === 'NO_TRADE' && reasons.includes('score below trading threshold'));
         })
-        .map(([symbol, s]) => [displaySymbol(symbol), `<span class="pill">${tAction(s.action)}</span>`, tTrendState(s.trend_state || s.regime), tRiskState(s.risk_state), tSmartMoneyPhase(s.smart_money_phase), s.score, signalEntryTiming(s), flowReasonText(signalReasonText(s)), tVetoes(s.vetoes)]);
+        .map(([symbol, s]) => [displaySymbol(symbol), `<span class="pill">${tAction(s.action)}</span>`, tTrendState(s.trend_state || s.regime), tRiskState(s.risk_state), tSmartMoneyPhase(s.smart_money_phase), s.score, signalEntryPosition(s), flowReasonText(signalReasonText(s)), tVetoes(s.vetoes)]);
       const signalsTable = document.getElementById('signals');
       const signalsScrollAnchor = captureTableScrollAnchor(signalsTable);
       signalsTable.className = 'signals-table';
-      signalsTable.innerHTML = table(['币种','动作','状态','风险','主力周期','分数','入场时机','原因','否决'], signalRows);
+      signalsTable.innerHTML = table(
+        ['币种','动作','状态','风险','主力周期','分数','入场位置','原因','否决'],
+        signalRows,
+        { 6: 'timing-col' },
+      );
       restoreTableScrollAnchor(signalsTable, signalsScrollAnchor);
       balanceSignalAndFillPanels();
       const fillHeaders = ['币种','方向','杠杆','开仓均价','平仓均价','数量','止损','止盈','收益率','实现盈亏','手续费','开仓时间','平仓时间','入场位置','出场原因'];
@@ -1680,8 +1623,8 @@ PAPER_DASHBOARD_HTML = """
       updatePnlHistory(data);
       drawPnlChart();
     }
-    function table(headers, rows) {
-      const classes = headers.map(tableClass);
+    function table(headers, rows, classOverrides = {}) {
+      const classes = headers.map((header, index) => classOverrides[index] || tableClass(header));
       if (!rows.length) return `<thead><tr>${headers.map((h, i) => `<th class="${classes[i]}">${h}</th>`).join('')}</tr></thead><tbody><tr><td colspan="${headers.length}">暂无数据</td></tr></tbody>`;
       return `<thead><tr>${headers.map((h, i) => `<th class="${classes[i]}">${h}</th>`).join('')}</tr></thead><tbody>${rows.map(row => `<tr>${row.map((v, i) => `<td class="${classes[i]}">${v}</td>`).join('')}</tr>`).join('')}</tbody>`;
     }
@@ -1758,7 +1701,6 @@ PAPER_DASHBOARD_HTML = """
     function tableClass(header) {
       if (header === '入场位置') return 'entry-position-col';
       if (header === '原因' || header === '入场原因' || header === '出场原因') return 'reason-col';
-      if (header === '入场时机') return 'timing-col';
       if (header === '否决') return 'veto-col';
       if (header.includes('时间')) return 'time-col';
       if (['价格', '入场', '现价', '成交价', '开仓均价', '平仓均价', '数量', '保证金', '净盈亏', '浮盈亏', '收益率', '止损', '止损价', '止盈', '收益率', '实现盈亏', '手续费', '分数'].includes(header)) return 'num-col';

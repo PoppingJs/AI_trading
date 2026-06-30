@@ -24,13 +24,17 @@ from ai_trading.paper import (
     _daily_bias_margin_factor,
     _daily_pnl_payload,
     _entry_reward_r,
+    _entry_signal_timeframe,
+    _entry_timeframe_for_signal,
     _entry_stop_error,
+    _exit_plan_error,
     _leverage_for_signal,
     _margin_for_signal,
     _merge_candles,
     _ma_cluster_signal_adjustment,
     _pnl_history_payload,
     _profit_drawdown_exit_reason,
+    _required_entry_timeframes,
     _preferred_exit_indicator,
     _protect_confirmed_breakout_position,
     _precision_stop_allowed,
@@ -76,6 +80,12 @@ class FakeMarketData:
         class Symbol:
             def __init__(self, symbol: str) -> None:
                 self.symbol = symbol
+                self.quote_volume = 100_000_000
+                self.price_change_percent = 5.0
+                self.last_price = 100.0
+                self.high_price = 105.0
+                self.low_price = 95.0
+                self.open_price = 99.0
 
         symbols = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XAUUSDT"] + [f"TEST{idx}USDT" for idx in range(limit)]
         return [Symbol(symbol) for symbol in symbols]
@@ -288,12 +298,13 @@ def test_live_entry_timing_rechecks_when_price_reaches_zone() -> None:
         "trend_state": "TREND_LONG",
         "risk_state": "NORMAL",
         "price": 110.0,
-        "entry_levels": {
-            "long": {
-                "h1_support": {"low": 99.0, "high": 101.0, "price": 100.0},
-            }
-        },
-    }
+            "entry_levels": {
+                "long": {
+                    "h1_support": {"low": 99.0, "high": 101.0, "price": 100.0},
+                }
+            },
+            "h1_structure": {"resistance": 105.0},
+        }
     engine._remember_mark_price("TESTUSDT", 110.0)
     engine._refresh_live_entry_timing()
     assert engine.latest_signals["TESTUSDT"]["entry_timing"] == "WAIT"
@@ -309,6 +320,7 @@ def test_transient_entry_blocks_are_removed_but_strategy_veto_remains() -> None:
         "vetoes": (
             "latest price is stale for more than 15 seconds",
             "current funding rate data is stale for more than 15 minutes",
+            "symbol excluded from automatic universe",
             "funding rate too hot for long entry",
         ),
         "entry_timing": "BLOCK",
@@ -318,8 +330,66 @@ def test_transient_entry_blocks_are_removed_but_strategy_veto_remains() -> None:
     _clear_transient_auto_entry_blocks(signal)
 
     assert signal["vetoes"] == ("funding rate too hot for long entry",)
-    assert "entry_timing" not in signal
-    assert "entry_timing_reason" not in signal
+    assert signal["entry_timing"] == "BLOCK"
+    assert signal["entry_timing_reason"] == "latest price is stale for more than 15 seconds"
+
+
+def test_data_freshness_only_requires_the_actual_entry_timeframe() -> None:
+    engine = PaperTradingEngine(
+        AppSettings(),
+        starting_balance=1000,
+        market_data=FakeMarketData(),
+    )
+    signal = {
+        "action": SignalAction.ENTRY_LONG.value,
+        "score": 90,
+        "price": 100.0,
+        "signal_timeframe": "4h",
+        "entry_levels": {
+            "long": {
+                "h4_support": {
+                    "low": 99.0,
+                    "high": 101.0,
+                    "price": 100.0,
+                }
+            }
+        },
+    }
+    now = datetime.now(UTC)
+    engine._warmup_complete = True
+    engine._price_updated_at["TESTUSDT"] = now
+    engine._oi_ratio_updated_at["TESTUSDT"] = now
+
+    assert _required_entry_timeframes(signal) == ("4h",)
+    blocks = engine._data_freshness_blocks("TESTUSDT", signal)
+    assert "4h K-line context is missing or discontinuous" in blocks
+    assert "1h K-line context is missing or discontinuous" not in blocks
+
+
+def test_excluded_symbol_is_not_added_as_an_auto_entry_veto() -> None:
+    engine = PaperTradingEngine(
+        AppSettings(),
+        starting_balance=1000,
+        market_data=FakeMarketData(),
+    )
+    engine.latest_signals["BTCUSDT"] = {
+        "action": SignalAction.ENTRY_LONG.value,
+        "score": 90,
+        "price": 100.0,
+        "entry_levels": {
+            "long": {
+                "h1_support": {
+                    "low": 99.0,
+                    "high": 101.0,
+                    "price": 100.0,
+                }
+            }
+        },
+    }
+
+    vetoes = engine.status()["latest_signals"]["BTCUSDT"]["vetoes"]
+
+    assert "symbol excluded from automatic universe" not in vetoes
 
 
 def test_stale_price_is_recorded_as_auto_entry_veto_and_clears_after_refresh() -> None:
@@ -349,6 +419,7 @@ def test_stale_price_is_recorded_as_auto_entry_veto_and_clears_after_refresh() -
                 "h1_support": {"low": 99.0, "high": 101.0, "price": 100.0},
             }
         },
+        "h1_structure": {"resistance": 105.0},
     }
 
     asyncio.run(engine._auto_trade_once())
@@ -602,6 +673,39 @@ def test_rest_fallback_refreshes_only_stale_symbols() -> None:
 
         assert market.requested == ["STALEUSDT"]
         assert engine.latest_prices["STALEUSDT"] == 101.0
+
+    asyncio.run(scenario())
+
+
+def test_rest_fallback_refreshes_price_before_stale_veto_threshold() -> None:
+    class MarkPriceMarket(FakeMarketData):
+        def __init__(self) -> None:
+            super().__init__()
+            self.requested: list[str] = []
+
+        async def mark_prices(self, symbols):
+            self.requested = list(symbols)
+            return {symbol: 101.0 for symbol in self.requested}
+
+    async def scenario() -> None:
+        market = MarkPriceMarket()
+        engine = PaperTradingEngine(
+            AppSettings(),
+            starting_balance=1000,
+            market_data=market,
+        )
+        engine.latest_signals["TESTUSDT"] = {
+            "action": "ENTRY_LONG",
+            "score": 90,
+        }
+        now = datetime.now(UTC)
+        engine._price_updated_at["TESTUSDT"] = now - timedelta(seconds=11)
+
+        await engine._refresh_rest_price_fallback(now)
+
+        assert market.requested == ["TESTUSDT"]
+        assert engine.latest_prices["TESTUSDT"] == 101.0
+        assert "latest price is stale for more than 15 seconds" not in engine._data_freshness_blocks("TESTUSDT")
 
     asyncio.run(scenario())
 
@@ -869,12 +973,16 @@ def test_breakout_protection_waits_for_real_profit_before_tightening_stop() -> N
 
 def test_precision_stop_only_allowed_for_strong_m15_tactical_pullback() -> None:
     precision = {"pullback": "M15_LONG_PULLBACK", "long_stop_anchor": 97.2, "trend": "UP"}
+    squeeze = "SHORT_SQUEEZE_MARKUP"
 
-    assert _precision_stop_allowed(PositionSide.LONG, "ONE_WAY_UP", "NORMAL", 90, precision)
-    assert not _precision_stop_allowed(PositionSide.LONG, "TREND_LONG", "NORMAL", 90, precision)
-    assert not _precision_stop_allowed(PositionSide.LONG, "ONE_WAY_UP", "LONG_CROWD", 90, precision)
-    assert not _precision_stop_allowed(PositionSide.LONG, "ONE_WAY_UP", "NORMAL", 80, precision)
-    assert not _precision_stop_allowed(PositionSide.LONG, "ONE_WAY_UP", "NORMAL", 90, {**precision, "trend": "CHOP"})
+    assert _precision_stop_allowed(PositionSide.LONG, "ONE_WAY_UP", "NORMAL", 90, precision, squeeze)
+    assert _precision_stop_allowed(PositionSide.LONG, "ONE_WAY_UP", "SHORT_CROWD", 90, precision, squeeze)
+    assert not _precision_stop_allowed(PositionSide.SHORT, "ONE_WAY_DOWN", "NORMAL", 90, precision, squeeze)
+    assert not _precision_stop_allowed(PositionSide.LONG, "ONE_WAY_UP", "NORMAL", 90, precision)
+    assert not _precision_stop_allowed(PositionSide.LONG, "TREND_LONG", "NORMAL", 90, precision, squeeze)
+    assert not _precision_stop_allowed(PositionSide.LONG, "ONE_WAY_UP", "LONG_CROWD", 90, precision, squeeze)
+    assert not _precision_stop_allowed(PositionSide.LONG, "ONE_WAY_UP", "NORMAL", 80, precision, squeeze)
+    assert not _precision_stop_allowed(PositionSide.LONG, "ONE_WAY_UP", "NORMAL", 90, {**precision, "trend": "CHOP"}, squeeze)
 
 
 def test_stop_exit_reason_explicitly_marks_stop_or_take_profit() -> None:
@@ -953,13 +1061,54 @@ def test_auto_top30_universe_refreshes_symbols() -> None:
     assert "STALEUSDT" not in engine.account.latest_signals
 
 
+def test_auto_universe_does_not_backfill_ineligible_symbols() -> None:
+    class PartiallyEligibleMarket(FakeMarketData):
+        async def top_usdt_perpetuals(self, limit: int = 30):
+            class Symbol:
+                def __init__(self, symbol: str, quote_volume: float) -> None:
+                    self.symbol = symbol
+                    self.quote_volume = quote_volume
+                    self.price_change_percent = 5.0
+                    self.last_price = 100.0
+                    self.high_price = 105.0
+                    self.low_price = 95.0
+                    self.open_price = 99.0
+
+            qualified = [
+                Symbol(f"GOOD{idx}USDT", 100_000_000)
+                for idx in range(18)
+            ]
+            rejected = [
+                Symbol(f"THIN{idx}USDT", 10_000_000)
+                for idx in range(30)
+            ]
+            return qualified + rejected
+
+    engine = PaperTradingEngine(
+        AppSettings(),
+        starting_balance=1000,
+        market_data=PartiallyEligibleMarket(),
+    )
+
+    asyncio.run(engine.refresh_universe_if_needed())
+
+    assert engine.symbols == [f"GOOD{idx}USDT" for idx in range(18)]
+    assert not any(symbol.startswith("THIN") for symbol in engine.symbols)
+
+
 def test_auto_signal_score_tiers_and_margins() -> None:
     base_signal = {
         "action": SignalAction.ENTRY_LONG.value,
         "price": 100.0,
         "entry_levels": {"long": {"h1_support": {"low": 99.0, "high": 101.0, "price": 100.0}}},
+        "h1_structure": {"resistance": 105.0},
     }
-    assert not _auto_signal_allowed({**base_signal, "score": 85, "risk_state": "LONG_CROWD"})
+    assert not _auto_signal_allowed({
+        **base_signal,
+        "score": 85,
+        "risk_state": "LONG_CROWD",
+        "vetoes": ("long side overcrowded",),
+    })
     assert _auto_signal_allowed({**base_signal, "score": 82, "risk_state": "NORMAL"})
     assert not _auto_signal_allowed({**base_signal, "score": 78, "risk_state": "FUNDING_HOT"})
     assert not _auto_signal_allowed({**base_signal, "score": 81, "risk_state": "NORMAL"})
@@ -986,7 +1135,7 @@ def test_auto_entry_prerequisites_explain_score_direction_and_timing_blocks() ->
     blocks = _auto_entry_prerequisite_blocks(wait_signal)
 
     assert "final score 81 below auto-entry minimum 82" in blocks
-    assert any(reason.startswith("current entry timing is not excellent:") for reason in blocks)
+    assert any(reason.startswith("current entry position is not excellent:") for reason in blocks)
     assert _auto_entry_prerequisite_blocks({"action": SignalAction.WATCH.value, "score": 90}) == (
         "directional entry signal not established",
     )
@@ -1000,6 +1149,7 @@ def test_status_exposes_strategy_switch_without_mutating_live_signal() -> None:
         "risk_state": "NORMAL",
         "price": 100.0,
         "entry_levels": {"long": {"h1_support": {"low": 99.0, "high": 101.0, "price": 100.0}}},
+        "h1_structure": {"resistance": 105.0},
     }
 
     status_signal = engine.status()["latest_signals"]["TESTUSDT"]
@@ -1032,14 +1182,14 @@ def test_auto_signal_requires_real_entry_zone_for_ordinary_short() -> None:
     timing, reason = _signal_entry_timing(mid_zone_short)
 
     assert timing == "WAIT"
-    assert "resistance" in reason
+    assert "scored short entry zone" in reason
     assert not _auto_signal_allowed(mid_zone_short)
 
     resistance_retest = {**mid_zone_short, "price": 261.0}
     timing, reason = _signal_entry_timing(resistance_retest)
 
     assert timing == "GOOD"
-    assert "resistance" in reason
+    assert "scored short entry zone" in reason
     assert _auto_signal_allowed(resistance_retest)
 
 
@@ -1060,7 +1210,7 @@ def test_entry_timing_turns_good_when_price_reaches_suggested_zone() -> None:
 
     timing, reason = _signal_entry_timing(signal)
     assert timing == "WAIT"
-    assert "support" in reason
+    assert "scored long entry zone" in reason
     assert not _auto_signal_allowed(signal)
 
     signal["price"] = 100.2
@@ -1072,15 +1222,15 @@ def test_entry_timing_turns_good_when_price_reaches_suggested_zone() -> None:
 
 def test_non_entry_signal_timing_is_not_excellent() -> None:
     timing, reason = _signal_entry_timing({"action": SignalAction.WATCH.value, "score": 90})
-    assert timing == "WAIT"
-    assert "watch signal" in reason
+    assert timing == "BLOCK"
+    assert "directional entry signal not established" in reason
 
     timing, reason = _signal_entry_timing({"action": SignalAction.NO_TRADE.value, "score": 90})
     assert timing == "BLOCK"
     assert "no trade signal" in reason
 
 
-def test_auto_signal_blocks_late_stage_fresh_entry() -> None:
+def test_entry_position_only_compares_price_with_zone_in_late_stage() -> None:
     late_long = {
         "action": "ENTRY_LONG",
         "score": 120,
@@ -1093,9 +1243,9 @@ def test_auto_signal_blocks_late_stage_fresh_entry() -> None:
 
     timing, reason = _signal_entry_timing(late_long)
 
-    assert timing == "BLOCK"
-    assert "late trend" in reason
-    assert not _auto_signal_allowed(late_long)
+    assert timing == "GOOD"
+    assert "scored long entry zone" in reason
+    assert _auto_signal_allowed(late_long)
 
 
 def test_entry_reward_r_requires_enough_target_space() -> None:
@@ -1109,6 +1259,142 @@ def test_entry_reward_r_requires_enough_target_space() -> None:
 
     assert _entry_reward_r(signal, PositionSide.LONG, price=100.0, stop=99.0) == 1.0
     assert _entry_reward_r(signal, PositionSide.LONG, price=100.0, stop=99.5) == 2.0
+
+
+def test_entry_reward_r_uses_target_from_entry_timeframe() -> None:
+    signal = {
+        "h1_structure": {"resistance": 101.0},
+        "h4_structure": {"resistance": 108.0},
+    }
+
+    assert _entry_reward_r(
+        signal,
+        PositionSide.LONG,
+        price=100.0,
+        stop=99.0,
+        timeframe="1h",
+    ) == 1.0
+    assert _entry_reward_r(
+        signal,
+        PositionSide.LONG,
+        price=100.0,
+        stop=96.0,
+        timeframe="4h",
+    ) == 2.0
+
+
+def test_entry_reward_r_uses_planned_target_when_structure_is_unavailable() -> None:
+    assert _entry_reward_r(
+        {},
+        PositionSide.LONG,
+        price=100.0,
+        stop=99.0,
+        timeframe="1h",
+        planned_target=101.8,
+    ) == pytest.approx(1.8)
+
+
+def test_exit_plan_postcondition_validates_stop_and_take_profit_direction() -> None:
+    assert _exit_plan_error(
+        PositionSide.LONG,
+        100.0,
+        99.0,
+        101.2,
+        102.0,
+    ) is None
+    assert _exit_plan_error(
+        PositionSide.SHORT,
+        100.0,
+        101.0,
+        98.8,
+        98.0,
+    ) is None
+    assert "invalid stop loss" in str(_exit_plan_error(
+        PositionSide.LONG,
+        100.0,
+        101.0,
+        102.0,
+        103.0,
+    ))
+    assert "take profit 1 must be above entry price" == _exit_plan_error(
+        PositionSide.LONG,
+        100.0,
+        99.0,
+        99.5,
+        102.0,
+    )
+
+
+def test_entry_timeframe_follows_zone_actually_hit() -> None:
+    signal = {
+        "score": 95,
+        "trend_state": "ONE_WAY_UP",
+        "risk_state": "NORMAL",
+        "smart_money_phase": "SHORT_SQUEEZE_MARKUP",
+        "m15_precision": {
+            "pullback": "M15_LONG_PULLBACK",
+            "long_stop_anchor": 98.0,
+            "trend": "UP",
+        },
+        "entry_levels": {
+            "long": {
+                "m15_ema20_ema60": {
+                    "low": 99.8,
+                    "high": 100.2,
+                    "price": 100.0,
+                },
+                "h1_support": {
+                    "low": 97.8,
+                    "high": 98.2,
+                    "price": 98.0,
+                },
+                "h4_support": {
+                    "low": 94.5,
+                    "high": 95.5,
+                    "price": 95.0,
+                },
+            }
+        }
+    }
+
+    assert _entry_timeframe_for_signal(
+        signal,
+        PositionSide.LONG,
+        100.0,
+    ) == "15m"
+    assert _entry_timeframe_for_signal(
+        signal,
+        PositionSide.LONG,
+        98.0,
+    ) == "1h"
+    assert _entry_timeframe_for_signal(
+        signal,
+        PositionSide.LONG,
+        95.0,
+    ) == "4h"
+    short_m15_only = {
+        "entry_levels": {
+            "short": {
+                "m15_ema20_ema60": {
+                    "low": 99.8,
+                    "high": 100.2,
+                    "price": 100.0,
+                }
+            }
+        }
+    }
+    assert _entry_timeframe_for_signal(
+        short_m15_only,
+        PositionSide.SHORT,
+        100.0,
+    ) == "1h"
+
+
+def test_strategy_signal_timeframe_is_limited_to_1h_or_4h() -> None:
+    assert _entry_signal_timeframe("15m") == "1h"
+    assert _entry_signal_timeframe("1h") == "1h"
+    assert _entry_signal_timeframe("4h") == "4h"
+    assert _entry_signal_timeframe("1d") == "1h"
 
 
 def test_auto_signal_waits_for_1h_4h_retest_in_one_way_down_short() -> None:
@@ -1129,16 +1415,17 @@ def test_auto_signal_waits_for_1h_4h_retest_in_one_way_down_short() -> None:
     timing, reason = _signal_entry_timing(signal)
 
     assert timing == "WAIT"
-    assert "1h/4h resistance" in reason
+    assert "scored short entry zone" in reason
     assert not _auto_signal_allowed(signal)
 
 
-def test_auto_signal_waits_when_m15_tactical_stop_is_noise_close() -> None:
+def test_entry_position_does_not_duplicate_m15_stop_validation() -> None:
     signal = {
         "action": "ENTRY_LONG",
         "score": 96,
         "trend_state": "ONE_WAY_UP",
         "risk_state": "NORMAL",
+        "smart_money_phase": "SHORT_SQUEEZE_MARKUP",
         "price": 100.0,
         "m15_precision": {"pullback": "M15_LONG_PULLBACK", "long_stop_anchor": 99.6, "trend": "UP"},
         "entry_levels": {
@@ -1150,9 +1437,9 @@ def test_auto_signal_waits_when_m15_tactical_stop_is_noise_close() -> None:
 
     timing, reason = _signal_entry_timing(signal)
 
-    assert timing == "WAIT"
-    assert "support" in reason
-    assert not _auto_signal_allowed(signal)
+    assert timing == "GOOD"
+    assert "scored long entry zone" in reason
+    assert _auto_signal_allowed(signal)
 
 
 def test_auto_trade_skips_m15_entry_when_stop_would_fall_back_to_wider_timeframe() -> None:
@@ -1169,6 +1456,7 @@ def test_auto_trade_skips_m15_entry_when_stop_would_fall_back_to_wider_timeframe
         "score": 96,
         "trend_state": "ONE_WAY_UP",
         "risk_state": "NORMAL",
+        "smart_money_phase": "SHORT_SQUEEZE_MARKUP",
         "price": 100.0,
         "m15_precision": {"pullback": "M15_LONG_PULLBACK", "long_stop_anchor": 98.5, "trend": "UP"},
         "entry_levels": {
@@ -1183,6 +1471,53 @@ def test_auto_trade_skips_m15_entry_when_stop_would_fall_back_to_wider_timeframe
     asyncio.run(engine._auto_trade_once())
 
     assert not engine.account.positions
+
+
+def test_auto_trade_uses_15m_only_for_short_squeeze_long() -> None:
+    engine = PaperTradingEngine(
+        AppSettings(),
+        starting_balance=1000,
+        market_data=FakeMarketData(),
+    )
+    symbol = "TESTUSDT"
+    m15_indicator = indicator_snapshot(close=100.0, atr=1.0)
+    engine.latest_prices[symbol] = 100.0
+    engine.latest_indicators[symbol] = [indicator_snapshot(close=100.0, atr=1.5)]
+    engine.latest_timeframe_indicators[symbol] = {
+        "15m": [m15_indicator],
+        "1h": [indicator_snapshot(close=100.0, atr=1.5)],
+    }
+    precision = {
+        "pullback": "M15_LONG_PULLBACK",
+        "long_stop_anchor": 98.5,
+        "trend": "UP",
+    }
+    engine.latest_timeframe_contexts[symbol] = {"m15_precision": precision}
+    engine.latest_signals[symbol] = {
+        "action": "ENTRY_LONG",
+        "score": 96,
+        "trend_state": "ONE_WAY_UP",
+        "risk_state": "SHORT_CROWD",
+        "smart_money_phase": "SHORT_SQUEEZE_MARKUP",
+        "price": 100.0,
+        "m15_precision": precision,
+        "entry_levels": {
+            "long": {
+                "m15_ema20_ema60": {
+                    "low": 99.5,
+                    "high": 100.5,
+                    "price": 100.0,
+                }
+            }
+        },
+        "h1_structure": {"resistance": 105.0},
+    }
+
+    asyncio.run(engine._auto_trade_once())
+
+    position = engine.account.positions[symbol]
+    assert position.metadata["entry_context"]["stop_timeframe"] == "15m"
+    assert position.stop_price == 98.5
 
 
 def test_multi_timeframe_context_adjusts_score_veto_and_margin() -> None:
@@ -1282,6 +1617,7 @@ def test_one_way_high_area_allows_15m_boll_ema9_pullback() -> None:
         "score": 90,
         "trend_state": "ONE_WAY_UP",
         "risk_state": "NORMAL",
+        "smart_money_phase": "SHORT_SQUEEZE_MARKUP",
         "price": 97.2,
         "reasons": (),
         "vetoes": (),
@@ -1334,6 +1670,7 @@ def test_one_way_hot_rsi_requires_1h_or_15m_pullback() -> None:
         "score": 96,
         "trend_state": "ONE_WAY_UP",
         "risk_state": "NORMAL",
+        "smart_money_phase": "SHORT_SQUEEZE_MARKUP",
         "rsi14": 88,
         "reasons": (),
         "vetoes": (),
@@ -1637,6 +1974,51 @@ def test_retest_structure_refines_short_stop_outside_resistance_and_ema60() -> N
     assert stop >= 198.6
 
 
+def test_1h_retest_stop_does_not_expand_to_4h_resistance() -> None:
+    context = {
+        "h1_structure": {
+            "resistance_zone_high": 102.0,
+            "resistance": 101.5,
+        },
+        "h4_structure": {"resistance": 112.0},
+        "h1_trigger": {"direction": "SHORT", "state": "RETEST"},
+    }
+    indicator = indicator_snapshot(close=100.0, atr=1.0)
+
+    stop = _refine_stop_with_retest_structure(
+        PositionSide.SHORT,
+        104.0,
+        100.0,
+        context,
+        indicator,
+        timeframe="1h",
+    )
+
+    assert 102.0 < stop < 112.0
+
+
+def test_4h_retest_stop_uses_4h_resistance() -> None:
+    context = {
+        "h1_structure": {"resistance": 102.0},
+        "h4_structure": {
+            "resistance_zone_high": 112.0,
+            "resistance": 111.0,
+        },
+    }
+    indicator = indicator_snapshot(close=100.0, atr=2.0)
+
+    stop = _refine_stop_with_retest_structure(
+        PositionSide.SHORT,
+        104.0,
+        100.0,
+        context,
+        indicator,
+        timeframe="4h",
+    )
+
+    assert stop > 112.0
+
+
 def test_retest_structure_refines_long_stop_outside_support_and_ema60() -> None:
     context = {
         "h1_structure": {"support_zone_low": 95.0, "support": 95.4},
@@ -1737,6 +2119,7 @@ def test_auto_trade_caps_positions_and_prefers_highest_scores() -> None:
             "trend_state": "TREND_LONG",
             "price": 100.0,
             "entry_levels": {"long": {"h1_support": {"low": 99.0, "high": 101.0, "price": 100.0}}},
+            "h1_structure": {"resistance": 105.0},
         }
 
     import asyncio
@@ -1779,8 +2162,101 @@ def test_auto_trade_backfills_slot_when_higher_score_candidate_has_low_reward_ri
 
     assert set(engine.account.positions) == {"NEXTUSDT"}
     blocked = engine.latest_signals["HIGHUSDT"]
-    assert blocked["entry_timing"] == "BLOCK"
+    assert blocked["entry_timing"] == "GOOD"
     assert any("entry reward/risk" in reason for reason in blocked["vetoes"])
+
+
+def test_auto_trade_uses_generated_take_profit_when_structure_target_is_unavailable() -> None:
+    engine = PaperTradingEngine(
+        AppSettings(),
+        starting_balance=1000,
+        market_data=FakeMarketData(),
+    )
+    engine.latest_prices["TESTUSDT"] = 100.0
+    engine.latest_signals["TESTUSDT"] = {
+        "action": "ENTRY_LONG",
+        "score": 95,
+        "trend_state": "TREND_LONG",
+        "risk_state": "NORMAL",
+        "price": 100.0,
+        "entry_levels": {
+            "long": {
+                "h1_support": {
+                    "low": 99.0,
+                    "high": 101.0,
+                    "price": 100.0,
+                }
+            }
+        },
+    }
+
+    asyncio.run(engine._auto_trade_once())
+
+    position = engine.account.positions["TESTUSDT"]
+    assert position.take_profit_1 > position.entry_price
+    assert position.take_profit_2 > position.take_profit_1
+    assert "entry reward/risk target unavailable" not in engine.latest_signals["TESTUSDT"]["vetoes"]
+
+
+def test_auto_trade_does_not_publish_partially_cleared_vetoes() -> None:
+    class BlockingMarkPriceMarket(FakeMarketData):
+        def __init__(self) -> None:
+            super().__init__()
+            self.price_requested = asyncio.Event()
+            self.release_price = asyncio.Event()
+
+        async def mark_prices(self, symbols):
+            self.price_requested.set()
+            await self.release_price.wait()
+            return {symbol: 100.0 for symbol in symbols}
+
+    async def scenario() -> None:
+        market = BlockingMarkPriceMarket()
+        engine = PaperTradingEngine(
+            AppSettings(),
+            starting_balance=1000,
+            market_data=market,
+        )
+        prior_veto = "entry reward/risk 0.80R below minimum 1.20R"
+        engine.latest_signals["TESTUSDT"] = {
+            "action": "ENTRY_LONG",
+            "score": 95,
+            "trend_state": "TREND_LONG",
+            "risk_state": "NORMAL",
+            "price": 100.0,
+            "entry_timing": "BLOCK",
+            "entry_timing_reason": prior_veto,
+            "vetoes": (prior_veto,),
+            "entry_levels": {
+                "long": {
+                    "h1_support": {
+                        "low": 99.0,
+                        "high": 101.0,
+                        "price": 100.0,
+                    }
+                }
+            },
+            "h1_structure": {
+                "resistance_zone_low": 100.5,
+                "resistance": 100.6,
+            },
+        }
+
+        task = asyncio.create_task(engine._auto_trade_once())
+        await asyncio.wait_for(market.price_requested.wait(), timeout=1)
+
+        assert engine.latest_signals["TESTUSDT"]["vetoes"] == (prior_veto,)
+        assert engine.latest_signals["TESTUSDT"]["entry_timing_reason"] == prior_veto
+
+        market.release_price.set()
+        await asyncio.wait_for(task, timeout=1)
+
+        assert any(
+            str(reason).startswith("entry reward/risk ")
+            for reason in engine.latest_signals["TESTUSDT"]["vetoes"]
+        )
+
+    asyncio.run(scenario())
 
 
 def test_auto_trade_marks_ready_candidates_blocked_after_position_capacity_is_filled() -> None:
@@ -1823,7 +2299,7 @@ def test_auto_trade_pauses_altcoin_entries_when_btc_4h_is_extreme() -> None:
     asyncio.run(engine._auto_trade_once())
 
     assert not engine.account.positions
-    assert engine.latest_signals["TESTUSDT"]["entry_timing"] == "BLOCK"
+    assert engine.latest_signals["TESTUSDT"]["entry_timing"] == "GOOD"
     assert "BTC 4h extreme volatility; pause new altcoin entries" in engine.latest_signals["TESTUSDT"]["vetoes"]
 
 
@@ -1850,6 +2326,7 @@ def test_auto_trade_rotates_weak_position_for_much_stronger_candidate() -> None:
         "risk_state": "NORMAL",
         "price": 100.0,
         "entry_levels": {"long": {"h1_support": {"low": 99.0, "high": 101.0, "price": 100.0}}},
+        "h1_structure": {"resistance": 105.0},
     }
     engine.latest_indicators["TEST5USDT"] = [indicator_snapshot(close=100.0, atr=1.0, volume_ratio=1.5)]
 
