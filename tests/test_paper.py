@@ -1833,6 +1833,46 @@ def test_15m_take_profit_is_rebuilt_from_final_15m_stop() -> None:
     ) == 2.0
 
 
+@pytest.mark.parametrize(
+    ("side", "target", "expected_tp1"),
+    (
+        (PositionSide.LONG, 100.01, 100.005),
+        (PositionSide.SHORT, 99.99, 99.995),
+    ),
+)
+def test_near_structure_target_keeps_tp1_between_entry_and_tp2(
+    side: PositionSide,
+    target: float,
+    expected_tp1: float,
+) -> None:
+    structure = (
+        {"resistance": target}
+        if side == PositionSide.LONG
+        else {"support": target}
+    )
+
+    take_profit_1, take_profit_2 = _take_profits_for_final_stop(
+        {"h1_structure": structure},
+        side,
+        100.0,
+        99.0 if side == PositionSide.LONG else 101.0,
+        timeframe="1h",
+    )
+
+    assert take_profit_1 == pytest.approx(expected_tp1)
+    assert take_profit_2 == pytest.approx(target)
+    assert (
+        _exit_plan_error(
+            side,
+            100.0,
+            99.0 if side == PositionSide.LONG else 101.0,
+            take_profit_1,
+            take_profit_2,
+        )
+        is None
+    )
+
+
 def test_1h_take_profit_does_not_borrow_a_4h_structure_target() -> None:
     signal = {
         "h4_structure": {"support": 95.0},

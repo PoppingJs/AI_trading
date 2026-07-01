@@ -3413,7 +3413,7 @@ def _take_profits_for_final_stop(
             2.0,
         )
     target_r = abs(target - entry_price) / risk_distance
-    first_r = min(1.0, max(target_r * 0.5, 0.1))
+    first_r = min(1.0, target_r * 0.5)
     take_profit_1 = _take_profit_from_r(
         side,
         entry_price,
