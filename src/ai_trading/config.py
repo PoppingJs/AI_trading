@@ -67,7 +67,7 @@ class StrategySettings:
 class RiskSettings:
     leverage_default: int = 5
     leverage_max: int = 10
-    risk_per_trade: float = 0.005
+    risk_per_trade: float = 0.01
     single_symbol_margin_limit: float = 0.10
     total_margin_limit: float = 0.35
     max_open_positions: int = 5

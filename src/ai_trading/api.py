@@ -702,7 +702,7 @@ PAPER_DASHBOARD_HTML = """
       'washout confirmed: upside wick swept resistance, OI dropped, close rejected key level': '洗盘确认：上插针扫过压力，OI下降，收盘跌回关键位',
       'downside sweep reclaimed support; stop-run filter favors long': '下插针扫损后收回支撑，偏向做多',
       'upside sweep rejected resistance; stop-run filter favors short': '上插针扫损后跌回压力，偏向做空',
-      'upper wick sweep rejected; avoid chasing long': '上插针回落，禁止追多',
+      'upper wick sweep rejected; avoid chasing long': '上插针跌回，禁止追多',
       'lower wick sweep reclaimed; avoid chasing short': '下插针收回，禁止追空',
       'extreme volatility: skip new long entry': '极端波动，禁止新开多单',
       'extreme volatility: skip new short entry': '极端波动，禁止新开空单',
@@ -714,6 +714,10 @@ PAPER_DASHBOARD_HTML = """
       '1d bearish bias supports short': '日线偏空，支持做空',
       '4h structure supports upside': '4小时结构支持上行',
       '4h structure supports downside': '4小时结构支持下行',
+      'stage 1 high distribution: only a tiny short at a confirmed prior-high rejection': '第一阶段高位派发：仅在前高明确受阻时轻仓试空',
+      'stage 2 descending distribution: short only at the projected lower-high trendline': '第二阶段阶梯派发：仅在下降顶点趋势线附近做空',
+      'stage 3 markdown acceleration: 1h/4h EMA/BOLL bounce rejection is eligible': '第三阶段加速主跌：允许在1H/4H EMA或BOLL反抽受阻时做空',
+      '1h EMA20/EMA60 repeatedly breached; promote entry, stop, and target to 4h': '1H均线结构多次被刺穿，入场、止损和止盈统一升级到4H',
       '4h OI deleverage with price breakdown; avoid long entry': '4小时 OI 大幅去杠杆且价格破位，禁止做多',
       '4h OI deleveraged but 1h BOLL/EMA held; allow small long only': '4小时 OI 大幅去杠杆但1小时中轨/EMA守住，只允许小仓多',
       '4h OI deleveraged while long/short ratio rose; 1h support held, only tiny long allowed': '4小时 OI 大跌且多空比上升，1小时支撑守住，仅允许极小仓多',
@@ -819,8 +823,8 @@ PAPER_DASHBOARD_HTML = """
       'RSI oversold for short entry': 'RSI超卖',
       'price closed above upper BOLL; no chase': '价格突破BOLL上轨',
       'price closed below lower BOLL; no chase': '价格跌破BOLL下轨',
-      'upper wick sweep rejected; avoid chasing long': '上插针回落',
-      'lower wick sweep reclaimed; avoid chasing short': '下插针收回',
+      'upper wick sweep rejected; avoid chasing long': '上插针跌回，禁止追多',
+      'lower wick sweep reclaimed; avoid chasing short': '下插针收回，禁止追空',
       'smart money accumulation after OI flush; avoid chasing shorts': 'OI爆减后疑似吸筹',
       'short crowd is vulnerable to a squeeze': '空头拥挤，逼空风险',
       'smart money distribution after upper wick sweeps': '上插针后疑似派发',
@@ -1034,6 +1038,8 @@ PAPER_DASHBOARD_HTML = """
       }
       if (reason.startsWith('available entry margin ')) return '可用保证金不足';
       if (reason.startsWith('position capacity full:')) return '持仓已满';
+      const reentryWait = reason.match(/^waiting for new (15m|1h|4h) closed candle after stop loss$/);
+      if (reentryWait) return `止损后等待新的${reentryWait[1]}收盘K线`;
       if (reason.startsWith('auto entry execution failed:')) return '自动开仓执行失败';
       if (
         reason.startsWith('MA cluster dense; wait for breakout or MA20 retest')
@@ -1326,6 +1332,11 @@ PAPER_DASHBOARD_HTML = """
       const levels = entrySideLevels(signal, direction);
       const candidates = [];
       if (direction === '多头') {
+        if (String(signal.entry_timeframe_override || '') === '4h') {
+          addEntryCandidate(candidates, '4H支撑回踩不破', levels.h4_support);
+          addEntryCandidate(candidates, '4H BOLL中轨趋势回踩', levels.h4_boll_mid);
+          addEntryCandidate(candidates, '4H EMA20或EMA60趋势回踩', levels.h4_ema20_ema60);
+        }
         if (isOneWayUp && has15mConfirm) addEntryCandidate(candidates, '强单边15m EMA20/EMA60回踩收回', levels.m15_ema20_ema60);
         if (hasDownsideSweep) addEntryCandidate(candidates, '下插针扫损后重新收回支撑', levels.sweep_reclaim_support);
         if (hasOiValley) addEntryCandidate(candidates, 'OI洼地止跌放量回稳', levels.oi_valley_recovery);
@@ -1340,6 +1351,7 @@ PAPER_DASHBOARD_HTML = """
             addEntryCandidate(candidates, '强单边15m EMA20/EMA60回踩收回', levels.m15_ema20_ema60);
             addEntryCandidate(candidates, '1H/4H EMA20或EMA60回踩不破', levels.h1_ema20_ema60);
             addEntryCandidate(candidates, '4H EMA20或EMA60趋势回踩', levels.h4_ema20_ema60);
+            addEntryCandidate(candidates, '4H BOLL中轨趋势回踩', levels.h4_boll_mid);
           } else {
             addEntryCandidate(candidates, '1H支撑回踩不破', levels.h1_support);
             addEntryCandidate(candidates, '1H BOLL中轨回踩不破', levels.h1_boll_mid);
@@ -1348,6 +1360,13 @@ PAPER_DASHBOARD_HTML = """
           addEntryCandidate(candidates, '均线密集区突破或回踩MA20不破', levels.ma_cluster_breakout || levels.ma20_retest);
         }
       } else if (direction === '空头') {
+        const distributionStage = String(signal.distribution_short_stage || '');
+        if (distributionStage === 'HIGH_DISTRIBUTION_RANGE') {
+          addEntryCandidate(candidates, '第一阶段：高位派发箱体上沿小仓试空', levels.distribution_range_high);
+        }
+        if (distributionStage === 'DESCENDING_DISTRIBUTION') {
+          addEntryCandidate(candidates, '第二阶段：下降顶点趋势线反抽做空', levels.descending_high_trendline);
+        }
         if (hasUpsideSweep) addEntryCandidate(candidates, '上插针扫空后重新跌回压力', levels.sweep_reject_resistance);
         if (hasOiValley) addEntryCandidate(candidates, '高位OI下降横盘涨不动', levels.oi_distribution);
         if (hasVwapShort) addEntryCandidate(candidates, 'VWAP/成交密集区反抽不过', levels.vwap_retest);
@@ -1435,6 +1454,8 @@ PAPER_DASHBOARD_HTML = """
         'entry position good: live price is inside a scored short entry zone': '实时价格已进入评分认可的做空区间',
         'entry position wait: live price has not reached a scored long entry zone': '实时价格尚未进入评分认可的做多区间',
         'entry position wait: live price has not reached a scored short entry zone': '实时价格尚未进入评分认可的做空区间',
+        'entry position wait: long entry zone touched; waiting for midpoint reclaim': '已进入做多区间，等待重新站上区间中位',
+        'entry position wait: short entry zone touched; waiting for midpoint rejection': '已进入做空区间，等待重新跌回区间中位',
         'entry position blocked: suggested entry zone unavailable': '评分未生成有效建议入场区'
       };
       return map[text] || text;

@@ -11,6 +11,9 @@ from ai_trading.api import create_app
 from ai_trading.config import AppSettings
 from ai_trading.models import Candle, IndicatorSnapshot, PositionSide, SignalAction
 from ai_trading.paper import (
+    DISTRIBUTION_STAGE_DESCENDING,
+    DISTRIBUTION_STAGE_MARKDOWN,
+    DISTRIBUTION_STAGE_RANGE,
     MARKET_PRICE_STALE_SECONDS,
     PaperStateError,
     PaperTradingEngine,
@@ -21,9 +24,13 @@ from ai_trading.paper import (
     _auto_entry_prerequisite_blocks,
     _auto_signal_allowed,
     _confirmed_structure_exit_reason,
+    _current_open_risk_usdt,
     _daily_bias_margin_factor,
     _daily_pnl_payload,
+    _distribution_short_stage,
+    _distribution_short_structure,
     _entry_reward_r,
+    _ema20_ema60_band,
     _entry_signal_timeframe,
     _entry_timeframe_for_signal,
     _entry_stop_error,
@@ -32,6 +39,7 @@ from ai_trading.paper import (
     _margin_for_signal,
     _merge_candles,
     _ma_cluster_signal_adjustment,
+    _one_hour_ema_reliability,
     _pnl_history_payload,
     _profit_drawdown_exit_reason,
     _required_entry_timeframes,
@@ -40,15 +48,20 @@ from ai_trading.paper import (
     _precision_stop_allowed,
     _refine_stop_with_ma_cluster,
     _refine_stop_with_precision,
+    _refine_stop_with_distribution_stage,
     _refine_stop_with_retest_structure,
     _refine_take_profit_with_ma_cluster,
     _pyramid_allowed,
     _rotation_candidate_allowed,
     _risk_exit_reason,
+    _risk_sized_margin,
+    _scored_entry_levels,
     _signal_entry_timing,
     _stop_exit_reason,
     _structure_take_profit_reason,
+    _take_profits_for_final_stop,
     _update_position_excursions,
+    _update_entry_position_fields,
 )
 
 
@@ -148,6 +161,84 @@ def test_paper_engine_manual_long_close_profit() -> None:
     assert engine.status()["equity"] > 1000
 
 
+def test_take_profit_1_partially_closes_and_moves_stop_above_break_even() -> None:
+    engine = PaperTradingEngine(AppSettings(), starting_balance=1000, market_data=FakeMarketData())
+    asyncio.run(
+        engine.open_position(
+            "TESTUSDT",
+            "LONG",
+            margin_usdt=100,
+            leverage=5,
+            stop_loss=98.0,
+            take_profit_1=102.0,
+            take_profit_2=104.0,
+        )
+    )
+    engine.latest_prices["TESTUSDT"] = 102.0
+    engine.latest_signals["TESTUSDT"] = {
+        "action": SignalAction.ENTRY_LONG.value,
+        "score": 90,
+        "trend_state": "TREND_LONG",
+        "risk_state": "NORMAL",
+        "vetoes": (),
+    }
+
+    engine._manage_open_positions()
+
+    position = engine.account.positions["TESTUSDT"]
+    assert position.first_tp_done
+    assert position.remaining_fraction == pytest.approx(0.65)
+    assert position.metadata["margin_usdt"] == pytest.approx(65.0)
+    assert position.stop_price > position.entry_price
+    assert engine.account.fills[-1].action == "PARTIAL_CLOSE"
+    assert engine.account.fills[-1].reason == "take profit: target 1 reached"
+
+
+def test_stop_loss_requires_new_entry_timeframe_candle_before_reentry() -> None:
+    engine = PaperTradingEngine(AppSettings(), starting_balance=1000, market_data=FakeMarketData())
+    candle_time = datetime(2026, 7, 1, 0, 0, tzinfo=UTC)
+    engine._timeframe_candles["TESTUSDT"] = {
+        "1h": [
+            Candle(
+                timestamp=candle_time,
+                open=100.0,
+                high=101.0,
+                low=99.0,
+                close=100.0,
+                volume=1000.0,
+            )
+        ]
+    }
+    asyncio.run(
+        engine.open_position(
+            "TESTUSDT",
+            "LONG",
+            margin_usdt=100,
+            leverage=5,
+            stop_loss=98.0,
+            take_profit_1=102.0,
+            take_profit_2=104.0,
+            entry_context={"stop_timeframe": "1h"},
+        )
+    )
+    position = engine.account.positions["TESTUSDT"]
+
+    engine._close_position_unlocked(position, 98.0, "stop loss: test")
+
+    assert engine._reentry_block_reason("TESTUSDT") == "waiting for new 1h closed candle after stop loss"
+    engine._timeframe_candles["TESTUSDT"]["1h"].append(
+        Candle(
+            timestamp=candle_time + timedelta(hours=1),
+            open=98.0,
+            high=99.0,
+            low=97.0,
+            close=98.5,
+            volume=1000.0,
+        )
+    )
+    assert engine._reentry_block_reason("TESTUSDT") is None
+
+
 def test_paper_status_pnl_components_reconcile_to_total() -> None:
     market = FakeMarketData()
     engine = PaperTradingEngine(AppSettings(), starting_balance=1000, market_data=market)
@@ -162,6 +253,27 @@ def test_paper_status_pnl_components_reconcile_to_total() -> None:
     status = engine.status()
     components = status["realized_pnl"] + status["unrealized_pnl"] - status["fees_paid"]
     assert components == pytest.approx(status["total_pnl"])
+
+
+def test_open_position_strategy_signal_only_shows_already_open_veto() -> None:
+    engine = PaperTradingEngine(AppSettings(), starting_balance=1000, market_data=FakeMarketData())
+    asyncio.run(engine.open_position("TESTUSDT", "LONG", margin_usdt=100, leverage=5))
+    engine.latest_signals["TESTUSDT"] = {
+        "action": SignalAction.ENTRY_LONG.value,
+        "score": 70,
+        "entry_timing": "WAIT",
+        "entry_timing_reason": "high area without pullback confirmation",
+        "vetoes": (
+            "high area without pullback confirmation; wait for 1h/4h pullback before long",
+            "final score 70 below auto-entry minimum 82",
+            "current entry position is not excellent",
+        ),
+    }
+    engine.running = True
+
+    signal = engine.status()["latest_signals"]["TESTUSDT"]
+
+    assert signal["vetoes"] == ("symbol already has an open position",)
 
 
 def test_closed_fill_preserves_actual_auto_entry_position() -> None:
@@ -1220,6 +1332,408 @@ def test_entry_timing_turns_good_when_price_reaches_suggested_zone() -> None:
     assert _auto_signal_allowed(signal)
 
 
+def test_entry_position_requires_midpoint_reclaim_inside_scored_zone() -> None:
+    signal = {
+        "timestamp": "2026-07-01T00:00:00+00:00",
+        "action": SignalAction.ENTRY_LONG.value,
+        "score": 90,
+        "trend_state": "TREND_LONG",
+        "risk_state": "NORMAL",
+        "entry_confirmation_required": True,
+        "price": 100.7,
+        "entry_levels": {
+            "long": {
+                "h1_support": {
+                    "low": 99.0,
+                    "high": 101.0,
+                    "price": 100.0,
+                }
+            }
+        },
+    }
+
+    _update_entry_position_fields(signal)
+    assert signal["entry_timing"] == "WAIT"
+
+    signal["price"] = 99.8
+    _update_entry_position_fields(signal)
+    assert signal["entry_timing"] == "WAIT"
+
+    signal["price"] = 100.2
+    _update_entry_position_fields(signal)
+    assert signal["entry_timing"] == "GOOD"
+
+
+def test_entry_position_rejects_aave_like_lower_single_indicator_zone() -> None:
+    signal = {
+        "timestamp": "2026-06-28T07:00:00+00:00",
+        "action": SignalAction.ENTRY_SHORT.value,
+        "score": 96,
+        "trend_state": "TREND_SHORT",
+        "risk_state": "NORMAL",
+        "entry_confirmation_required": True,
+        "price": 90.93,
+        "entry_levels": {
+            "short": {
+                "h1_boll_mid": {
+                    "low": 93.8,
+                    "high": 94.8,
+                    "price": 94.3,
+                },
+                "h1_ema20_ema60": {
+                    "low": 93.7,
+                    "high": 94.7,
+                    "price": 94.2,
+                },
+                "h4_ema20_ema60": {
+                    "low": 90.4,
+                    "high": 91.3,
+                    "price": 90.85,
+                },
+                "oi_distribution": {
+                    "low": 90.15,
+                    "high": 91.71,
+                    "price": 90.93,
+                },
+            }
+        },
+    }
+
+    _update_entry_position_fields(signal)
+    assert signal["entry_timing"] == "WAIT"
+
+    signal["price"] = 94.5
+    _update_entry_position_fields(signal)
+    assert signal["entry_timing"] == "WAIT"
+
+    signal["price"] = 94.1
+    _update_entry_position_fields(signal)
+    assert signal["entry_timing"] == "GOOD"
+
+
+def test_separated_ema20_and_ema60_do_not_create_a_bridge_entry_zone() -> None:
+    indicator = indicator_snapshot(
+        close=90.93,
+        atr=1.0,
+        ema20=94.0,
+    )
+
+    zone = _ema20_ema60_band(
+        indicator,
+        {"ema60": 91.5},
+    )
+
+    assert zone == {
+        "low": pytest.approx(93.55),
+        "high": pytest.approx(94.45),
+        "price": 94.0,
+    }
+
+
+def test_oi_context_does_not_become_a_standalone_suggested_entry_zone() -> None:
+    levels = {
+        "short": {
+            "h1_resistance": {
+                "low": 93.8,
+                "high": 94.8,
+                "price": 94.3,
+            },
+            "oi_distribution": {
+                "low": 90.15,
+                "high": 91.71,
+                "price": 90.93,
+            },
+        }
+    }
+    selected = _scored_entry_levels(
+        {
+            "action": SignalAction.ENTRY_SHORT.value,
+            "signal_timeframe": "1h",
+            "reasons": ("4h OI drained while price stalled",),
+        },
+        levels,
+    )
+
+    assert "oi_distribution" not in selected["short"]
+    assert selected["short"]["h1_resistance"]["price"] == 94.3
+
+
+def test_distribution_short_lifecycle_has_three_distinct_stages() -> None:
+    signal = {
+        "smart_money_phase": "DISTRIBUTION_EXIT",
+        "trend_state": "TREND_SHORT",
+    }
+    base_context = {
+        "distribution_short": {
+            "active": True,
+            "range_high_zone": {"low": 94.0, "high": 95.0, "price": 94.5},
+            "descending_trendline_zone": None,
+        },
+        "h4_structure": {"state": "BOX_LOWER_HALF"},
+        "h1_trigger": {"direction": "NONE", "state": "WAIT"},
+        "h4_oi": {"state": "DELEVERAGE_WAIT"},
+    }
+
+    assert _distribution_short_stage(signal, base_context) == DISTRIBUTION_STAGE_RANGE
+
+    descending_context = {
+        **base_context,
+        "distribution_short": {
+            **base_context["distribution_short"],
+            "descending_trendline_zone": {
+                "low": 92.5,
+                "high": 93.2,
+                "price": 92.85,
+            },
+        },
+    }
+    assert (
+        _distribution_short_stage(signal, descending_context)
+        == DISTRIBUTION_STAGE_DESCENDING
+    )
+
+    markdown_context = {
+        **descending_context,
+        "h4_structure": {"state": "BREAKDOWN_DOWN"},
+        "h4_oi": {"state": "DELEVERAGE_BREAKDOWN"},
+    }
+    assert (
+        _distribution_short_stage(signal, markdown_context)
+        == DISTRIBUTION_STAGE_MARKDOWN
+    )
+
+
+def test_distribution_structure_projects_the_latest_lower_high_line() -> None:
+    start = datetime(2026, 6, 28, tzinfo=UTC)
+    candles = [
+        Candle(
+            timestamp=start + timedelta(hours=index),
+            open=98.0,
+            high=100.0,
+            low=96.0,
+            close=98.0,
+            volume=1000.0,
+        )
+        for index in range(20)
+    ]
+    candles[5] = Candle(
+        timestamp=candles[5].timestamp,
+        open=106.0,
+        high=110.0,
+        low=104.0,
+        close=106.0,
+        volume=1000.0,
+    )
+    candles[10] = Candle(
+        timestamp=candles[10].timestamp,
+        open=103.0,
+        high=106.0,
+        low=101.0,
+        close=103.0,
+        volume=1000.0,
+    )
+    candles[15] = Candle(
+        timestamp=candles[15].timestamp,
+        open=101.0,
+        high=103.0,
+        low=99.0,
+        close=101.0,
+        volume=1000.0,
+    )
+    structure = _distribution_short_structure(
+        candles,
+        [indicator_snapshot(close=98.0, atr=1.0) for _ in candles],
+        {"drop_from_high_pct": -0.10},
+        AppSettings(),
+    )
+
+    assert structure["active"]
+    line = structure["descending_trendline_zone"]
+    assert line["price"] == pytest.approx(100.6)
+    assert line["low"] == pytest.approx(100.2)
+    assert line["high"] == pytest.approx(101.0)
+
+
+def test_distribution_stages_switch_the_only_eligible_short_entry_zone() -> None:
+    levels = {
+        "short": {
+            "distribution_range_high": {
+                "low": 94.0,
+                "high": 95.0,
+                "price": 94.5,
+            },
+            "descending_high_trendline": {
+                "low": 92.5,
+                "high": 93.2,
+                "price": 92.85,
+            },
+            "h1_boll_mid": {
+                "low": 89.5,
+                "high": 90.5,
+                "price": 90.0,
+            },
+            "h1_ema20_ema60": {
+                "low": 89.8,
+                "high": 90.8,
+                "price": 90.3,
+            },
+        }
+    }
+    base_signal = {
+        "action": SignalAction.ENTRY_SHORT.value,
+        "smart_money_phase": "DISTRIBUTION_EXIT",
+        "reasons": (
+            "smart money distribution: repeated upper wicks with OI falling after markup",
+        ),
+    }
+
+    stage_1 = _scored_entry_levels(
+        {
+            **base_signal,
+            "distribution_short_stage": DISTRIBUTION_STAGE_RANGE,
+        },
+        levels,
+    )
+    assert set(stage_1["short"]) == {"distribution_range_high"}
+
+    stage_2 = _scored_entry_levels(
+        {
+            **base_signal,
+            "distribution_short_stage": DISTRIBUTION_STAGE_DESCENDING,
+        },
+        levels,
+    )
+    assert set(stage_2["short"]) == {"descending_high_trendline"}
+
+    stage_3 = _scored_entry_levels(
+        {
+            **base_signal,
+            "distribution_short_stage": DISTRIBUTION_STAGE_MARKDOWN,
+        },
+        levels,
+    )
+    assert set(stage_3["short"]) == {
+        "h1_boll_mid",
+        "h1_ema20_ema60",
+    }
+
+
+def test_stage_one_distribution_short_is_penalized_and_tiny() -> None:
+    signal = {
+        "action": SignalAction.ENTRY_SHORT.value,
+        "score": 100,
+        "trend_state": "TREND_SHORT",
+        "risk_state": "NORMAL",
+        "smart_money_phase": "DISTRIBUTION_EXIT",
+        "reasons": (
+            "smart money distribution: repeated upper wicks with OI falling after markup",
+        ),
+        "vetoes": (),
+    }
+    context = {
+        "daily_bias": "NEUTRAL",
+        "h4_structure": {"state": "BOX_UPPER_HALF"},
+        "h1_structure": {},
+        "h4_ma_cluster": {},
+        "h1_ma_cluster": {},
+        "h4_oi": {
+            "state": "DELEVERAGE_WAIT",
+            "drop_from_high_pct": -0.10,
+        },
+        "h1_trigger": {"direction": "NONE", "state": "WAIT"},
+        "h1_pullback": {"direction": "NONE", "state": "WAIT"},
+        "distribution_short": {
+            "active": True,
+            "range_high_zone": {
+                "low": 94.0,
+                "high": 95.0,
+                "price": 94.5,
+            },
+            "descending_trendline_zone": None,
+        },
+        "m15_precision": {},
+        "entry_levels": {
+            "short": {
+                "distribution_range_high": {
+                    "low": 94.0,
+                    "high": 95.0,
+                    "price": 94.5,
+                },
+                "h1_ema20_ema60": {
+                    "low": 90.0,
+                    "high": 91.0,
+                    "price": 90.5,
+                },
+            }
+        },
+        "summary": "test",
+    }
+
+    adjusted = _apply_multi_timeframe_context(signal, context)
+
+    assert adjusted["distribution_short_stage"] == DISTRIBUTION_STAGE_RANGE
+    assert adjusted["leverage_cap"] == 3
+    assert adjusted["margin_factor"] == 0.25
+    assert adjusted["score"] <= 92
+    assert set(adjusted["entry_levels"]["short"]) == {
+        "distribution_range_high"
+    }
+
+
+def test_distribution_stage_stop_sits_above_the_active_price_structure() -> None:
+    signal = {
+        "distribution_short_stage": DISTRIBUTION_STAGE_DESCENDING,
+        "entry_levels": {
+            "short": {
+                "descending_high_trendline": {
+                    "low": 92.5,
+                    "high": 93.2,
+                    "price": 92.85,
+                }
+            }
+        },
+    }
+
+    refined = _refine_stop_with_distribution_stage(
+        PositionSide.SHORT,
+        98.0,
+        92.8,
+        signal,
+        indicator_snapshot(close=92.8, atr=1.0),
+    )
+
+    assert refined == 93.2
+
+
+def test_new_signal_version_requires_a_fresh_zone_reclaim() -> None:
+    signal = {
+        "timestamp": "2026-07-01T00:00:00+00:00",
+        "action": SignalAction.ENTRY_LONG.value,
+        "score": 90,
+        "trend_state": "TREND_LONG",
+        "risk_state": "NORMAL",
+        "entry_confirmation_required": True,
+        "price": 100.0,
+        "entry_levels": {
+            "long": {
+                "h1_support": {
+                    "low": 99.0,
+                    "high": 101.0,
+                    "price": 100.0,
+                }
+            }
+        },
+    }
+    _update_entry_position_fields(signal)
+    _update_entry_position_fields(signal)
+    assert signal["entry_timing"] == "GOOD"
+
+    signal["timestamp"] = "2026-07-01T01:00:00+00:00"
+    _update_entry_position_fields(signal)
+
+    assert signal["entry_timing"] == "WAIT"
+
+
 def test_non_entry_signal_timing_is_not_excellent() -> None:
     timing, reason = _signal_entry_timing({"action": SignalAction.WATCH.value, "score": 90})
     assert timing == "BLOCK"
@@ -1292,6 +1806,77 @@ def test_entry_reward_r_uses_planned_target_when_structure_is_unavailable() -> N
         timeframe="1h",
         planned_target=101.8,
     ) == pytest.approx(1.8)
+
+
+def test_15m_take_profit_is_rebuilt_from_final_15m_stop() -> None:
+    signal = {
+        "h1_structure": {"resistance": 120.0},
+    }
+
+    take_profit_1, take_profit_2 = _take_profits_for_final_stop(
+        signal,
+        PositionSide.LONG,
+        100.0,
+        98.0,
+        timeframe="15m",
+    )
+
+    assert take_profit_1 == 102.0
+    assert take_profit_2 == 104.0
+    assert _entry_reward_r(
+        signal,
+        PositionSide.LONG,
+        100.0,
+        98.0,
+        timeframe="15m",
+        planned_target=take_profit_2,
+    ) == 2.0
+
+
+def test_1h_take_profit_does_not_borrow_a_4h_structure_target() -> None:
+    signal = {
+        "h4_structure": {"support": 95.0},
+    }
+
+    take_profit_1, take_profit_2 = _take_profits_for_final_stop(
+        signal,
+        PositionSide.SHORT,
+        100.0,
+        101.0,
+        timeframe="1h",
+    )
+
+    assert take_profit_1 == 99.0
+    assert take_profit_2 == 98.0
+
+
+def test_risk_sized_margin_keeps_wide_and_narrow_stops_at_same_loss_budget() -> None:
+    wide_margin, wide_risk = _risk_sized_margin(
+        equity=1200.0,
+        available=1200.0,
+        remaining_total_margin=936.0,
+        current_open_risk_usdt=0.0,
+        risk_per_trade=0.01,
+        risk_factor=1.0,
+        entry_price=0.01239,
+        stop_price=0.01089,
+        leverage=5,
+    )
+    narrow_margin, narrow_risk = _risk_sized_margin(
+        equity=1200.0,
+        available=1200.0,
+        remaining_total_margin=936.0,
+        current_open_risk_usdt=0.0,
+        risk_per_trade=0.01,
+        risk_factor=1.0,
+        entry_price=1.848,
+        stop_price=1.801,
+        leverage=5,
+    )
+
+    assert wide_margin < narrow_margin
+    assert wide_risk == pytest.approx(12.0)
+    assert narrow_risk == pytest.approx(12.0)
 
 
 def test_exit_plan_postcondition_validates_stop_and_take_profit_direction() -> None:
@@ -1388,6 +1973,174 @@ def test_entry_timeframe_follows_zone_actually_hit() -> None:
         PositionSide.SHORT,
         100.0,
     ) == "1h"
+
+
+def test_repeated_1h_ema_sweeps_mark_the_timeframe_unreliable() -> None:
+    start = datetime(2026, 6, 26, tzinfo=UTC)
+    candles = [
+        Candle(
+            timestamp=start + timedelta(hours=index),
+            open=100.0,
+            high=101.0,
+            low=100.0,
+            close=100.0,
+            volume=1000.0,
+        )
+        for index in range(70)
+    ]
+    for index in (52, 60):
+        candles[index] = Candle(
+            timestamp=candles[index].timestamp,
+            open=100.0,
+            high=101.0,
+            low=98.0,
+            close=100.0,
+            volume=1000.0,
+        )
+    reliability = _one_hour_ema_reliability(
+        candles,
+        [
+            indicator_snapshot(
+                close=100.0,
+                atr=1.0,
+                ema20=100.0,
+            )
+            for _ in candles
+        ],
+    )
+
+    assert reliability["state"] == "UNRELIABLE"
+    assert reliability["ema20_breach_episodes"] == 2
+    assert reliability["ema60_breach_episodes"] == 1
+
+
+def test_unreliable_1h_long_promotes_entry_stop_and_target_to_4h() -> None:
+    signal = {
+        "action": SignalAction.ENTRY_LONG.value,
+        "score": 92,
+        "trend_state": "TREND_LONG",
+        "risk_state": "NORMAL",
+        "smart_money_phase": "NONE",
+        "reasons": (),
+        "vetoes": (),
+        "price": 95.0,
+    }
+    context = {
+        "daily_bias": "NEUTRAL",
+        "h4_structure": {"state": "BOX_UPPER_HALF"},
+        "h1_structure": {},
+        "h4_ma_cluster": {},
+        "h1_ma_cluster": {},
+        "h4_oi": {"state": "NORMAL"},
+        "h1_trigger": {"direction": "NONE", "state": "WAIT"},
+        "h1_pullback": {"direction": "NONE", "state": "WAIT"},
+        "h1_ema_reliability": {
+            "state": "UNRELIABLE",
+            "ema20_breach_episodes": 2,
+            "ema60_breach_episodes": 1,
+        },
+        "distribution_short": {"active": False},
+        "m15_precision": {},
+        "entry_levels": {
+            "long": {
+                "h1_support": {
+                    "low": 98.0,
+                    "high": 99.0,
+                    "price": 98.5,
+                },
+                "h4_support": {
+                    "low": 94.5,
+                    "high": 95.5,
+                    "price": 95.0,
+                },
+                "h4_boll_mid": {
+                    "low": 94.6,
+                    "high": 95.4,
+                    "price": 95.0,
+                },
+                "h4_ema20_ema60": {
+                    "low": 94.7,
+                    "high": 95.3,
+                    "price": 95.0,
+                },
+            }
+        },
+        "summary": "test",
+    }
+
+    adjusted = _apply_multi_timeframe_context(signal, context)
+
+    assert adjusted["entry_timeframe_override"] == "4h"
+    assert set(adjusted["entry_levels"]["long"]) == {
+        "h4_support",
+        "h4_boll_mid",
+        "h4_ema20_ema60",
+    }
+    assert (
+        _entry_timeframe_for_signal(
+            adjusted,
+            PositionSide.LONG,
+            95.0,
+        )
+        == "4h"
+    )
+
+
+def test_short_squeeze_long_keeps_the_15m_tactical_exception() -> None:
+    signal = {
+        "action": SignalAction.ENTRY_LONG.value,
+        "score": 92,
+        "trend_state": "ONE_WAY_UP",
+        "risk_state": "NORMAL",
+        "smart_money_phase": "SHORT_SQUEEZE_MARKUP",
+        "reasons": (),
+        "vetoes": (),
+        "price": 100.0,
+    }
+    context = {
+        "daily_bias": "NEUTRAL",
+        "h4_structure": {"state": "BOX_UPPER_HALF"},
+        "h1_structure": {},
+        "h4_ma_cluster": {},
+        "h1_ma_cluster": {},
+        "h4_oi": {"state": "NORMAL"},
+        "h1_trigger": {"direction": "NONE", "state": "WAIT"},
+        "h1_pullback": {"direction": "NONE", "state": "WAIT"},
+        "h1_ema_reliability": {"state": "UNRELIABLE"},
+        "distribution_short": {"active": False},
+        "m15_precision": {
+            "pullback": "M15_LONG_PULLBACK",
+            "trend": "UP",
+            "long_stop_anchor": 98.5,
+        },
+        "entry_levels": {
+            "long": {
+                "m15_ema20_ema60": {
+                    "low": 99.5,
+                    "high": 100.5,
+                    "price": 100.0,
+                },
+                "h4_support": {
+                    "low": 94.5,
+                    "high": 95.5,
+                    "price": 95.0,
+                },
+            }
+        },
+        "summary": "test",
+    }
+
+    adjusted = _apply_multi_timeframe_context(signal, context)
+
+    assert "entry_timeframe_override" not in adjusted
+    assert (
+        _entry_timeframe_for_signal(
+            adjusted,
+            PositionSide.LONG,
+            100.0,
+        )
+        == "15m"
+    )
 
 
 def test_strategy_signal_timeframe_is_limited_to_1h_or_4h() -> None:
@@ -1535,6 +2288,7 @@ def test_multi_timeframe_context_adjusts_score_veto_and_margin() -> None:
     }
 
     adjusted = _apply_multi_timeframe_context(signal, context)
+    _update_entry_position_fields(adjusted)
 
     assert adjusted["score"] == 64
     assert "1h trigger opposes long entry" in adjusted["vetoes"]
@@ -1559,6 +2313,7 @@ def test_multi_timeframe_healthy_pullback_adds_score() -> None:
     }
 
     adjusted = _apply_multi_timeframe_context(signal, context)
+    _update_entry_position_fields(adjusted)
 
     assert adjusted["score"] == 103
     assert "1h BOLL/EMA pullback held with clean risk" in adjusted["reasons"]
@@ -1606,6 +2361,7 @@ def test_high_area_long_allows_retest_confirmation() -> None:
     }
 
     adjusted = _apply_multi_timeframe_context(signal, context)
+    _update_entry_position_fields(adjusted)
 
     assert "high area without pullback confirmation; wait for 1h/4h pullback before long" not in adjusted["vetoes"]
     assert _auto_signal_allowed(adjusted)
@@ -1633,6 +2389,7 @@ def test_one_way_high_area_allows_15m_boll_ema9_pullback() -> None:
     }
 
     adjusted = _apply_multi_timeframe_context(signal, context)
+    _update_entry_position_fields(adjusted)
 
     assert "high area without pullback confirmation; wait for 1h/4h pullback before long" not in adjusted["vetoes"]
     assert "one-way uptrend 15m BOLL/EMA9 pullback confirmed; allow tactical long" in adjusted["reasons"]
@@ -1691,6 +2448,7 @@ def test_one_way_hot_rsi_requires_1h_or_15m_pullback() -> None:
 
     blocked = _apply_multi_timeframe_context(signal, no_pullback_context)
     allowed = _apply_multi_timeframe_context(signal, pullback_context)
+    _update_entry_position_fields(allowed)
 
     assert "one-way uptrend RSI hot without 1h/15m pullback; wait before long" in blocked["vetoes"]
     assert not _auto_signal_allowed(blocked)
@@ -2126,13 +2884,15 @@ def test_auto_trade_caps_positions_and_prefers_highest_scores() -> None:
 
     asyncio.run(engine._auto_trade_once())
 
-    assert len(engine.account.positions) == 5
+    assert len(engine.account.positions) == 4
     assert "TEST0USDT" not in engine.account.positions
-    assert set(engine.account.positions) == {"TEST1USDT", "TEST2USDT", "TEST3USDT", "TEST4USDT", "TEST5USDT"}
-    used_margin = sum(float(position.metadata["margin_usdt"]) for position in engine.account.positions.values())
-    assert 760 <= used_margin <= 790
-    assert engine.status()["available_balance"] >= 200
-    assert engine.account.positions["TEST5USDT"].metadata["margin_usdt"] >= 180
+    assert set(engine.account.positions) == {"TEST1USDT", "TEST3USDT", "TEST4USDT", "TEST5USDT"}
+    total_risk = sum(
+        abs(position.entry_price - position.stop_price) * position.quantity
+        for position in engine.account.positions.values()
+    )
+    assert total_risk <= 40.0 + 1e-6
+    assert engine.status()["available_balance"] >= 600
 
 
 def test_auto_trade_backfills_slot_when_higher_score_candidate_has_low_reward_risk() -> None:
@@ -2310,7 +3070,13 @@ def test_auto_trade_rotates_weak_position_for_much_stronger_candidate() -> None:
     import asyncio
 
     for idx in range(5):
-        asyncio.run(engine.open_position(f"TEST{idx}USDT", "LONG", margin_usdt=100, leverage=5))
+        asyncio.run(engine.open_position(
+            f"TEST{idx}USDT",
+            "LONG",
+            margin_usdt=100,
+            leverage=5,
+            stop_loss=99.0,
+        ))
         engine.account.positions[f"TEST{idx}USDT"].opened_at = datetime.now(UTC) - timedelta(hours=1)
         engine.latest_signals[f"TEST{idx}USDT"] = {
             "score": 75 + idx,
