@@ -35,11 +35,15 @@ from ai_trading.paper import (
     _entry_timeframe_for_signal,
     _entry_stop_error,
     _exit_plan_error,
+    _four_hour_oi_valley,
+    _high_distribution_handoff,
+    _high_distribution_handoff_exit_reason,
     _leverage_for_signal,
     _margin_for_signal,
     _merge_candles,
     _ma_cluster_signal_adjustment,
     _one_hour_ema_reliability,
+    _oi_valley_short_exit_reason,
     _pnl_history_payload,
     _profit_drawdown_exit_reason,
     _required_entry_timeframes,
@@ -60,6 +64,7 @@ from ai_trading.paper import (
     _stop_exit_reason,
     _structure_take_profit_reason,
     _take_profits_for_final_stop,
+    _tighten_short_support_stop,
     _update_position_excursions,
     _update_entry_position_fields,
 )
@@ -111,6 +116,8 @@ def indicator_snapshot(
     volume_ratio: float = 1.5,
     ema20: float = 100.0,
     oi_change: float | None = None,
+    open_interest: float | None = None,
+    long_short_ratio: float | None = None,
 ) -> IndicatorSnapshot:
     return IndicatorSnapshot(
         timestamp=datetime(2026, 1, 1, tzinfo=UTC),
@@ -128,6 +135,8 @@ def indicator_snapshot(
         volume_ratio=volume_ratio,
         ema50_slope=0.1,
         oi_change=oi_change,
+        open_interest=open_interest,
+        long_short_ratio=long_short_ratio,
     )
 
 
@@ -632,6 +641,36 @@ def test_closed_candle_cache_ignores_open_bar_and_merges_incrementally() -> None
 
     assert [candle.timestamp.minute for candle in closed] == [30, 45]
     assert merged == closed
+
+
+@pytest.mark.parametrize(
+    ("timeframe", "duration"),
+    (("1h", timedelta(hours=1)), ("4h", timedelta(hours=4))),
+)
+def test_directional_timeframes_ignore_the_open_bar(
+    timeframe: str,
+    duration: timedelta,
+) -> None:
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    now = start + duration * 2 + timedelta(seconds=6)
+    candles = [
+        Candle(
+            timestamp=start + duration * index,
+            open=100.0,
+            high=101.0,
+            low=99.0,
+            close=100.0 + index,
+            volume=1000.0,
+        )
+        for index in range(3)
+    ]
+
+    closed = _closed_candles(candles, timeframe, now)
+
+    assert [candle.timestamp for candle in closed] == [
+        start,
+        start + duration,
+    ]
 
 
 def test_disabled_entries_still_manage_and_close_existing_position() -> None:
@@ -1458,6 +1497,362 @@ def test_oi_context_does_not_become_a_standalone_suggested_entry_zone() -> None:
     assert selected["short"]["h1_resistance"]["price"] == 94.3
 
 
+def test_ma_cluster_breakdown_is_direction_evidence_not_a_short_entry_zone() -> None:
+    levels = {
+        "short": {
+            "ma_cluster_breakdown": {
+                "low": 0.42585,
+                "high": 0.473416,
+                "price": 0.449633,
+            },
+            "h1_resistance": {
+                "low": 0.41743,
+                "high": 0.42457,
+                "price": 0.421,
+            },
+        },
+    }
+
+    selected = _scored_entry_levels(
+        {
+            "action": SignalAction.ENTRY_SHORT.value,
+            "signal_timeframe": "1h",
+            "reasons": ("MA cluster breakdown down",),
+        },
+        levels,
+    )
+
+    assert "ma_cluster_breakdown" not in selected["short"]
+    assert set(selected["short"]) == {"h1_resistance"}
+
+
+def test_high_distribution_handoff_distinguishes_weak_price_from_healthy_recovery() -> None:
+    start = datetime(2026, 6, 29, 12, tzinfo=UTC)
+    candles = [
+        Candle(
+            timestamp=start + timedelta(hours=index),
+            open=100.0,
+            high=101.0,
+            low=99.0,
+            close=100.0,
+            volume=1000.0,
+        )
+        for index in range(20)
+    ]
+    candles[14] = Candle(
+        timestamp=candles[14].timestamp,
+        open=108.0,
+        high=110.0,
+        low=108.0,
+        close=109.0,
+        volume=1800.0,
+    )
+    candles[19] = Candle(
+        timestamp=candles[19].timestamp,
+        open=106.0,
+        high=106.5,
+        low=104.5,
+        close=105.0,
+        volume=1200.0,
+    )
+    oi_values = [
+        1080.0 + index
+        for index in range(20)
+    ]
+    oi_values[14:20] = [
+        1100.0,
+        1090.0,
+        1094.0,
+        1098.0,
+        1100.0,
+        1102.0,
+    ]
+    ratios = [1.18 for _ in candles]
+    ratios[14] = 1.20
+    ratios[19] = 1.25
+    indicators = [
+        indicator_snapshot(
+            close=candle.close,
+            ema20=106.0,
+            open_interest=oi,
+            long_short_ratio=ratio,
+        )
+        for candle, oi, ratio in zip(candles, oi_values, ratios)
+    ]
+
+    handoff = _high_distribution_handoff(candles, indicators)
+
+    assert handoff["state"] == "CONFIRMED"
+    assert handoff["oi_rebuilt"]
+    assert handoff["price_failed"]
+    assert handoff["ratio_shifted_to_longs"]
+
+    healthy_candles = list(candles)
+    healthy_candles[19] = Candle(
+        timestamp=candles[19].timestamp,
+        open=108.5,
+        high=109.8,
+        low=108.2,
+        close=109.5,
+        volume=1200.0,
+    )
+    healthy_indicators = [
+        indicator_snapshot(
+            close=candle.close,
+            ema20=106.0,
+            open_interest=oi,
+            long_short_ratio=1.19 if index == 19 else ratio,
+        )
+        for index, (candle, oi, ratio) in enumerate(
+            zip(healthy_candles, oi_values, ratios)
+        )
+    ]
+    assert (
+        _high_distribution_handoff(
+            healthy_candles,
+            healthy_indicators,
+        )["state"]
+        == "WATCH"
+    )
+
+
+def test_high_distribution_handoff_vetoes_new_long_and_waits_for_stage_two_short() -> None:
+    handoff = {"state": "CONFIRMED"}
+    context = {
+        "daily_bias": "NEUTRAL",
+        "h4_structure": {"state": "BOX_LOWER_HALF"},
+        "h1_structure": {},
+        "h4_ma_cluster": {},
+        "h1_ma_cluster": {},
+        "h4_oi": {"state": "NORMAL"},
+        "h1_trigger": {"direction": "NONE", "state": "WAIT"},
+        "h1_pullback": {"direction": "NONE", "state": "WAIT"},
+        "h1_ema_reliability": {"state": "RELIABLE"},
+        "high_distribution_handoff": handoff,
+        "distribution_short": {
+            "active": False,
+            "descending_trendline_zone": None,
+        },
+        "m15_precision": {},
+        "entry_levels": {"long": {}, "short": {}},
+        "summary": "test",
+    }
+    adjusted_long = _apply_multi_timeframe_context(
+        {
+            "action": SignalAction.ENTRY_LONG.value,
+            "score": 96,
+            "trend_state": "TREND_LONG",
+            "risk_state": "NORMAL",
+            "reasons": (),
+            "vetoes": (),
+        },
+        context,
+    )
+
+    assert (
+        "high distribution handoff complete; avoid new long"
+        in adjusted_long["vetoes"]
+    )
+    assert (
+        _distribution_short_stage(
+            {
+                "action": SignalAction.ENTRY_SHORT.value,
+                "trend_state": "TREND_SHORT",
+            },
+            context,
+        )
+        == DISTRIBUTION_STAGE_DESCENDING
+    )
+
+
+def test_profitable_long_exits_after_high_distribution_handoff_completes() -> None:
+    engine = PaperTradingEngine(
+        AppSettings(),
+        starting_balance=1000,
+        market_data=FakeMarketData(),
+    )
+    position = asyncio.run(
+        engine.open_position(
+            "TESTUSDT",
+            "LONG",
+            margin_usdt=100,
+            leverage=5,
+            stop_loss=98.0,
+            take_profit_1=102.0,
+            take_profit_2=104.0,
+        )
+    )
+    position.metadata["max_favorable_distance"] = 2.1
+
+    reason = _high_distribution_handoff_exit_reason(
+        position,
+        {"high_distribution_handoff": {"state": "CONFIRMED"}},
+    )
+
+    assert reason == "take profit: high distribution handoff complete"
+
+
+def test_four_hour_oi_valley_requires_retail_carry_capitulation_and_rebuild() -> None:
+    start = datetime(2026, 6, 25, tzinfo=UTC)
+    closes = [100.0, 98.0, 96.0, 94.0, 92.0, 90.0, 88.0, 87.5, 88.0, 89.0]
+    oi_values = [1000.0, 990.0, 980.0, 970.0, 960.0, 950.0, 900.0, 902.0, 906.0, 912.0]
+    ratios = [1.0, 1.05, 1.10, 1.16, 1.24, 1.32, 1.36, 1.38, 1.40, 1.42]
+    candles = [
+        Candle(
+            timestamp=start + timedelta(hours=4 * index),
+            open=close + 0.5,
+            high=close + 1.0,
+            low=close - 1.0,
+            close=close,
+            volume=1000.0,
+        )
+        for index, close in enumerate(closes)
+    ]
+    indicators = [
+        indicator_snapshot(
+            close=close,
+            open_interest=oi,
+            long_short_ratio=ratio,
+        )
+        for close, oi, ratio in zip(closes, oi_values, ratios)
+    ]
+
+    valley = _four_hour_oi_valley(
+        candles,
+        indicators,
+        AppSettings(),
+    )
+
+    assert valley["state"] == "CONFIRMED"
+    assert valley["retail_long_carry"]
+    assert valley["carry_price_change_pct"] < 0
+    assert valley["carry_oi_change_pct"] < 0
+    assert valley["carry_long_short_ratio_change_pct"] > 0
+    assert valley["flush_pct"] == pytest.approx((950.0 - 900.0) / 950.0)
+    assert valley["rebuild_pct"] == pytest.approx((912.0 - 900.0) / 900.0)
+
+    no_rebuild_indicators = list(indicators)
+    no_rebuild_indicators[-1] = indicator_snapshot(
+        close=closes[-1],
+        open_interest=905.0,
+        long_short_ratio=ratios[-1],
+    )
+    assert (
+        _four_hour_oi_valley(
+            candles,
+            no_rebuild_indicators,
+            AppSettings(),
+        )["state"]
+        == "WATCH"
+    )
+
+    oi_did_not_decline = [
+        indicator_snapshot(
+            close=close,
+            open_interest=oi,
+            long_short_ratio=ratio,
+        )
+        for close, oi, ratio in zip(
+            closes,
+            [900.0, 910.0, 920.0, 930.0, 940.0, 950.0, 900.0, 902.0, 906.0, 912.0],
+            ratios,
+        )
+    ]
+    no_retail_carry = _four_hour_oi_valley(
+        candles,
+        oi_did_not_decline,
+        AppSettings(),
+    )
+    assert no_retail_carry["state"] == "WATCH"
+    assert not no_retail_carry["retail_long_carry"]
+
+
+def test_confirmed_four_hour_oi_valley_exits_short_and_needs_wick_for_long() -> None:
+    engine = PaperTradingEngine(
+        AppSettings(),
+        starting_balance=1000,
+        market_data=FakeMarketData(),
+    )
+    short_position = asyncio.run(
+        engine.open_position(
+            "TESTUSDT",
+            "SHORT",
+            margin_usdt=100,
+            leverage=5,
+            stop_loss=102.0,
+            take_profit_1=98.0,
+            take_profit_2=96.0,
+        )
+    )
+    assert _oi_valley_short_exit_reason(
+        short_position,
+        {"h4_oi_valley": {"state": "CONFIRMED"}},
+    ) == "take profit: 4h OI valley formed; downside trend exhausted"
+
+    context = {
+        "daily_bias": "NEUTRAL",
+        "h4_structure": {"state": "BOX_LOWER_HALF"},
+        "h1_structure": {"support": 99.0, "support_zone_low": 98.5, "support_zone_high": 99.5},
+        "h4_ma_cluster": {},
+        "h1_ma_cluster": {},
+        "h4_oi": {"state": "NORMAL"},
+        "h4_oi_valley": {"state": "CONFIRMED"},
+        "h1_trigger": {"direction": "LONG", "state": "FAKE_BREAKDOWN"},
+        "h1_pullback": {"direction": "NONE", "state": "WAIT"},
+        "h1_ema_reliability": {"state": "RELIABLE"},
+        "high_distribution_handoff": {"state": "WATCH"},
+        "distribution_short": {"active": False},
+        "m15_precision": {},
+        "entry_levels": {
+            "long": {
+                "sweep_reclaim_support": {
+                    "low": 98.5,
+                    "high": 99.5,
+                    "price": 99.0,
+                }
+            },
+            "short": {},
+        },
+        "summary": "test",
+    }
+    adjusted_long = _apply_multi_timeframe_context(
+        {
+            "action": SignalAction.ENTRY_LONG.value,
+            "score": 82,
+            "trend_state": "TREND_LONG",
+            "risk_state": "NORMAL",
+            "reasons": (
+                "downside sweep reclaimed support; stop-run filter favors long",
+            ),
+            "vetoes": (),
+            "price": 99.0,
+        },
+        context,
+    )
+    assert (
+        "4h OI valley formed after retail capitulation; downside wick reclaimed support"
+        in adjusted_long["reasons"]
+    )
+    assert "sweep_reclaim_support" in adjusted_long["entry_levels"]["long"]
+
+    adjusted_short = _apply_multi_timeframe_context(
+        {
+            "action": SignalAction.ENTRY_SHORT.value,
+            "score": 96,
+            "trend_state": "TREND_SHORT",
+            "risk_state": "NORMAL",
+            "reasons": (),
+            "vetoes": (),
+            "price": 99.0,
+        },
+        context,
+    )
+    assert (
+        "4h OI valley confirmed; downside trend exhaustion blocks new short"
+        in adjusted_short["vetoes"]
+    )
+
+
 def test_distribution_short_lifecycle_has_three_distinct_stages() -> None:
     signal = {
         "smart_money_phase": "DISTRIBUTION_EXIT",
@@ -2212,6 +2607,55 @@ def test_auto_signal_waits_for_1h_4h_retest_in_one_way_down_short() -> None:
     assert not _auto_signal_allowed(signal)
 
 
+def test_short_at_or_below_closed_h1_boll_lower_waits_for_bounce() -> None:
+    signal = {
+        "action": "ENTRY_SHORT",
+        "score": 96,
+        "trend_state": "ONE_WAY_DOWN",
+        "risk_state": "NORMAL",
+        "price": 97.8,
+        "entry_guardrails": {"h1_boll_lower": 98.0},
+        "entry_levels": {
+            "short": {
+                "breakdown_retest": {
+                    "low": 97.5,
+                    "high": 99.5,
+                    "price": 98.5,
+                },
+            },
+        },
+    }
+
+    timing, reason = _signal_entry_timing(signal)
+
+    assert timing == "WAIT"
+    assert "1h BOLL lower" in reason
+
+
+def test_short_above_h1_boll_lower_can_use_scored_retest_zone() -> None:
+    signal = {
+        "action": "ENTRY_SHORT",
+        "score": 96,
+        "trend_state": "ONE_WAY_DOWN",
+        "risk_state": "NORMAL",
+        "price": 98.5,
+        "entry_guardrails": {"h1_boll_lower": 98.0},
+        "entry_levels": {
+            "short": {
+                "breakdown_retest": {
+                    "low": 97.5,
+                    "high": 99.5,
+                    "price": 98.5,
+                },
+            },
+        },
+    }
+
+    timing, _ = _signal_entry_timing(signal)
+
+    assert timing == "GOOD"
+
+
 def test_entry_position_does_not_duplicate_m15_stop_validation() -> None:
     signal = {
         "action": "ENTRY_LONG",
@@ -2585,7 +3029,7 @@ def test_multi_timeframe_high_pullback_with_distribution_risk_vetoes_long() -> N
     assert not _auto_signal_allowed(adjusted)
 
 
-def test_oi_deleverage_hold_long_caps_leverage_and_margin() -> None:
+def test_oi_deleverage_hold_long_is_only_an_event_until_valley_rebuild() -> None:
     signal = {
         "action": "ENTRY_LONG",
         "score": 95,
@@ -2604,13 +3048,15 @@ def test_oi_deleverage_hold_long_caps_leverage_and_margin() -> None:
 
     adjusted = _apply_multi_timeframe_context(signal, context)
 
-    assert adjusted["leverage_cap"] == 5
-    assert adjusted["margin_factor"] == 0.5
-    assert _daily_bias_margin_factor("LONG", adjusted) == 0.5
-    assert min(_leverage_for_signal(adjusted["score"], 10, "ONE_WAY_UP"), adjusted["leverage_cap"]) == 5
+    assert "leverage_cap" not in adjusted
+    assert "margin_factor" not in adjusted
+    assert (
+        "4h OI sharp drop is an event, not a confirmed OI valley; wait for OI rebuilding and downside-wick reclaim"
+        in adjusted["reasons"]
+    )
 
 
-def test_oi_deleverage_with_long_short_ratio_rising_allows_tiny_long_only() -> None:
+def test_oi_deleverage_with_long_short_ratio_rising_vetoes_long_during_retail_carry() -> None:
     signal = {
         "action": "ENTRY_LONG",
         "score": 95,
@@ -2631,7 +3077,11 @@ def test_oi_deleverage_with_long_short_ratio_rising_allows_tiny_long_only() -> N
 
     assert adjusted["leverage_cap"] == 3
     assert adjusted["margin_factor"] == 0.3
-    assert "4h OI deleveraged while long/short ratio rose; 1h support held, only tiny long allowed" in adjusted["reasons"]
+    assert (
+        "4h OI dropped while long/short ratio rose; retail longs are carrying the decline"
+        in adjusted["vetoes"]
+    )
+    assert not _auto_signal_allowed(adjusted)
 
 
 def test_weak_oi_rebound_vetoes_long_pullback() -> None:
@@ -2659,7 +3109,7 @@ def test_weak_oi_rebound_vetoes_long_pullback() -> None:
     assert not _auto_signal_allowed(adjusted)
 
 
-def test_weak_oi_rebound_with_ma_pressure_improves_short() -> None:
+def test_weak_oi_rebound_with_ma_pressure_does_not_use_oi_to_improve_short() -> None:
     signal = {
         "action": "ENTRY_SHORT",
         "score": 82,
@@ -2681,7 +3131,11 @@ def test_weak_oi_rebound_with_ma_pressure_improves_short() -> None:
 
     adjusted = _apply_multi_timeframe_context(signal, context)
 
-    assert "OI drained, rebound volume weak, and 1h/MA resistance rejected; short candidate improved" in adjusted["reasons"]
+    assert (
+        "4h OI sharp drop is not an OI valley and does not confirm a short entry"
+        in adjusted["reasons"]
+    )
+    assert not any("OI drained" in reason for reason in adjusted["reasons"])
     assert adjusted["score"] > signal["score"]
 
 
@@ -2714,11 +3168,14 @@ def test_oi_deleverage_breakdown_vetoes_long_and_waits_for_short_retest() -> Non
 
     assert "4h OI deleverage with price breakdown; avoid long entry" in adjusted_long["vetoes"]
     assert not _auto_signal_allowed(adjusted_long)
-    assert "4h OI deleverage breakdown; wait for resistance retest or upper-wick rejection before short" in adjusted_short["vetoes"]
+    assert (
+        "low area without 1h/4h resistance retest; wait for higher-timeframe bounce before short"
+        in adjusted_short["vetoes"]
+    )
     assert not _auto_signal_allowed(adjusted_short)
 
 
-def test_oi_deleverage_breakdown_improves_short_after_failed_bounce() -> None:
+def test_oi_deleverage_breakdown_does_not_add_oi_short_score_after_failed_bounce() -> None:
     short_signal = {
         "action": "ENTRY_SHORT",
         "score": 80,
@@ -2737,7 +3194,11 @@ def test_oi_deleverage_breakdown_improves_short_after_failed_bounce() -> None:
 
     adjusted_short = _apply_multi_timeframe_context(short_signal, context)
 
-    assert "4h OI deleverage breakdown with failed bounce; short candidate improved" in adjusted_short["reasons"]
+    assert (
+        "4h OI sharp drop is not an OI valley and does not confirm a short entry"
+        in adjusted_short["reasons"]
+    )
+    assert not any("OI deleverage breakdown with failed bounce" in reason for reason in adjusted_short["reasons"])
     assert adjusted_short["score"] > short_signal["score"]
 
 
@@ -2755,6 +3216,38 @@ def test_fifteen_minute_precision_keeps_wider_stop_when_anchor_too_close() -> No
     assert _refine_stop_with_precision(PositionSide.SHORT, 104.0, {"short_stop_anchor": 100.4}, 100.0, indicator) == 104.0
     assert _refine_stop_with_precision(PositionSide.LONG, 96.0, {"long_stop_anchor": 98.4}, 100.0, indicator) == 98.4
     assert _refine_stop_with_precision(PositionSide.SHORT, 104.0, {"short_stop_anchor": 101.6}, 100.0, indicator) == 101.6
+
+
+def test_short_support_stop_waits_until_position_reached_one_r() -> None:
+    engine = PaperTradingEngine(
+        AppSettings(),
+        starting_balance=1000,
+        market_data=FakeMarketData(),
+    )
+    position = asyncio.run(
+        engine.open_position(
+            "TESTUSDT",
+            "SHORT",
+            margin_usdt=100,
+            leverage=5,
+            stop_loss=105.0,
+            take_profit_1=95.0,
+            take_profit_2=90.0,
+        )
+    )
+    indicator = indicator_snapshot(close=98.0, atr=1.0, ema20=100.0)
+
+    _update_position_excursions(position, 98.0)
+    _tighten_short_support_stop(position, 98.0, {}, indicator)
+
+    assert position.stop_price == 105.0
+    assert not position.metadata.get("short_support_protected")
+
+    _update_position_excursions(position, 95.0)
+    _tighten_short_support_stop(position, 95.0, {}, indicator)
+
+    assert position.stop_price == pytest.approx(99.35)
+    assert position.metadata["short_support_protected"]
 
 
 def test_retest_structure_refines_short_stop_outside_resistance_and_ema60() -> None:

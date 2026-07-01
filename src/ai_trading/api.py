@@ -658,7 +658,7 @@ PAPER_DASHBOARD_HTML = """
       'open interest spike risks liquidation sweep': 'OI 异常暴增，存在扫损/爆仓风险',
       'price closed above upper BOLL; no chase': '价格收在布林上轨外，禁止追高',
       'price closed below lower BOLL; no chase': '价格收在布林下轨外，禁止追空',
-      'smart money accumulation: OI flushed into a 4h pocket, then rebuilt while price recovered': '主力吸筹：4小时 OI 爆减形成洼地，随后 OI 回升且价格修复',
+      'smart money accumulation: OI flushed into a 4h pocket, then rebuilt while price recovered': '主力吸筹：4H OI骤减到冰点后重新回升，确认形成OI洼地且价格修复',
       'smart money accumulation after OI flush; avoid chasing shorts': 'OI 爆减后疑似吸筹，避免追空',
       'short squeeze markup: price and OI rise while long/short ratio falls, shorts are being trapped': '逼空拉升：价格和 OI 同升，多空比下降，空头开始被套',
       'short crowd is vulnerable to a squeeze': '空头拥挤，存在被继续拉升爆空风险',
@@ -718,6 +718,11 @@ PAPER_DASHBOARD_HTML = """
       'stage 2 descending distribution: short only at the projected lower-high trendline': '第二阶段阶梯派发：仅在下降顶点趋势线附近做空',
       'stage 3 markdown acceleration: 1h/4h EMA/BOLL bounce rejection is eligible': '第三阶段加速主跌：允许在1H/4H EMA或BOLL反抽受阻时做空',
       '1h EMA20/EMA60 repeatedly breached; promote entry, stop, and target to 4h': '1H均线结构多次被刺穿，入场、止损和止盈统一升级到4H',
+      'high distribution handoff complete: OI rebuilt while price failed and long/short ratio rose': '高位换手完成：OI已回补但价格未恢复，多空比继续上升',
+      '4h OI sharp drop is an event, not a confirmed OI valley; wait for OI rebuilding and downside-wick reclaim': '4H OI骤减只是事件，尚未形成洼地；等待OI从冰点回升并出现下插针收回',
+      '4h OI valley formed after retail capitulation; downside wick reclaimed support': '4H散户集中割肉后OI从冰点回升形成洼地，下插针已收回支撑',
+      '4h OI valley formed; wait for a downside-wick support reclaim before long': '4H OI洼地已经形成，等待下插针收回支撑后再做多',
+      '4h OI sharp drop is not an OI valley and does not confirm a short entry': '4H OI骤减不等于OI洼地，也不用于确认做空',
       '4h OI deleverage with price breakdown; avoid long entry': '4小时 OI 大幅去杠杆且价格破位，禁止做多',
       '4h OI deleveraged but 1h BOLL/EMA held; allow small long only': '4小时 OI 大幅去杠杆但1小时中轨/EMA守住，只允许小仓多',
       '4h OI deleveraged while long/short ratio rose; 1h support held, only tiny long allowed': '4小时 OI 大跌且多空比上升，1小时支撑守住，仅允许极小仓多',
@@ -751,6 +756,8 @@ PAPER_DASHBOARD_HTML = """
       'structure break stop': '结构破位止损',
       'ATR volatility stop': 'ATR波动止损',
       'take profit: target 2 reached': '止盈：达到第二止盈目标',
+      'take profit: high distribution handoff complete': '止盈：高位换手完成',
+      'take profit: 4h OI valley formed; downside trend exhausted': '止盈：4H OI洼地形成，下跌行情衰竭',
       'take profit: floating profit trailing stop': '止盈：浮盈回撤触发保护',
       'take profit: protected stop after profit lock': '止盈：盈利后保护止损触发',
       'stop loss: protected stop slipped below entry': '止损：保护止损成交后仍低于开仓价',
@@ -805,6 +812,9 @@ PAPER_DASHBOARD_HTML = """
       'late trend stage blocks fresh entry': '趋势末段',
       'auto strategy disabled; new entries are paused': '策略已关闭',
       'symbol already has an open position': '已开仓',
+      'high distribution handoff complete; avoid new long': '高位换手完成，禁止新开多单',
+      '4h OI dropped while long/short ratio rose; retail longs are carrying the decline': '价格阴跌、OI下降且多空比上升，散户多头仍在扛单',
+      '4h OI valley confirmed; downside trend exhaustion blocks new short': '4H OI洼地形成，下跌行情衰竭，禁止新开空单',
       '15m tactical entry lacks a valid 15m structure stop or 1h/4h entry zone': '缺少有效止损或入场区',
       'BTC 4h extreme volatility; pause new altcoin entries': 'BTC极端波动',
       'market warm-up is still running': '行情预热中',
@@ -1304,7 +1314,8 @@ PAPER_DASHBOARD_HTML = """
       const hasUpsideSweep = reasonHas(rawReasons, ['washout confirmed: upside wick swept resistance', 'upside sweep rejected resistance', 'upper wick sweeps', 'repeated upper wicks', 'smart money distribution']);
       const h4Oi = objectValue(signal.h4_oi);
       const h4OiState = String(h4Oi.state || mtfPart(rawReasons, 'oi4h') || '');
-      const hasOiValley = h4OiState.includes('DELEVERAGE') || h4OiState.includes('REBUILD') || reasonHas(rawReasons, ['OI deleveraged', 'OI rebounds after deleverage', 'OI洼地', 'OI 去杠杆']);
+      const h4OiValley = objectValue(signal.h4_oi_valley);
+      const hasOiValley = String(h4OiValley.state || '') === 'CONFIRMED';
       const h1Trigger = objectValue(signal.h1_trigger);
       const h1State = String(h1Trigger.state || '');
       const h4Structure = objectValue(signal.h4_structure);
@@ -1339,7 +1350,6 @@ PAPER_DASHBOARD_HTML = """
         }
         if (isOneWayUp && has15mConfirm) addEntryCandidate(candidates, '强单边15m EMA20/EMA60回踩收回', levels.m15_ema20_ema60);
         if (hasDownsideSweep) addEntryCandidate(candidates, '下插针扫损后重新收回支撑', levels.sweep_reclaim_support);
-        if (hasOiValley) addEntryCandidate(candidates, 'OI洼地止跌放量回稳', levels.oi_valley_recovery);
         if (hasVwapLong) addEntryCandidate(candidates, 'VWAP/成交密集区回踩不破', levels.vwap_pullback);
         if (hasVolumeLongConfirm || hasVolumeLongBreakout) addEntryCandidate(candidates, '前压力突破后回踩确认', levels.breakout_retest);
         if (has1hHeld) addEntryCandidate(candidates, '1H支撑回踩不破', levels.h1_support);
@@ -1368,7 +1378,6 @@ PAPER_DASHBOARD_HTML = """
           addEntryCandidate(candidates, '第二阶段：下降顶点趋势线反抽做空', levels.descending_high_trendline);
         }
         if (hasUpsideSweep) addEntryCandidate(candidates, '上插针扫空后重新跌回压力', levels.sweep_reject_resistance);
-        if (hasOiValley) addEntryCandidate(candidates, '高位OI下降横盘涨不动', levels.oi_distribution);
         if (hasVwapShort) addEntryCandidate(candidates, 'VWAP/成交密集区反抽不过', levels.vwap_retest);
         if (hasVolumeShortConfirm || hasVolumeShortBreakdown) addEntryCandidate(candidates, '前支撑跌破后反抽确认', levels.breakdown_retest);
         if (has1hRejected) addEntryCandidate(candidates, '1H压力反抽不过', levels.h1_resistance);
@@ -1421,7 +1430,7 @@ PAPER_DASHBOARD_HTML = """
       if (direction === '多头' && hasDownsideSweep) riskBits.push('多次下插针已清杠杆');
       if (direction === '空头' && hasUpsideSweep) riskBits.push('多次上插针已清杠杆');
       if (oiRebound !== null && oiRebound >= 0.003) riskBits.push('OI下降后回稳');
-      else if (hasOiValley && !(oiDropFromHigh !== null && oiDropFromHigh <= -0.18)) riskBits.push('OI下降后回稳');
+      else if (hasOiValley) riskBits.push('4H OI洼地已形成');
       if (riskState === 'LONG_CROWD') riskBits.push('多头情绪拥挤');
       else if (riskState === 'SHORT_CROWD') riskBits.push('空头情绪拥挤');
       else if (riskState === 'OI_ABNORMAL') riskBits.push('OI异常');
@@ -1456,6 +1465,7 @@ PAPER_DASHBOARD_HTML = """
         'entry position wait: live price has not reached a scored short entry zone': '实时价格尚未进入评分认可的做空区间',
         'entry position wait: long entry zone touched; waiting for midpoint reclaim': '已进入做多区间，等待重新站上区间中位',
         'entry position wait: short entry zone touched; waiting for midpoint rejection': '已进入做空区间，等待重新跌回区间中位',
+        'entry position wait: live price is at or below 1h BOLL lower; wait for a higher-timeframe bounce': '实时价格位于或跌破1H BOLL下轨，等待1H/4H反抽后再做空',
         'entry position blocked: suggested entry zone unavailable': '评分未生成有效建议入场区'
       };
       return map[text] || text;

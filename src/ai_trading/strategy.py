@@ -810,47 +810,23 @@ def _detect_smart_money_cycle(
     if first_oi <= 0 or min_oi <= 0:
         return SmartMoneyCycle(reason="smart money cycle invalid OI data")
 
-    valley_index = oi_values.index(min_oi)
-    pre_valley_high = max(oi_values[: valley_index + 1])
-    post_valley_high = max(oi_values[valley_index:])
-    oi_flush_into_valley = (pre_valley_high - min_oi) / pre_valley_high if pre_valley_high else 0.0
-    oi_rebuild_from_valley = (last_oi - min_oi) / min_oi
-    oi_post_valley_rebuild = (post_valley_high - min_oi) / min_oi
     oi_drop_from_high = (max_oi - last_oi) / max_oi if max_oi else 0.0
     oi_change_window = (last_oi - first_oi) / first_oi
 
     first_close = recent_candles[0].close
     last_close = recent_candles[-1].close
-    valley_close = recent_candles[valley_index].close
     price_change = (last_close - first_close) / first_close if first_close else 0.0
-    price_recovery_from_valley = (last_close - valley_close) / valley_close if valley_close else 0.0
     upper_wicks = _count_wicks(recent_candles, recent_indicators, upper=True, settings=settings)
-    lower_wicks = _count_wicks(recent_candles, recent_indicators, upper=False, settings=settings)
     volume_confirmed = _average_volume_ratio(recent_indicators[-5:]) >= settings.smart_money_volume_ratio
     ratio_change = _ratio_change(recent_indicators)
 
-    valley_has_room_to_rebuild = valley_index <= len(oi_values) - 3
-    flushed = oi_flush_into_valley >= settings.smart_money_oi_flush
-    rebuilt = valley_has_room_to_rebuild and (
-        oi_rebuild_from_valley >= settings.smart_money_oi_rebuild
-        or oi_post_valley_rebuild >= settings.smart_money_oi_rebuild
-    )
     oi_rising = oi_change_window >= settings.smart_money_oi_rebuild
     oi_falling_from_high = oi_drop_from_high >= settings.smart_money_oi_rebuild
     price_rising = price_change >= settings.smart_money_price_move
     price_falling = price_change <= -settings.smart_money_price_move
     upper_sweeps = upper_wicks >= settings.smart_money_min_wicks
-    lower_sweeps = lower_wicks >= settings.smart_money_min_wicks
     longs_getting_crowded = ratio_change >= 0.08
     shorts_getting_crowded = ratio_change <= -0.08
-
-    if flushed and rebuilt and (price_rising or price_recovery_from_valley >= settings.smart_money_price_move or lower_sweeps) and volume_confirmed:
-        return SmartMoneyCycle(
-            phase="ACCUMULATION_REBUILD",
-            reason="smart money accumulation: OI flushed into a 4h pocket, then rebuilt while price recovered",
-            long_bias=18,
-            short_veto="smart money accumulation after OI flush; avoid chasing shorts",
-        )
 
     if oi_rising and price_rising and shorts_getting_crowded and volume_confirmed:
         return SmartMoneyCycle(
@@ -874,14 +850,6 @@ def _detect_smart_money_cycle(
             reason="trapped longs markdown: price falls while OI and long/short ratio rise",
             short_bias=18,
             long_veto="trapped longs are increasing while price falls",
-        )
-
-    if price_falling and lower_sweeps and oi_falling_from_high and volume_confirmed:
-        return SmartMoneyCycle(
-            phase="CAPITULATION_ABSORB",
-            reason="capitulation absorption: lower wick sweeps with OI flush and volume expansion",
-            long_bias=12,
-            short_veto="capitulation OI flush; avoid late shorts",
         )
 
     return SmartMoneyCycle()

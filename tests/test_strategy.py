@@ -207,7 +207,7 @@ def test_strategy_rewards_washout_with_oi_drop_and_key_level_reclaim() -> None:
     assert "washout confirmed: downside wick swept support, OI dropped, close reclaimed key level" in signal.reasons
 
 
-def test_smart_money_detects_oi_flush_accumulation() -> None:
+def test_base_timeframe_oi_flush_does_not_claim_a_four_hour_oi_valley() -> None:
     candles, derivatives = _trending_market()
     candles = _rewrite_recent_prices(candles, start_price=118.0, step=0.12, lower_wicks=True)
     indicators = build_indicators(candles, derivatives)
@@ -220,9 +220,9 @@ def test_smart_money_detects_oi_flush_accumulation() -> None:
 
     cycle = CompositeStrategy().smart_money_cycle(candles, indicators)
 
-    assert cycle.phase == "ACCUMULATION_REBUILD"
-    assert cycle.long_bias > cycle.short_bias
-    assert cycle.short_veto == "smart money accumulation after OI flush; avoid chasing shorts"
+    assert cycle.phase == "NEUTRAL"
+    assert cycle.long_bias == 0
+    assert cycle.short_veto is None
 
 
 def test_smart_money_detects_trapped_longs_markdown() -> None:

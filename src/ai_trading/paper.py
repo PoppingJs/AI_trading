@@ -10,6 +10,7 @@ from dataclasses import asdict, dataclass, field
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
+from statistics import median
 from typing import Any
 from typing import Literal
 
@@ -1141,7 +1142,7 @@ class PaperTradingEngine:
                 async with semaphore:
                     changed = False
                     source_timestamps: list[datetime] = []
-                    for timeframe in {self.interval, "4h"}:
+                    for timeframe in {self.interval, "1h", "4h"}:
                         candles = self._timeframe_candles.get(symbol, {}).get(timeframe, [])
                         if not candles:
                             continue
@@ -1347,7 +1348,7 @@ class PaperTradingEngine:
             return False
         refresh_derivatives = getattr(self.market_data, "derivatives_bundle", None)
         if refresh_derivatives is not None:
-            for timeframe in {self.interval, "4h"}:
+            for timeframe in {self.interval, "1h", "4h"}:
                 closed = timeframe_candles.get(timeframe, [])
                 if not closed:
                     continue
@@ -1380,7 +1381,7 @@ class PaperTradingEngine:
         now = datetime.now(UTC)
         if all(
             _derivatives_complete(timeframe_derivatives.get(timeframe, []))
-            for timeframe in {self.interval, "4h"}
+            for timeframe in {self.interval, "1h", "4h"}
         ):
             self._oi_ratio_updated_at[symbol] = now
             self._derivatives_updated_at[symbol] = now
@@ -1993,6 +1994,28 @@ class PaperTradingEngine:
                     self.account.positions.pop(position.symbol, None)
                 self._save_state_unlocked()
                 continue
+            handoff_exit_reason = _high_distribution_handoff_exit_reason(
+                position,
+                signal,
+            )
+            if handoff_exit_reason:
+                self._close_position_unlocked(
+                    position,
+                    price,
+                    handoff_exit_reason,
+                )
+                continue
+            oi_valley_exit_reason = _oi_valley_short_exit_reason(
+                position,
+                signal,
+            )
+            if oi_valley_exit_reason:
+                self._close_position_unlocked(
+                    position,
+                    price,
+                    oi_valley_exit_reason,
+                )
+                continue
             structure_exit_reason = _confirmed_structure_exit_reason(position, price, signal)
             if structure_exit_reason:
                 self._close_position_unlocked(position, price, structure_exit_reason)
@@ -2395,7 +2418,6 @@ def _entry_position_text(
             "h4_ema20_ema60": "4H EMA20/EMA60回踩",
             "m15_ema20_ema60": "强单边15m EMA20/EMA60回踩",
             "sweep_reclaim_support": "下插针扫损后收回支撑",
-            "oi_valley_recovery": "OI洼地止跌回稳",
             "ma_cluster_breakout": "上穿均线密集区",
             "ma20_retest": "突破均线密集后回踩MA20",
             "breakout_retest": "前压力突破后回踩确认",
@@ -2412,7 +2434,6 @@ def _entry_position_text(
             "h1_ema20_ema60": "1H EMA20/EMA60反抽",
             "h4_ema20_ema60": "4H EMA20/EMA60反抽",
             "sweep_reject_resistance": "上插针扫空后跌回压力",
-            "oi_distribution": "高位OI下降横盘滞涨",
             "ma_cluster_breakdown": "下穿均线密集区",
             "ma20_retest": "跌破均线密集后反抽MA20",
             "breakdown_retest": "前支撑跌破后反抽确认",
@@ -2502,9 +2523,11 @@ def _entry_context_from_signal(signal: dict[str, object]) -> dict[str, object]:
         "h4_ma_cluster",
         "h1_ma_cluster",
         "h4_oi",
+        "h4_oi_valley",
         "h1_trigger",
         "h1_pullback",
         "h1_ema_reliability",
+        "high_distribution_handoff",
         "entry_timeframe_override",
         "distribution_short",
         "distribution_short_stage",
@@ -2942,6 +2965,18 @@ def _structure_take_profit_reason(
                 _tighten_short_support_stop(position, price, signal, indicator)
                 return None
             if _short_support_exhaustion_confirmed(price, signal, indicator):
+                h4_oi_valley = (
+                    signal.get("h4_oi_valley")
+                    if isinstance(signal.get("h4_oi_valley"), dict)
+                    else {}
+                )
+                if str(h4_oi_valley.get("state") or "") == "CONFIRMED":
+                    return _outcome_exit_reason(
+                        position,
+                        price,
+                        "4h OI valley formed; downside trend exhausted",
+                        fee_rate,
+                    )
                 return _outcome_exit_reason(position, price, "4h support plus short exhaustion confirmed", fee_rate)
             if trend_state not in {"TREND_SHORT", "ONE_WAY_DOWN"} and _profit_risk_signal(signal, indicator):
                 return _outcome_exit_reason(position, price, "near 4h support with profit protection", fee_rate)
@@ -2989,22 +3024,11 @@ def _short_support_exhaustion_confirmed(
     indicator: IndicatorSnapshot | None,
 ) -> bool:
     risk_state = str(signal.get("risk_state") or "NORMAL")
-    h4_oi = signal.get("h4_oi") if isinstance(signal.get("h4_oi"), dict) else {}
-    drop_from_high = _float_or_none(h4_oi.get("drop_from_high_pct")) or 0.0
+    h4_oi_valley = signal.get("h4_oi_valley") if isinstance(signal.get("h4_oi_valley"), dict) else {}
     reasons_text = " | ".join(str(reason).lower() for reason in (signal.get("reasons") or ()))
     rsi_extreme = bool(indicator and indicator.rsi14 is not None and indicator.rsi14 <= RSI_STRONG_SHORT_SEVERE)
     short_crowded = risk_state == "SHORT_CROWD" or "short crowd" in reasons_text or "空头拥挤" in reasons_text
-    oi_valley = drop_from_high <= -0.16 or any(
-        token in reasons_text
-        for token in (
-            "oi valley",
-            "oi flush",
-            "oi drained",
-            "deleverag",
-            "oi洼地",
-            "oi 去杠杆",
-        )
-    )
+    oi_valley = str(h4_oi_valley.get("state") or "") == "CONFIRMED"
     h1_reclaimed = False
     if indicator:
         levels = [value for value in (indicator.ema20, indicator.boll_mid) if value is not None]
@@ -3022,7 +3046,10 @@ def _short_support_exhaustion_confirmed(
             "支撑收回",
         )
     )
-    return ((rsi_extreme or short_crowded) and (h1_reclaimed or downside_reclaim)) or (oi_valley and downside_reclaim)
+    return oi_valley or (
+        (rsi_extreme or short_crowded)
+        and (h1_reclaimed or downside_reclaim)
+    )
 
 
 def _tighten_short_support_stop(
@@ -3032,6 +3059,21 @@ def _tighten_short_support_stop(
     indicator: IndicatorSnapshot | None,
 ) -> None:
     if position.side != PositionSide.SHORT or indicator is None or not indicator.atr14:
+        return
+    initial_stop_distance = float(
+        position.metadata.get("initial_stop_distance")
+        or abs(position.entry_price - position.stop_price)
+    )
+    max_favorable_distance = float(
+        position.metadata.get("max_favorable_distance") or 0.0
+    )
+    if (
+        not position.first_tp_done
+        and (
+            initial_stop_distance <= 0
+            or max_favorable_distance < initial_stop_distance
+        )
+    ):
         return
     candidates: list[float] = []
     if indicator.ema20 is not None:
@@ -3257,6 +3299,47 @@ def _risk_exit_reason(side: PositionSide, trend_state: str, risk_state: str) -> 
     if trend_state == "ONE_WAY_DOWN" and side == PositionSide.SHORT and risk_state in {"SHORT_CROWD", "OI_ABNORMAL", "FUNDING_HOT"}:
         return f"risk exit: {risk_state}"
     return None
+
+
+def _high_distribution_handoff_exit_reason(
+    position: Position,
+    signal: dict[str, object],
+) -> str | None:
+    if position.side != PositionSide.LONG:
+        return None
+    handoff = (
+        signal.get("high_distribution_handoff")
+        if isinstance(signal.get("high_distribution_handoff"), dict)
+        else {}
+    )
+    if str(handoff.get("state") or "") != "CONFIRMED":
+        return None
+    stop_distance = float(
+        position.metadata.get("initial_stop_distance")
+        or abs(position.entry_price - position.stop_price)
+    )
+    favorable_distance = float(
+        position.metadata.get("max_favorable_distance") or 0.0
+    )
+    if stop_distance <= 0 or favorable_distance < stop_distance:
+        return None
+    return "take profit: high distribution handoff complete"
+
+
+def _oi_valley_short_exit_reason(
+    position: Position,
+    signal: dict[str, object],
+) -> str | None:
+    if position.side != PositionSide.SHORT:
+        return None
+    h4_oi_valley = (
+        signal.get("h4_oi_valley")
+        if isinstance(signal.get("h4_oi_valley"), dict)
+        else {}
+    )
+    if str(h4_oi_valley.get("state") or "") != "CONFIRMED":
+        return None
+    return "take profit: 4h OI valley formed; downside trend exhausted"
 
 
 def _trend_stage_from_signal(signal: dict[str, object], indicator: IndicatorSnapshot | None = None) -> str:
@@ -3710,6 +3793,23 @@ def _side_entry_timing(side: PositionSide, price: float, signal: dict[str, objec
         m15_precision,
         smart_money_phase,
     )
+    entry_guardrails = (
+        signal.get("entry_guardrails")
+        if isinstance(signal.get("entry_guardrails"), dict)
+        else {}
+    )
+    h1_boll_lower = _float_or_none(
+        entry_guardrails.get("h1_boll_lower")
+    )
+    if (
+        side == PositionSide.SHORT
+        and h1_boll_lower is not None
+        and price <= h1_boll_lower
+    ):
+        return (
+            ENTRY_TIMING_WAIT,
+            "entry position wait: live price is at or below 1h BOLL lower; wait for a higher-timeframe bounce",
+        )
     if _entry_level_group_hit(signal, price, side, include_m15=include_m15):
         if (
             signal.get("entry_confirmation_required")
@@ -4003,8 +4103,6 @@ def _scored_entry_levels(
             add("breakdown_retest", "h1_resistance")
         if any(token in reason_text for token in ("washout confirmed: upside", "upside sweep rejected")):
             add("sweep_reject_resistance")
-        if "ma cluster breakdown down" in reason_text:
-            add("ma_cluster_breakdown")
         if "ma cluster retest rejected" in reason_text:
             add("ma20_retest")
         if "4h structure supports downside" in reason_text:
@@ -4136,9 +4234,9 @@ def _entry_timeframe_for_signal(
     if h4_hit:
         return "4h"
     generic_keys = (
-        ("sweep_reclaim_support", "oi_valley_recovery", "ma_cluster_breakout", "ma20_retest", "breakout_retest")
+        ("sweep_reclaim_support", "ma_cluster_breakout", "ma20_retest", "breakout_retest")
         if side == PositionSide.LONG
-        else ("sweep_reject_resistance", "oi_distribution", "ma_cluster_breakdown", "ma20_retest", "breakdown_retest")
+        else ("sweep_reject_resistance", "ma_cluster_breakdown", "ma20_retest", "breakdown_retest")
     )
     generic_hit = any(
         _entry_level_hit(price, side_levels.get(key))
@@ -4456,9 +4554,18 @@ def _build_multi_timeframe_context(
         timeframe_candles.get("1h", []),
         timeframe_indicators.get("1h", []),
     )
+    high_handoff = _high_distribution_handoff(
+        timeframe_candles.get("1h", []),
+        timeframe_indicators.get("1h", []),
+    )
     h4_ma_cluster = _moving_average_cluster(timeframe_candles.get("4h", []), timeframe_indicators.get("4h", []), settings)
     h1_ma_cluster = _moving_average_cluster(timeframe_candles.get("1h", []), timeframe_indicators.get("1h", []), settings)
     h4_oi = _four_hour_oi_state(timeframe_indicators.get("4h", []), h4, h1, h1_pullback)
+    h4_oi_valley = _four_hour_oi_valley(
+        timeframe_candles.get("4h", []),
+        timeframe_indicators.get("4h", []),
+        settings,
+    )
     distribution_short = _distribution_short_structure(
         timeframe_candles.get("1h", []),
         timeframe_indicators.get("1h", []),
@@ -4475,6 +4582,16 @@ def _build_multi_timeframe_context(
         m15,
         distribution_short,
     )
+    h1_indicator = _latest_indicator(
+        timeframe_indicators.get("1h", [])
+    )
+    entry_guardrails = {
+        "h1_boll_lower": (
+            h1_indicator.boll_lower
+            if h1_indicator is not None
+            else None
+        ),
+    }
     return {
         "daily_bias": d1,
         "h4_structure": h4,
@@ -4482,12 +4599,15 @@ def _build_multi_timeframe_context(
         "h4_ma_cluster": h4_ma_cluster,
         "h1_ma_cluster": h1_ma_cluster,
         "h4_oi": h4_oi,
+        "h4_oi_valley": h4_oi_valley,
         "h1_trigger": h1,
         "h1_pullback": h1_pullback,
         "h1_ema_reliability": h1_ema_reliability,
+        "high_distribution_handoff": high_handoff,
         "distribution_short": distribution_short,
         "m15_precision": m15,
         "entry_levels": entry_levels,
+        "entry_guardrails": entry_guardrails,
         "summary": _multi_timeframe_summary(d1, h4, h1, h1_pullback, h4_oi, h4_ma_cluster, h1_ma_cluster),
     }
 
@@ -4746,6 +4866,106 @@ def _four_hour_oi_state(
     return {"state": state, "drop_from_high_pct": drop_from_high, "rebound_pct": rebound, "ratio_change_pct": ratio_change}
 
 
+def _four_hour_oi_valley(
+    candles: list[Candle],
+    indicators: list[IndicatorSnapshot],
+    settings: AppSettings,
+) -> dict[str, object]:
+    """Confirm retail-long carry, capitulation OI flush, then OI rebuilding."""
+    usable = min(len(candles), len(indicators))
+    if usable < 8:
+        return {"state": "UNKNOWN"}
+    observations = [
+        (candle, indicator)
+        for candle, indicator in zip(
+            candles[-24:],
+            indicators[-24:],
+        )
+        if indicator.open_interest is not None
+        and indicator.long_short_ratio is not None
+        and indicator.open_interest > 0
+    ]
+    if len(observations) < 8:
+        return {"state": "UNKNOWN"}
+    flush_candidates: list[tuple[float, int]] = []
+    for idx in range(1, len(observations) - 1):
+        previous_oi = observations[idx - 1][1].open_interest
+        current_oi = observations[idx][1].open_interest
+        if previous_oi is None or current_oi is None or previous_oi <= 0:
+            continue
+        drop = (previous_oi - current_oi) / previous_oi
+        flush_candidates.append((drop, idx))
+    if not flush_candidates:
+        return {"state": "WATCH"}
+    flush_pct, valley_idx = max(flush_candidates)
+    valley_candle, valley_indicator = observations[valley_idx]
+    pre_flush_candle, pre_flush_indicator = observations[valley_idx - 1]
+    valley_oi = float(valley_indicator.open_interest or 0.0)
+    current_oi = float(observations[-1][1].open_interest or 0.0)
+    rebuild_pct = (
+        (current_oi - valley_oi) / valley_oi
+        if valley_oi > 0
+        else 0.0
+    )
+    carry_start = max(0, valley_idx - 6)
+    prior_carry = observations[carry_start:valley_idx]
+    pre_flush_oi = float(pre_flush_indicator.open_interest or 0.0)
+    pre_flush_ratio = float(pre_flush_indicator.long_short_ratio or 0.0)
+    carry_first_candle, carry_first_indicator = (
+        prior_carry[0]
+        if prior_carry
+        else (pre_flush_candle, pre_flush_indicator)
+    )
+    carry_first_oi = float(carry_first_indicator.open_interest or 0.0)
+    carry_first_ratio = float(carry_first_indicator.long_short_ratio or 0.0)
+    carry_price_change = (
+        (pre_flush_candle.close - carry_first_candle.close) / carry_first_candle.close
+        if carry_first_candle.close > 0
+        else 0.0
+    )
+    carry_oi_change = (
+        (pre_flush_oi - carry_first_oi) / carry_first_oi
+        if carry_first_oi > 0
+        else 0.0
+    )
+    carry_ratio_change = (
+        (pre_flush_ratio - carry_first_ratio) / carry_first_ratio
+        if carry_first_ratio > 0
+        else 0.0
+    )
+    retail_long_carry = (
+        len(prior_carry) >= 3
+        and carry_price_change < 0
+        and carry_oi_change < 0
+        and carry_ratio_change > 0
+    )
+    valley_is_local_low = valley_oi <= min(
+        float(indicator.open_interest or valley_oi)
+        for _, indicator in observations[carry_start : valley_idx + 1]
+    )
+    confirmed = (
+        retail_long_carry
+        and valley_is_local_low
+        and flush_pct >= settings.strategy.smart_money_oi_flush
+        and rebuild_pct >= settings.strategy.smart_money_oi_rebuild
+    )
+    return {
+        "state": "CONFIRMED" if confirmed else "WATCH",
+        "retail_long_carry": retail_long_carry,
+        "valley_is_local_low": valley_is_local_low,
+        "flush_timestamp": valley_candle.timestamp.isoformat(),
+        "pre_flush_oi": pre_flush_oi,
+        "valley_oi": valley_oi,
+        "current_oi": current_oi,
+        "flush_pct": flush_pct,
+        "rebuild_pct": rebuild_pct,
+        "pre_flush_long_short_ratio": pre_flush_ratio,
+        "carry_price_change_pct": carry_price_change,
+        "carry_oi_change_pct": carry_oi_change,
+        "carry_long_short_ratio_change_pct": carry_ratio_change,
+    }
+
+
 def _distribution_short_structure(
     candles: list[Candle],
     indicators: list[IndicatorSnapshot],
@@ -4833,8 +5053,18 @@ def _distribution_short_stage(
         if isinstance(context.get("distribution_short"), dict)
         else {}
     )
+    handoff = (
+        context.get("high_distribution_handoff")
+        if isinstance(context.get("high_distribution_handoff"), dict)
+        else {}
+    )
+    handoff_confirmed = str(handoff.get("state") or "") == "CONFIRMED"
     smart_money_phase = str(signal.get("smart_money_phase") or "")
-    if not structure.get("active") and smart_money_phase != "DISTRIBUTION_EXIT":
+    if (
+        not structure.get("active")
+        and smart_money_phase != "DISTRIBUTION_EXIT"
+        and not handoff_confirmed
+    ):
         return None
     h4 = (
         context.get("h4_structure")
@@ -4872,6 +5102,8 @@ def _distribution_short_stage(
     )
     if markdown_confirmed:
         return DISTRIBUTION_STAGE_MARKDOWN
+    if handoff_confirmed:
+        return DISTRIBUTION_STAGE_DESCENDING
     if isinstance(structure.get("descending_trendline_zone"), dict):
         return DISTRIBUTION_STAGE_DESCENDING
     return DISTRIBUTION_STAGE_RANGE
@@ -4925,6 +5157,96 @@ def _one_hour_ema_reliability(
         "ema20_breach_episodes": ema20_episodes,
         "ema60_breach_episodes": ema60_episodes,
         "lookback_hours": len(ema20_breaches),
+    }
+
+
+def _high_distribution_handoff(
+    candles: list[Candle],
+    indicators: list[IndicatorSnapshot],
+) -> dict[str, object]:
+    """Confirm that post-high OI rebuilt into weak price while longs crowded in."""
+    usable = min(len(candles), len(indicators))
+    if usable < 16:
+        return {"state": "UNKNOWN"}
+    candles = candles[-48:]
+    indicators = indicators[-len(candles):]
+    current_idx = len(candles) - 1
+    peak_candidates = range(
+        max(0, len(candles) - 24),
+        max(0, current_idx - 1),
+    )
+    if not peak_candidates:
+        return {"state": "UNKNOWN"}
+    peak_idx = max(peak_candidates, key=lambda idx: candles[idx].high)
+    peak_indicator = indicators[peak_idx]
+    current_indicator = indicators[current_idx]
+    peak_oi = peak_indicator.open_interest
+    current_oi = current_indicator.open_interest
+    peak_ratio = peak_indicator.long_short_ratio
+    current_ratio = current_indicator.long_short_ratio
+    if (
+        peak_oi is None
+        or current_oi is None
+        or peak_ratio is None
+        or current_ratio is None
+        or peak_oi <= 0
+        or peak_idx >= current_idx - 1
+    ):
+        return {"state": "UNKNOWN"}
+    oi_changes = [
+        abs(current.open_interest - previous.open_interest)
+        / previous.open_interest
+        for previous, current in zip(indicators, indicators[1:])
+        if previous.open_interest is not None
+        and current.open_interest is not None
+        and previous.open_interest > 0
+    ]
+    if not oi_changes:
+        return {"state": "UNKNOWN"}
+    typical_oi_change = median(oi_changes)
+    post_peak_oi = [
+        indicator.open_interest
+        for indicator in indicators[peak_idx + 1 :]
+        if indicator.open_interest is not None
+    ]
+    if not post_peak_oi:
+        return {"state": "UNKNOWN"}
+    minimum_oi = min(post_peak_oi)
+    flush_pct = (
+        max(peak_oi - minimum_oi, 0.0) / peak_oi
+        if peak_oi
+        else 0.0
+    )
+    meaningful_flush = (
+        typical_oi_change > 0
+        and flush_pct >= typical_oi_change
+    )
+    oi_rebuilt = current_oi >= peak_oi
+    price_failed = (
+        candles[current_idx].close < candles[peak_idx].low
+    )
+    ratio_shifted_to_longs = current_ratio > peak_ratio
+    confirmed = (
+        meaningful_flush
+        and oi_rebuilt
+        and price_failed
+        and ratio_shifted_to_longs
+    )
+    return {
+        "state": "CONFIRMED" if confirmed else "WATCH",
+        "peak_timestamp": candles[peak_idx].timestamp.isoformat(),
+        "peak_price": candles[peak_idx].high,
+        "peak_candle_low": candles[peak_idx].low,
+        "peak_oi": peak_oi,
+        "minimum_oi": minimum_oi,
+        "current_oi": current_oi,
+        "oi_flush_pct": flush_pct,
+        "typical_oi_change_pct": typical_oi_change,
+        "peak_long_short_ratio": peak_ratio,
+        "current_long_short_ratio": current_ratio,
+        "oi_rebuilt": oi_rebuilt,
+        "price_failed": price_failed,
+        "ratio_shifted_to_longs": ratio_shifted_to_longs,
     }
 
 
@@ -5044,7 +5366,6 @@ def _entry_level_context(
             "h4_ema20_ema60": _ema20_ema60_band(h4_indicator, h4_ma_cluster),
             "m15_ema20_ema60": _zone_from_object(m15.get("long_pullback_zone")),
             "sweep_reclaim_support": _zone_from_mapping(h1_structure, "support") or _zone_from_mapping(h4_structure, "support"),
-            "oi_valley_recovery": _recovery_band(h1_indicator) or _zone_from_mapping(h1_structure, "support"),
             "ma_cluster_breakout": _cluster_band(h1_ma_cluster) or _cluster_band(h4_ma_cluster),
             "ma20_retest": _ma20_band(h1_ma_cluster, h1_indicator) or _ma20_band(h4_ma_cluster, h4_indicator),
             "breakout_retest": _zone_from_mapping(h1_structure, "resistance") or _zone_from_mapping(h4_structure, "resistance"),
@@ -5064,7 +5385,6 @@ def _entry_level_context(
             "h1_ema20_ema60": _ema20_ema60_band(h1_indicator, h1_ma_cluster),
             "h4_ema20_ema60": _ema20_ema60_band(h4_indicator, h4_ma_cluster),
             "sweep_reject_resistance": _zone_from_mapping(h1_structure, "resistance") or _zone_from_mapping(h4_structure, "resistance"),
-            "oi_distribution": _recovery_band(h1_indicator) or _zone_from_mapping(h1_structure, "resistance"),
             "ma_cluster_breakdown": _cluster_band(h1_ma_cluster) or _cluster_band(h4_ma_cluster),
             "ma20_retest": _ma20_band(h1_ma_cluster, h1_indicator) or _ma20_band(h4_ma_cluster, h4_indicator),
             "breakdown_retest": _zone_from_mapping(h1_structure, "support") or _zone_from_mapping(h4_structure, "support"),
@@ -5165,12 +5485,6 @@ def _ma20_band(cluster: dict[str, object], indicator: IndicatorSnapshot | None) 
     return _indicator_band(indicator, _float_or_none(cluster.get("ma20")))
 
 
-def _recovery_band(indicator: IndicatorSnapshot | None) -> dict[str, float] | None:
-    if indicator is None:
-        return None
-    return _indicator_band(indicator, indicator.close)
-
-
 def _weak_deleverage_rebound(
     signal: dict[str, object],
     h4_oi: dict[str, object],
@@ -5196,28 +5510,22 @@ def _weak_deleverage_rebound(
     return oi_not_recovered and volume_weak
 
 
-def _distribution_short_retest_setup(
-    signal: dict[str, object],
-    h4_oi: dict[str, object],
-    h1: dict[str, object],
-    h1_pullback: dict[str, object],
-    h1_ma_cluster: dict[str, object],
-    h4_ma_cluster: dict[str, object],
+def _oi_valley_long_reversal_confirmed(
+    h4_oi_valley: dict[str, object],
+    reasons: list[object],
 ) -> bool:
-    if not _weak_deleverage_rebound(signal, h4_oi, h1_pullback):
+    if str(h4_oi_valley.get("state") or "") != "CONFIRMED":
         return False
-    h1_direction = str(h1.get("direction") or "NONE")
-    h1_state = str(h1.get("state") or "UNKNOWN")
-    pullback_direction = str(h1_pullback.get("direction") or "NONE")
-    pullback_state = str(h1_pullback.get("state") or "UNKNOWN")
-    cluster_states = {
-        str(h1_ma_cluster.get("state") or "UNKNOWN"),
-        str(h4_ma_cluster.get("state") or "UNKNOWN"),
-    }
-    resistance_rejected = h1_direction == "SHORT" and h1_state in {"RETEST", "FAKE_BREAKOUT"}
-    rebound_failed = pullback_direction == "SHORT" and pullback_state == "HEALTHY_PULLBACK"
-    ma_pressure_rejected = bool(cluster_states & {"RETEST_DOWN", "BREAKDOWN_DOWN"})
-    return resistance_rejected or rebound_failed or ma_pressure_rejected
+    reason_text = " | ".join(str(reason).lower() for reason in reasons)
+    return any(
+        marker in reason_text
+        for marker in (
+            "washout confirmed: downside wick swept support",
+            "downside sweep reclaimed support",
+            "lower wick sweep reclaimed",
+            "capitulation absorption",
+        )
+    )
 
 
 def _apply_multi_timeframe_context(signal: dict[str, object], context: dict[str, object]) -> dict[str, object]:
@@ -5232,12 +5540,19 @@ def _apply_multi_timeframe_context(signal: dict[str, object], context: dict[str,
     h4_ma_cluster = context.get("h4_ma_cluster") if isinstance(context.get("h4_ma_cluster"), dict) else {}
     h1_ma_cluster = context.get("h1_ma_cluster") if isinstance(context.get("h1_ma_cluster"), dict) else {}
     h4_oi = context.get("h4_oi") if isinstance(context.get("h4_oi"), dict) else {}
+    h4_oi_valley = context.get("h4_oi_valley") if isinstance(context.get("h4_oi_valley"), dict) else {}
     h1 = context.get("h1_trigger") if isinstance(context.get("h1_trigger"), dict) else {}
     h1_pullback = context.get("h1_pullback") if isinstance(context.get("h1_pullback"), dict) else {}
     h1_ema_reliability = context.get("h1_ema_reliability") if isinstance(context.get("h1_ema_reliability"), dict) else {}
+    high_distribution_handoff = context.get("high_distribution_handoff") if isinstance(context.get("high_distribution_handoff"), dict) else {}
     distribution_short = context.get("distribution_short") if isinstance(context.get("distribution_short"), dict) else {}
     m15_precision = context.get("m15_precision") if isinstance(context.get("m15_precision"), dict) else {}
     entry_levels = context.get("entry_levels") if isinstance(context.get("entry_levels"), dict) else {}
+    entry_guardrails = (
+        context.get("entry_guardrails")
+        if isinstance(context.get("entry_guardrails"), dict)
+        else {}
+    )
     h4_state = str(h4.get("state") or "UNKNOWN")
     h1_direction = str(h1.get("direction") or "NONE")
     h1_state = str(h1.get("state") or "UNKNOWN")
@@ -5248,6 +5563,18 @@ def _apply_multi_timeframe_context(signal: dict[str, object], context: dict[str,
     trend_state = str(out.get("trend_state") or "")
     smart_money_phase = str(out.get("smart_money_phase") or "")
     distribution_short_stage = _distribution_short_stage(out, context)
+    handoff_confirmed = (
+        str(high_distribution_handoff.get("state") or "")
+        == "CONFIRMED"
+    )
+    if handoff_confirmed:
+        reasons.append(
+            "high distribution handoff complete: OI rebuilt while price failed and long/short ratio rose"
+        )
+        if action == SignalAction.ENTRY_LONG.value:
+            vetoes.append(
+                "high distribution handoff complete; avoid new long"
+            )
     entry_timeframe_override: str | None = None
     m15_long_exception = _strong_m15_pullback_allowed(
         PositionSide.LONG,
@@ -5269,13 +5596,9 @@ def _apply_multi_timeframe_context(signal: dict[str, object], context: dict[str,
         )
     rsi14 = _float_or_none(out.get("rsi14"))
     weak_deleverage_rebound = _weak_deleverage_rebound(out, h4_oi, h1_pullback)
-    distribution_short_retest_setup = _distribution_short_retest_setup(
-        out,
-        h4_oi,
-        h1,
-        h1_pullback,
-        h1_ma_cluster,
-        h4_ma_cluster,
+    oi_valley_long_reversal = _oi_valley_long_reversal_confirmed(
+        h4_oi_valley,
+        reasons,
     )
     if action == SignalAction.ENTRY_LONG.value:
         if daily_bias == "BEAR":
@@ -5331,15 +5654,25 @@ def _apply_multi_timeframe_context(signal: dict[str, object], context: dict[str,
             score -= 8
             out["leverage_cap"] = min(int(out.get("leverage_cap") or 99), 3)
             out["margin_factor"] = min(float(out.get("margin_factor") or 1.0), 0.3)
-            reasons.append("4h OI deleveraged while long/short ratio rose; 1h support held, only tiny long allowed")
+            vetoes.append(
+                "4h OI dropped while long/short ratio rose; retail longs are carrying the decline"
+            )
         elif h4_oi_state == "DELEVERAGE_HOLD_LONG":
-            score += 6
-            out["leverage_cap"] = min(int(out.get("leverage_cap") or 99), 5)
-            out["margin_factor"] = min(float(out.get("margin_factor") or 1.0), 0.5)
-            reasons.append("4h OI deleveraged but 1h BOLL/EMA held; allow small long only")
+            reasons.append(
+                "4h OI sharp drop is an event, not a confirmed OI valley; wait for OI rebuilding and downside-wick reclaim"
+            )
         elif h4_oi_state == "REBUILD_BREAKOUT_LONG":
             score += 12
             reasons.append("4h OI rebounds after deleverage and price breaks out; strong long restored")
+        if oi_valley_long_reversal:
+            score += 12
+            reasons.append(
+                "4h OI valley formed after retail capitulation; downside wick reclaimed support"
+            )
+        elif str(h4_oi_valley.get("state") or "") == "CONFIRMED":
+            reasons.append(
+                "4h OI valley formed; wait for a downside-wick support reclaim before long"
+            )
         rsi_score, rsi_reasons, rsi_vetoes = _rsi_entry_adjustment(
             PositionSide.LONG,
             rsi14,
@@ -5404,26 +5737,21 @@ def _apply_multi_timeframe_context(signal: dict[str, object], context: dict[str,
         elif _low_area_needs_short_pullback(h4_state, h1_direction, h1_state):
             score -= 12
             vetoes.append("low area without 1h/4h resistance retest; wait for higher-timeframe bounce before short")
-        if h4_oi_state in {"DELEVERAGE_BREAKDOWN", "DELEVERAGE_CROWD_BREAKDOWN"}:
-            if _deleverage_short_failure_confirmed(h1_direction, h1_state, pullback_direction, pullback_state, reasons):
-                score += 8
-                reasons.append("4h OI deleverage breakdown with failed bounce; short candidate improved")
-            else:
-                score -= 8
-                vetoes.append("4h OI deleverage breakdown; wait for resistance retest or upper-wick rejection before short")
-        elif h4_oi_state in {"DELEVERAGE_HOLD_LONG", "DELEVERAGE_CROWD_HOLD_LONG"}:
-            if distribution_short_retest_setup:
-                score += 8
-                reasons.append("OI drained with weak rebound and resistance rejection; short candidate improved")
-            else:
-                vetoes.append("4h OI deleveraged but 1h support held; avoid chasing short")
-        elif h4_oi_state in {"DELEVERAGE_WAIT", "DELEVERAGE_CROWD_WAIT"}:
-            if distribution_short_retest_setup:
-                score += 8
-                reasons.append("OI drained, rebound volume weak, and 1h/MA resistance rejected; short candidate improved")
-            else:
-                score -= 6
-                vetoes.append("4h OI drained; wait for 1h resistance retest or upper-wick rejection before short")
+        if str(h4_oi_valley.get("state") or "") == "CONFIRMED":
+            vetoes.append(
+                "4h OI valley confirmed; downside trend exhaustion blocks new short"
+            )
+        elif h4_oi_state in {
+            "DELEVERAGE_BREAKDOWN",
+            "DELEVERAGE_CROWD_BREAKDOWN",
+            "DELEVERAGE_HOLD_LONG",
+            "DELEVERAGE_CROWD_HOLD_LONG",
+            "DELEVERAGE_WAIT",
+            "DELEVERAGE_CROWD_WAIT",
+        }:
+            reasons.append(
+                "4h OI sharp drop is not an OI valley and does not confirm a short entry"
+            )
         rsi_score, rsi_reasons, rsi_vetoes = _rsi_entry_adjustment(
             PositionSide.SHORT,
             rsi14,
@@ -5446,15 +5774,18 @@ def _apply_multi_timeframe_context(signal: dict[str, object], context: dict[str,
         "h1_trigger": h1,
         "h1_pullback": h1_pullback,
         "h1_ema_reliability": h1_ema_reliability,
+        "high_distribution_handoff": high_distribution_handoff,
         "entry_timeframe_override": entry_timeframe_override,
         "distribution_short": distribution_short,
         "distribution_short_stage": distribution_short_stage,
         "h4_oi": h4_oi,
+        "h4_oi_valley": h4_oi_valley,
         "h1_structure": h1_structure,
         "h4_structure": h4,
         "h1_ma_cluster": h1_ma_cluster,
         "h4_ma_cluster": h4_ma_cluster,
         "m15_precision": m15_precision,
+        "entry_guardrails": entry_guardrails,
     }
     trend_stage_phase = _trend_stage_from_signal(stage_probe)
     if trend_stage_phase == TREND_STAGE_LATE and action in {SignalAction.ENTRY_LONG.value, SignalAction.ENTRY_SHORT.value}:
@@ -5469,9 +5800,11 @@ def _apply_multi_timeframe_context(signal: dict[str, object], context: dict[str,
     out["h4_ma_cluster"] = h4_ma_cluster
     out["h1_ma_cluster"] = h1_ma_cluster
     out["h4_oi"] = h4_oi
+    out["h4_oi_valley"] = h4_oi_valley
     out["h1_trigger"] = h1
     out["h1_pullback"] = h1_pullback
     out["h1_ema_reliability"] = h1_ema_reliability
+    out["high_distribution_handoff"] = high_distribution_handoff
     if entry_timeframe_override:
         out["entry_timeframe_override"] = entry_timeframe_override
     else:
@@ -5479,6 +5812,7 @@ def _apply_multi_timeframe_context(signal: dict[str, object], context: dict[str,
     out["distribution_short"] = distribution_short
     out["distribution_short_stage"] = distribution_short_stage
     out["m15_precision"] = m15_precision
+    out["entry_guardrails"] = entry_guardrails
     out["entry_levels"] = _scored_entry_levels(stage_probe, entry_levels)
     out["trend_stage_phase"] = trend_stage_phase
     out["entry_confirmation_required"] = True
@@ -5671,26 +6005,6 @@ def _precision_stop_allowed(
         precision,
         smart_money_phase,
     )
-
-
-def _deleverage_short_failure_confirmed(
-    h1_direction: str,
-    h1_state: str,
-    pullback_direction: str,
-    pullback_state: str,
-    reasons: list[object],
-) -> bool:
-    if h1_direction == "SHORT" and h1_state in {"RETEST", "FAKE_BREAKOUT"}:
-        return True
-    if pullback_direction == "SHORT" and pullback_state == "HEALTHY_PULLBACK":
-        return True
-    reason_text = " | ".join(str(reason) for reason in reasons)
-    rejection_markers = (
-        "washout confirmed: upside wick swept resistance",
-        "upside sweep rejected resistance",
-        "market structure confirms short: breakdown or retest failed",
-    )
-    return any(marker in reason_text for marker in rejection_markers)
 
 
 def _daily_bias_margin_factor(side: str, signal: dict[str, object]) -> float:
