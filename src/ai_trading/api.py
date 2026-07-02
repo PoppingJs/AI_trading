@@ -150,7 +150,7 @@ def create_app(settings_path: str | Path = "config/strategy.yaml", state_path: s
         engine: PaperTradingEngine = app.state.paper_engine
         requested_symbols = [symbol.upper() for symbol in request.symbols or []]
         if not requested_symbols or _uses_default_symbol_pool(requested_symbols):
-            engine.configure_symbols(["AUTO_TOP30"])
+            engine.configure_symbols(["AUTO_TOP50"])
         else:
             engine.configure_symbols(requested_symbols)
         engine.configure_interval(request.interval)
@@ -250,7 +250,11 @@ def _signal_payload(signal) -> dict[str, object]:
 
 def _uses_default_symbol_pool(symbols: list[str]) -> bool:
     cleaned = {symbol.replace("/", "").replace("-", "").upper() for symbol in symbols if symbol}
-    return not cleaned or cleaned == {"BTCUSDT", "ETHUSDT", "SOLUSDT"} or cleaned == {"AUTO_TOP30"}
+    return (
+        not cleaned
+        or cleaned == {"BTCUSDT", "ETHUSDT", "SOLUSDT"}
+        or cleaned in ({"AUTO_TOP50"}, {"AUTO_TOP30"})
+    )
 
 
 def _require_api_token(x_api_token: str | None = Header(default=None)) -> None:
@@ -460,7 +464,7 @@ PAPER_DASHBOARD_HTML = """
         <label>模拟本金 USDT</label>
         <input id="startingBalance" type="number" value="1200" min="1" step="10" />
         <label>币种标的池</label>
-        <input id="symbols" value="AUTO_TOP30" />
+        <input id="symbols" value="AUTO_TOP50" />
         <label>周期</label>
         <select id="interval"><option>15m</option><option selected>1h</option><option>4h</option><option>1d</option></select>
         <div class="control-actions">
@@ -1609,10 +1613,6 @@ PAPER_DASHBOARD_HTML = """
         `<button class="neutral" onclick="closePosition('${displaySymbol(p.symbol)}')">平仓</button>`
       ]));
       const signalRows = Object.entries(data.latest_signals || {})
-        .filter(([, s]) => {
-          const reasons = s.reasons || [];
-          return !(s.action === 'NO_TRADE' && reasons.includes('score below trading threshold'));
-        })
         .map(([symbol, s]) => [displaySymbol(symbol), `<span class="pill">${tAction(s.action)}</span>`, tTrendState(s.trend_state || s.regime), tRiskState(s.risk_state), tSmartMoneyPhase(s.smart_money_phase), s.score, signalEntryPosition(s), flowReasonText(signalReasonText(s)), tVetoes(s.vetoes)]);
       const signalsTable = document.getElementById('signals');
       const signalsScrollAnchor = captureTableScrollAnchor(signalsTable);

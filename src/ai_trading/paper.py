@@ -22,13 +22,13 @@ from ai_trading.strategy import CompositeStrategy
 
 
 PaperSide = Literal["LONG", "SHORT"]
+AUTO_UNIVERSE_SYMBOL = "AUTO_TOP50"
+LEGACY_AUTO_UNIVERSE_SYMBOL = "AUTO_TOP30"
 AUTO_UNIVERSE_EXCLUDED_SYMBOLS = {"BTCUSDT", "BTCUSDC", "ETHUSDT", "SOLUSDT", "XAUUSDT"}
+AUTO_UNIVERSE_SCAN_LIMIT = 80
+AUTO_MAIN_POOL_LIMIT = 50
+AUTO_MAIN_POOL_MIN_SCORE = 65
 CANDIDATE_MIN_QUOTE_VOLUME = 50_000_000
-CANDIDATE_MAX_ABS_24H_CHANGE = 60.0
-CANDIDATE_HIGH_CHANGE_THRESHOLD = 40.0
-CANDIDATE_MAX_UPPER_WICK_RATIO = 0.45
-CANDIDATE_MAX_RETRACE_FROM_HIGH_PCT = 22.0
-CANDIDATE_MAX_CENTER_OFFSET_PCT = 24.0
 BTC_EXTREME_4H_AMPLITUDE = 0.08
 ROTATION_MIN_SCORE_GAP = 20
 ROTATION_MIN_ATR_PCT = 0.008
@@ -148,29 +148,7 @@ class _StateFileLock:
 
 def _candidate_prefilter_allowed(item: object) -> bool:
     quote_volume = float(getattr(item, "quote_volume", 0.0) or 0.0)
-    if quote_volume < CANDIDATE_MIN_QUOTE_VOLUME:
-        return False
-    change = _float_or_none(getattr(item, "price_change_percent", None))
-    last_price = _float_or_none(getattr(item, "last_price", None))
-    high_price = _float_or_none(getattr(item, "high_price", None))
-    low_price = _float_or_none(getattr(item, "low_price", None))
-    open_price = _float_or_none(getattr(item, "open_price", None))
-    if change is not None and abs(change) > CANDIDATE_MAX_ABS_24H_CHANGE:
-        return False
-    if last_price and high_price and low_price and high_price > low_price:
-        center = (high_price + low_price) / 2
-        center_offset = abs(last_price - center) / last_price * 100
-        if change is not None and abs(change) > 35 and center_offset > CANDIDATE_MAX_CENTER_OFFSET_PCT:
-            return False
-        if change is not None and change > CANDIDATE_HIGH_CHANGE_THRESHOLD and open_price:
-            range_size = high_price - low_price
-            upper_wick_ratio = max(high_price - max(open_price, last_price), 0.0) / range_size
-            retrace_from_high_pct = (high_price - last_price) / last_price * 100
-            if upper_wick_ratio >= CANDIDATE_MAX_UPPER_WICK_RATIO:
-                return False
-            if retrace_from_high_pct >= CANDIDATE_MAX_RETRACE_FROM_HIGH_PCT:
-                return False
-    return True
+    return quote_volume >= CANDIDATE_MIN_QUOTE_VOLUME
 
 
 @dataclass(frozen=True)
@@ -230,8 +208,22 @@ class PaperTradingEngine:
         self.settings = settings
         self.state_path = Path(state_path) if state_path else None
         self.account = _load_paper_account(self.state_path) or PaperAccount(starting_balance=starting_balance, wallet_balance=starting_balance)
-        self.symbols = [symbol.upper() for symbol in (symbols or ["AUTO_TOP30"])]
-        self._auto_universe = self.symbols == ["AUTO_TOP30"]
+        requested_symbols = [
+            symbol.upper()
+            for symbol in (symbols or [AUTO_UNIVERSE_SYMBOL])
+        ]
+        self._auto_universe = requested_symbols in (
+            [AUTO_UNIVERSE_SYMBOL],
+            [LEGACY_AUTO_UNIVERSE_SYMBOL],
+        )
+        self.symbols = (
+            [AUTO_UNIVERSE_SYMBOL]
+            if self._auto_universe
+            else requested_symbols
+        )
+        self._universe_symbols: list[str] = []
+        self._candidate_symbols: list[str] = []
+        self._post_close_pool_review: set[str] = set()
         self.interval = interval
         self.market_data = market_data or BinanceFuturesMarketData()
         self.strategy = CompositeStrategy(settings.strategy)
@@ -362,6 +354,11 @@ class PaperTradingEngine:
             self._funding_updated_at.clear()
             self._derivatives_source_at.clear()
             self._current_funding_rates.clear()
+            self._universe_symbols.clear()
+            self._candidate_symbols.clear()
+            self._post_close_pool_review.clear()
+            if self._auto_universe:
+                self.symbols = [AUTO_UNIVERSE_SYMBOL]
             self.last_error = None
             self.last_market_update_at = None
             self._warmup_complete = False
@@ -370,14 +367,24 @@ class PaperTradingEngine:
 
     def configure_symbols(self, symbols: list[str]) -> None:
         requested = [symbol.upper() for symbol in symbols if symbol]
-        use_auto_universe = not requested or requested == ["AUTO_TOP30"]
-        if use_auto_universe and self._auto_universe and self.symbols != ["AUTO_TOP30"]:
+        use_auto_universe = (
+            not requested
+            or requested == [AUTO_UNIVERSE_SYMBOL]
+            or requested == [LEGACY_AUTO_UNIVERSE_SYMBOL]
+        )
+        if (
+            use_auto_universe
+            and self._auto_universe
+            and self.symbols != [AUTO_UNIVERSE_SYMBOL]
+        ):
             return
-        next_symbols = ["AUTO_TOP30"] if use_auto_universe else requested
+        next_symbols = [AUTO_UNIVERSE_SYMBOL] if use_auto_universe else requested
         if self._auto_universe == use_auto_universe and self.symbols == next_symbols:
             return
         self._auto_universe = use_auto_universe
         self.symbols = next_symbols
+        self._universe_symbols.clear()
+        self._candidate_symbols.clear()
         self._warmup_complete = False
         if not use_auto_universe:
             self._prune_market_cache()
@@ -423,6 +430,11 @@ class PaperTradingEngine:
                 batch = symbols[start : start + WARMUP_BATCH_SIZE]
                 await asyncio.gather(*(refresh_with_limit(symbol) for symbol in batch))
                 await asyncio.sleep(0)
+            self._rebalance_auto_signal_pools(
+                fresh_symbols=self._symbols_with_latest_closed_timeframe(
+                    "1h",
+                ),
+            )
             self._warmup_complete = True
             if refreshed:
                 now = datetime.now(UTC)
@@ -487,25 +499,200 @@ class PaperTradingEngine:
             and (now - self._last_universe_refresh_at).total_seconds() < UNIVERSE_REFRESH_SECONDS
         ):
             return
-        top_symbols = await self.market_data.top_usdt_perpetuals(limit=80)
-        eligible = [item for item in top_symbols if item.symbol.upper() not in AUTO_UNIVERSE_EXCLUDED_SYMBOLS]
-        filtered = [item.symbol for item in eligible if _candidate_prefilter_allowed(item)]
-        self.symbols = filtered[:30]
+        eligible = await self._eligible_auto_universe_symbols()
+        universe = eligible[:AUTO_UNIVERSE_SCAN_LIMIT]
+        current_main = [
+            symbol
+            for symbol in self.symbols
+            if symbol in universe
+            and symbol not in {
+                AUTO_UNIVERSE_SYMBOL,
+                LEGACY_AUTO_UNIVERSE_SYMBOL,
+            }
+        ]
+        self._universe_symbols = universe
+        self.symbols = (
+            current_main
+            if current_main
+            else universe[:AUTO_MAIN_POOL_LIMIT]
+        )
+        main_set = set(self.symbols)
+        self._candidate_symbols = [
+            symbol for symbol in universe if symbol not in main_set
+        ]
         self._last_universe_refresh_at = now
         self._prune_market_cache()
         await self._restart_price_stream_if_needed()
 
-    def _managed_symbols(self) -> list[str]:
-        symbols = [
-            symbol for symbol in self.symbols
-            if symbol != "AUTO_TOP30"
+    async def _eligible_auto_universe_symbols(self) -> list[str]:
+        top_symbols = await self.market_data.top_usdt_perpetuals(
+            limit=AUTO_UNIVERSE_SCAN_LIMIT
+        )
+        eligible = [item for item in top_symbols if item.symbol.upper() not in AUTO_UNIVERSE_EXCLUDED_SYMBOLS]
+        return [
+            item.symbol
+            for item in eligible
+            if _candidate_prefilter_allowed(item)
         ]
-        if self._auto_universe and self.symbols == ["AUTO_TOP30"]:
-            symbols.extend(self.latest_signals)
+
+    def _rebalance_auto_signal_pools(
+        self,
+        *,
+        fresh_symbols: set[str] | None = None,
+    ) -> None:
+        if not self._auto_universe or not self._universe_symbols:
+            return
+        fresh = (
+            set(self._universe_symbols)
+            if fresh_symbols is None
+            else set(fresh_symbols)
+        )
+        position_symbols = list(self.account.positions)
+        position_set = set(position_symbols)
+        current_main = [
+            symbol
+            for symbol in self.symbols
+            if (
+                symbol not in position_set
+                and symbol
+                not in {
+                    AUTO_UNIVERSE_SYMBOL,
+                    LEGACY_AUTO_UNIVERSE_SYMBOL,
+                }
+            )
+        ]
+        waiting_post_close = (
+            self._post_close_pool_review - fresh
+        )
+        locked_main = [
+            symbol
+            for symbol in current_main
+            if (
+                symbol not in fresh
+                or symbol in waiting_post_close
+            )
+        ]
+        self._post_close_pool_review.difference_update(fresh)
+        turnover_rank = {
+            symbol: index
+            for index, symbol in enumerate(self._universe_symbols)
+        }
+        entry_actions = {
+            SignalAction.ENTRY_LONG.value,
+            SignalAction.ENTRY_SHORT.value,
+        }
+        eligible: list[str] = []
+        for symbol in self._universe_symbols:
+            if symbol not in fresh or symbol in position_set:
+                continue
+            signal = self.latest_signals.get(symbol)
+            if not isinstance(signal, dict):
+                continue
+            action = str(signal.get("action") or "")
+            score = int(signal.get("score") or 0)
+            if (
+                score >= AUTO_MAIN_POOL_MIN_SCORE
+                and action
+                in {
+                    SignalAction.WATCH.value,
+                    *entry_actions,
+                }
+            ):
+                eligible.append(symbol)
+        eligible.sort(
+            key=lambda symbol: (
+                1
+                if str(
+                    self.latest_signals.get(symbol, {}).get("action") or ""
+                )
+                in entry_actions
+                else 0,
+                int(
+                    self.latest_signals.get(symbol, {}).get("score") or 0
+                ),
+                -turnover_rank[symbol],
+            ),
+            reverse=True,
+        )
+        pinned = list(
+            dict.fromkeys(
+                [
+                    *position_symbols,
+                    *locked_main,
+                ]
+            )
+        )
+        available_slots = max(
+            AUTO_MAIN_POOL_LIMIT - len(pinned),
+            0,
+        )
+        selected = [
+            symbol
+            for symbol in eligible
+            if symbol not in set(pinned)
+        ][:available_slots]
+        self.symbols = [
+            *pinned[:AUTO_MAIN_POOL_LIMIT],
+            *selected,
+        ]
+        main_set = set(self.symbols)
+        self._candidate_symbols = [
+            symbol
+            for symbol in self._universe_symbols
+            if symbol not in main_set
+        ]
+
+    def _managed_symbols(self) -> list[str]:
+        if self._auto_universe:
+            symbols = list(
+                self._universe_symbols
+                or [
+                    symbol
+                    for symbol in self.symbols
+                    if symbol not in {
+                        AUTO_UNIVERSE_SYMBOL,
+                        LEGACY_AUTO_UNIVERSE_SYMBOL,
+                    }
+                ]
+                or self.latest_signals
+            )
+        else:
+            symbols = list(self.symbols)
         for symbol in self.account.positions:
             if symbol not in symbols:
                 symbols.append(symbol)
+        for symbol in self._post_close_pool_review:
+            if symbol not in symbols:
+                symbols.append(symbol)
         return symbols
+
+    def _symbols_with_latest_closed_timeframe(
+        self,
+        timeframe: str,
+        now: datetime | None = None,
+    ) -> set[str]:
+        current_time = now or datetime.now(UTC)
+        expected_open = _latest_closed_slot(
+            timeframe,
+            current_time,
+        ) - timedelta(seconds=_timeframe_seconds(timeframe))
+        return {
+            symbol
+            for symbol in self._managed_symbols()
+            if (
+                symbol in self.latest_signals
+                and self._timeframe_candles.get(symbol, {}).get(timeframe)
+                and self._timeframe_candles[symbol][timeframe][-1].timestamp
+                >= expected_open
+            )
+        }
+
+    def _auto_main_symbols(self) -> set[str]:
+        if not self._auto_universe:
+            return set(self.latest_signals)
+        if self._universe_symbols:
+            return set(self.symbols)
+        return set(self.latest_signals)
 
     def _prune_market_cache(self) -> None:
         managed = set(self._managed_symbols())
@@ -693,7 +880,22 @@ class PaperTradingEngine:
         used_margin = 0.0
         latest_prices = dict(self.latest_prices)
         latest_signals: dict[str, dict[str, object]] = {}
-        for symbol, signal in self.latest_signals.items():
+        main_symbols = set(self.symbols)
+        candidate_symbols = set(self._candidate_symbols)
+        ordered_signal_symbols = list(
+            dict.fromkeys(
+                [
+                    *self.account.positions,
+                    *self.symbols,
+                    *self._candidate_symbols,
+                    *self.latest_signals,
+                ]
+            )
+        )
+        for symbol in ordered_signal_symbols:
+            signal = self.latest_signals.get(symbol)
+            if not isinstance(signal, dict):
+                continue
             has_position = symbol in self.account.positions
             payload = _auto_entry_status_signal(
                 symbol,
@@ -704,6 +906,15 @@ class PaperTradingEngine:
             if self.running and not has_position:
                 for reason in self._data_freshness_blocks(symbol, payload):
                     _record_auto_entry_block(payload, reason)
+            payload["pool"] = (
+                "POSITION"
+                if has_position
+                else "MAIN"
+                if symbol in main_symbols
+                else "CANDIDATE"
+                if symbol in candidate_symbols
+                else "OUTSIDE"
+            )
             latest_signals[symbol] = payload
         latest_timeframe_contexts = {symbol: dict(context) for symbol, context in self.latest_timeframe_contexts.items()}
         positions_snapshot = list(self.account.positions.values())
@@ -770,6 +981,10 @@ class PaperTradingEngine:
             "running": self.running,
             "auto_trade": self.auto_trade,
             "symbols": self.symbols,
+            "candidate_symbols": self._candidate_symbols,
+            "universe_symbols": self._universe_symbols,
+            "main_pool_count": len(self.symbols),
+            "candidate_pool_count": len(self._candidate_symbols),
             "interval": self.interval,
             "starting_balance": self.account.starting_balance,
             "wallet_balance": self.account.wallet_balance,
@@ -819,6 +1034,13 @@ class PaperTradingEngine:
                 if due_timeframes:
                     await self._refresh_closed_timeframes(due_timeframes)
                 await self._refresh_due_derivatives(now)
+                if "1h" in due_timeframes:
+                    self._rebalance_auto_signal_pools(
+                        fresh_symbols=self._symbols_with_latest_closed_timeframe(
+                            "1h",
+                            now,
+                        ),
+                    )
                 await self._refresh_universe_and_new_symbols(now)
                 await self._validate_cached_market_data(now)
                 if monotonic_now - last_live_entry_refresh >= LIVE_ENTRY_REFRESH_SECONDS:
@@ -977,7 +1199,13 @@ class PaperTradingEngine:
         await self.refresh_open_position_prices()
 
     def _refresh_live_entry_timing(self) -> None:
+        live_symbols = (
+            self._auto_main_symbols()
+            | set(self.account.positions)
+        )
         for symbol, signal in self.latest_signals.items():
+            if self._auto_universe and symbol not in live_symbols:
+                continue
             score = int(signal.get("score") or 0)
             if symbol not in self.account.positions and score < AUTO_ENTRY_MIN_SCORE:
                 continue
@@ -1251,26 +1479,86 @@ class PaperTradingEngine:
         if self._scan_lock.locked():
             return
         async with self._scan_lock:
-            previous = set(self.symbols)
-            await self.refresh_universe_if_needed()
-            new_symbols = [
+            previous_universe = list(
+                self._universe_symbols
+                or dict.fromkeys(
+                    [
+                        *self.symbols,
+                        *self._candidate_symbols,
+                    ]
+                )
+            )
+            previous_main = list(self.symbols)
+            eligible = await self._eligible_auto_universe_symbols()
+            desired_universe = eligible[:AUTO_UNIVERSE_SCAN_LIMIT]
+            previous_set = set(previous_universe)
+            symbols_to_warm = [
                 symbol
-                for symbol in self.symbols
-                if symbol not in previous or symbol not in self._timeframe_candles
+                for symbol in desired_universe
+                if (
+                    symbol not in previous_set
+                    or symbol not in self.latest_signals
+                    or not self._symbol_cache_valid(symbol)
+                )
             ]
-            if not new_symbols:
-                return
             semaphore = asyncio.Semaphore(MARKET_REQUEST_CONCURRENCY)
+            warmed: set[str] = set()
 
             async def warm(symbol: str) -> None:
                 async with semaphore:
-                    await self._refresh_symbol(symbol)
+                    if await self._refresh_symbol(symbol):
+                        warmed.add(symbol)
 
-            for start in range(0, len(new_symbols), WARMUP_BATCH_SIZE):
+            for start in range(0, len(symbols_to_warm), WARMUP_BATCH_SIZE):
                 await asyncio.gather(
-                    *(warm(symbol) for symbol in new_symbols[start : start + WARMUP_BATCH_SIZE]),
+                    *(warm(symbol) for symbol in symbols_to_warm[start : start + WARMUP_BATCH_SIZE]),
                     return_exceptions=True,
                 )
+            ready = [
+                symbol
+                for symbol in desired_universe
+                if (
+                    symbol in warmed
+                    or (
+                        symbol in previous_set
+                        and symbol in self.latest_signals
+                        and self._symbol_cache_valid(symbol)
+                    )
+                )
+            ]
+            target_size = len(desired_universe)
+            eligible_set = set(eligible)
+            for symbol in previous_universe:
+                if len(ready) >= target_size:
+                    break
+                if (
+                    symbol in eligible_set
+                    and symbol not in ready
+                    and symbol in self.latest_signals
+                ):
+                    ready.append(symbol)
+            self._universe_symbols = ready
+            ready_set = set(ready)
+            protected_main = (
+                set(self.account.positions)
+                | self._post_close_pool_review
+            )
+            self.symbols = [
+                symbol
+                for symbol in previous_main
+                if (
+                    symbol in ready_set
+                    or symbol in protected_main
+                )
+            ]
+            main_set = set(self.symbols)
+            self._candidate_symbols = [
+                symbol
+                for symbol in ready
+                if symbol not in main_set
+            ]
+            self._last_universe_refresh_at = now
+            self._prune_market_cache()
             await self._restart_price_stream_if_needed()
 
     async def _validate_cached_market_data(self, now: datetime) -> None:
@@ -1534,9 +1822,14 @@ class PaperTradingEngine:
             position.metadata["last_mark_price"] = price
 
     async def _auto_trade_once(self) -> None:
+        auto_entry_symbols = self._auto_main_symbols()
         baseline_signals = {
             symbol: dict(signal)
             for symbol, signal in self.latest_signals.items()
+            if (
+                symbol in auto_entry_symbols
+                or symbol in self.account.positions
+            )
         }
         evaluated_signals = {
             symbol: dict(signal)
@@ -1991,6 +2284,9 @@ class PaperTradingEngine:
                         position.entry_price * (1 - fee_buffer),
                     )
                 if position.remaining_fraction <= 1e-9:
+                    self._mark_symbol_for_post_close_pool_review(
+                        position.symbol
+                    )
                     self.account.positions.pop(position.symbol, None)
                 self._save_state_unlocked()
                 continue
@@ -2137,6 +2433,9 @@ class PaperTradingEngine:
             break
 
     def _close_position_unlocked(self, position: Position, price: float, reason: str) -> Trade:
+        self._mark_symbol_for_post_close_pool_review(
+            position.symbol
+        )
         self.account.positions.pop(position.symbol, None)
         close_quantity = (
             position.quantity * max(position.remaining_fraction, 0.0)
@@ -2203,6 +2502,14 @@ class PaperTradingEngine:
             self._record_reentry_barrier(position)
         self._save_state_unlocked()
         return trade
+
+    def _mark_symbol_for_post_close_pool_review(
+        self,
+        symbol: str,
+    ) -> None:
+        if not self._auto_universe:
+            return
+        self._post_close_pool_review.add(symbol)
 
     def _record_reentry_barrier(self, position: Position) -> None:
         timeframe = _exit_timeframe_from_position(position) or "1h"

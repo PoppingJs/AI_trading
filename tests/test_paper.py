@@ -23,6 +23,7 @@ from ai_trading.paper import (
     _apply_multi_timeframe_context,
     _auto_entry_prerequisite_blocks,
     _auto_signal_allowed,
+    _candidate_prefilter_allowed,
     _confirmed_structure_exit_reason,
     _current_open_risk_usdt,
     _daily_bias_margin_factor,
@@ -1193,23 +1194,58 @@ def test_risk_exit_reason_is_specific_to_one_way_position_risk() -> None:
     assert _risk_exit_reason(PositionSide.LONG, "TREND_LONG", "LONG_CROWD") is None
 
 
-def test_auto_top30_universe_refreshes_symbols() -> None:
+def test_auto_top50_universe_refreshes_symbols() -> None:
     engine = PaperTradingEngine(AppSettings(), starting_balance=1000, market_data=FakeMarketData())
     engine.latest_signals["STALEUSDT"] = {"score": 99}
     engine.account.latest_signals["STALEUSDT"] = {"score": 99}
 
     import asyncio
 
-    assert engine.symbols == ["AUTO_TOP30"]
+    assert engine.symbols == ["AUTO_TOP50"]
     asyncio.run(engine.refresh_universe_if_needed())
 
-    assert len(engine.symbols) == 30
+    assert len(engine.symbols) == 50
+    assert len(engine._candidate_symbols) == 30
     assert "BTCUSDT" not in engine.symbols
     assert "ETHUSDT" not in engine.symbols
     assert "SOLUSDT" not in engine.symbols
     assert engine.symbols[0] == "TEST0USDT"
     assert "STALEUSDT" not in engine.latest_signals
     assert "STALEUSDT" not in engine.account.latest_signals
+
+
+def test_auto_top50_checks_the_top_80_by_turnover() -> None:
+    class CaptureLimitMarket(FakeMarketData):
+        requested_limit: int | None = None
+
+        async def top_usdt_perpetuals(self, limit: int = 30):
+            self.requested_limit = limit
+            return await super().top_usdt_perpetuals(limit=limit)
+
+    market = CaptureLimitMarket()
+    engine = PaperTradingEngine(
+        AppSettings(),
+        starting_balance=1000,
+        market_data=market,
+    )
+
+    asyncio.run(engine.refresh_universe_if_needed())
+
+    assert market.requested_limit == 80
+
+
+def test_candidate_prefilter_only_enforces_the_liquidity_floor() -> None:
+    class Candidate:
+        quote_volume = 100_000_000
+        price_change_percent = 120.0
+        last_price = 50.0
+        high_price = 120.0
+        low_price = 40.0
+        open_price = 100.0
+
+    assert _candidate_prefilter_allowed(Candidate())
+    Candidate.quote_volume = 49_999_999
+    assert not _candidate_prefilter_allowed(Candidate())
 
 
 def test_auto_universe_does_not_backfill_ineligible_symbols() -> None:
@@ -1245,6 +1281,273 @@ def test_auto_universe_does_not_backfill_ineligible_symbols() -> None:
 
     assert engine.symbols == [f"GOOD{idx}USDT" for idx in range(18)]
     assert not any(symbol.startswith("THIN") for symbol in engine.symbols)
+
+
+def test_periodic_universe_swap_keeps_eligible_old_pool_when_new_warmup_fails() -> None:
+    class RotatingMarket(FakeMarketData):
+        async def top_usdt_perpetuals(self, limit: int = 30):
+            class Symbol:
+                def __init__(self, symbol: str) -> None:
+                    self.symbol = symbol
+                    self.quote_volume = 100_000_000
+
+            return [
+                *(Symbol(f"NEW{idx}USDT") for idx in range(30)),
+                *(Symbol(f"OLD{idx}USDT") for idx in range(30)),
+            ][:limit]
+
+    engine = PaperTradingEngine(
+        AppSettings(),
+        starting_balance=1000,
+        market_data=RotatingMarket(),
+    )
+    engine.symbols = [f"OLD{idx}USDT" for idx in range(30)]
+    engine.latest_signals = {
+        symbol: {"action": "NO_TRADE", "score": 0}
+        for symbol in engine.symbols
+    }
+
+    async def warmup_fails(symbol: str) -> bool:
+        return False
+
+    async def no_stream_restart() -> None:
+        return None
+
+    engine._refresh_symbol = warmup_fails  # type: ignore[method-assign]
+    engine._restart_price_stream_if_needed = no_stream_restart  # type: ignore[method-assign]
+
+    asyncio.run(
+        engine._refresh_universe_and_new_symbols(
+            datetime.now(UTC),
+        )
+    )
+
+    assert engine.symbols == [f"OLD{idx}USDT" for idx in range(30)]
+
+
+def test_auto_main_pool_requires_score_65_and_watch_or_entry_action() -> None:
+    engine = PaperTradingEngine(
+        AppSettings(),
+        starting_balance=1000,
+        market_data=FakeMarketData(),
+    )
+    engine._universe_symbols = [
+        "ENTRYUSDT",
+        "WATCHUSDT",
+        "LOWUSDT",
+        "BLOCKEDUSDT",
+    ]
+    engine.latest_signals = {
+        "ENTRYUSDT": {"action": "ENTRY_LONG", "score": 65},
+        "WATCHUSDT": {"action": "WATCH", "score": 65},
+        "LOWUSDT": {"action": "WATCH", "score": 64},
+        "BLOCKEDUSDT": {"action": "NO_TRADE", "score": 99},
+    }
+
+    engine._rebalance_auto_signal_pools()
+
+    assert engine.symbols == ["ENTRYUSDT", "WATCHUSDT"]
+    assert engine._candidate_symbols == ["LOWUSDT", "BLOCKEDUSDT"]
+
+    engine.latest_signals["LOWUSDT"] = {
+        "action": "ENTRY_SHORT",
+        "score": 70,
+    }
+    engine._rebalance_auto_signal_pools()
+
+    assert engine.symbols == [
+        "LOWUSDT",
+        "ENTRYUSDT",
+        "WATCHUSDT",
+    ]
+    assert engine._candidate_symbols == ["BLOCKEDUSDT"]
+
+
+def test_auto_main_pool_never_exceeds_50_symbols() -> None:
+    engine = PaperTradingEngine(
+        AppSettings(),
+        starting_balance=1000,
+        market_data=FakeMarketData(),
+    )
+    engine._universe_symbols = [
+        f"TEST{index}USDT"
+        for index in range(80)
+    ]
+    engine.latest_signals = {
+        symbol: {
+            "action": "WATCH",
+            "score": 65 + index,
+        }
+        for index, symbol in enumerate(engine._universe_symbols)
+    }
+
+    engine._rebalance_auto_signal_pools()
+
+    assert len(engine.symbols) == 50
+    assert len(engine._candidate_symbols) == 30
+    assert set(engine.symbols).isdisjoint(engine._candidate_symbols)
+
+
+def test_pool_rotation_keeps_stale_symbols_in_their_existing_pool() -> None:
+    engine = PaperTradingEngine(
+        AppSettings(),
+        starting_balance=1000,
+        market_data=FakeMarketData(),
+    )
+    engine._universe_symbols = [
+        "STALEMAINUSDT",
+        "FRESHCANDIDATEUSDT",
+        "STALECANDIDATEUSDT",
+    ]
+    engine.symbols = ["STALEMAINUSDT"]
+    engine._candidate_symbols = [
+        "FRESHCANDIDATEUSDT",
+        "STALECANDIDATEUSDT",
+    ]
+    engine.latest_signals = {
+        "STALEMAINUSDT": {
+            "action": "NO_TRADE",
+            "score": 0,
+        },
+        "FRESHCANDIDATEUSDT": {
+            "action": "WATCH",
+            "score": 70,
+        },
+        "STALECANDIDATEUSDT": {
+            "action": "ENTRY_LONG",
+            "score": 99,
+        },
+    }
+
+    engine._rebalance_auto_signal_pools(
+        fresh_symbols={"FRESHCANDIDATEUSDT"},
+    )
+
+    assert engine.symbols == [
+        "STALEMAINUSDT",
+        "FRESHCANDIDATEUSDT",
+    ]
+    assert engine._candidate_symbols == [
+        "STALECANDIDATEUSDT",
+    ]
+
+    engine._rebalance_auto_signal_pools(
+        fresh_symbols=set(engine._universe_symbols),
+    )
+
+    assert "STALEMAINUSDT" not in engine.symbols
+    assert engine.symbols == [
+        "STALECANDIDATEUSDT",
+        "FRESHCANDIDATEUSDT",
+    ]
+
+
+def test_position_is_pinned_first_and_waits_for_post_close_rescore() -> None:
+    engine = PaperTradingEngine(
+        AppSettings(),
+        starting_balance=1000,
+        market_data=FakeMarketData(),
+    )
+    engine._universe_symbols = [
+        "HOLDUSDT",
+        "WATCHUSDT",
+    ]
+    engine.symbols = ["WATCHUSDT"]
+    engine._candidate_symbols = ["HOLDUSDT"]
+    position = asyncio.run(
+        engine.open_position(
+            "HOLDUSDT",
+            "LONG",
+            margin_usdt=100,
+            leverage=5,
+            stop_loss=98.0,
+            take_profit_1=102.0,
+            take_profit_2=104.0,
+        )
+    )
+    engine.latest_prices["HOLDUSDT"] = 100.0
+    engine.latest_signals = {
+        "HOLDUSDT": {
+            "action": "NO_TRADE",
+            "score": 0,
+            "reasons": (),
+            "vetoes": (),
+        },
+        "WATCHUSDT": {
+            "action": "WATCH",
+            "score": 70,
+            "reasons": (),
+            "vetoes": (),
+        },
+    }
+
+    engine._rebalance_auto_signal_pools(
+        fresh_symbols=set(engine._universe_symbols),
+    )
+
+    assert engine.symbols[0] == "HOLDUSDT"
+    assert list(engine.status()["latest_signals"])[0] == "HOLDUSDT"
+
+    engine._close_position_unlocked(position, 100.0, "manual close")
+    engine._rebalance_auto_signal_pools(
+        fresh_symbols={"WATCHUSDT"},
+    )
+
+    assert "HOLDUSDT" in engine.symbols
+    assert "HOLDUSDT" in engine._post_close_pool_review
+
+    engine._rebalance_auto_signal_pools(
+        fresh_symbols={"HOLDUSDT", "WATCHUSDT"},
+    )
+
+    assert "HOLDUSDT" not in engine.symbols
+    assert "HOLDUSDT" not in engine._post_close_pool_review
+    assert "HOLDUSDT" in engine._candidate_symbols
+
+
+def test_candidate_pool_signal_cannot_open_until_promoted_to_main_pool() -> None:
+    settings = AppSettings()
+    settings.risk.max_open_positions = 2
+    engine = PaperTradingEngine(
+        settings,
+        starting_balance=1000,
+        market_data=FakeMarketData(),
+    )
+    engine._universe_symbols = ["MAINUSDT", "CANDIDATEUSDT"]
+    engine.symbols = ["MAINUSDT"]
+    engine._candidate_symbols = ["CANDIDATEUSDT"]
+    engine.latest_prices = {
+        "MAINUSDT": 100.0,
+        "CANDIDATEUSDT": 100.0,
+    }
+    signal = {
+        "action": "ENTRY_LONG",
+        "score": 95,
+        "trend_state": "TREND_LONG",
+        "risk_state": "NORMAL",
+        "price": 100.0,
+        "entry_levels": {
+            "long": {
+                "h1_support": {
+                    "low": 99.0,
+                    "high": 101.0,
+                    "price": 100.0,
+                },
+            },
+        },
+        "h1_structure": {
+            "resistance_zone_low": 105.0,
+            "resistance": 106.0,
+        },
+    }
+    engine.latest_signals = {
+        "MAINUSDT": dict(signal),
+        "CANDIDATEUSDT": dict(signal),
+    }
+
+    asyncio.run(engine._auto_trade_once())
+
+    assert set(engine.account.positions) == {"MAINUSDT"}
 
 
 def test_auto_signal_score_tiers_and_margins() -> None:

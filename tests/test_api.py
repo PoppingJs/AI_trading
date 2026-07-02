@@ -50,4 +50,5 @@ def test_dashboard_uses_concise_chinese_veto_copy(tmp_path: Path) -> None:
     assert "return `${timeframeGap[1]}周期缺失或不连续`;" in page
     assert "signalEntryPosition(s)" in page
     assert "signalEntryTiming(s)" not in page
+    assert "reasons.includes('score below trading threshold')" not in page
     assert "['币种','动作','状态','风险','主力周期','分数','入场位置','原因','否决']" in page
