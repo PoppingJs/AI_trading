@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from collections.abc import Sequence
 
 from ai_trading.config import StrategySettings
-from ai_trading.models import Candle, IndicatorSnapshot, MarketRegime, SignalAction, StrategySignal
+from ai_trading.models import Candle, IndicatorSnapshot, MarketRegime, PositionSide, SignalAction, StrategySignal
 
 
 class CompositeStrategy:
@@ -44,52 +44,44 @@ class CompositeStrategy:
         regime = self._detect_regime(current)
         long_score, long_reasons, long_vetoes = self._score_long(candles, indicators)
         short_score, short_reasons, short_vetoes = self._score_short(candles, indicators)
+        best_is_long = long_score >= short_score
+        best_score = long_score if best_is_long else short_score
+        best_reasons = long_reasons if best_is_long else short_reasons
+        best_vetoes = long_vetoes if best_is_long else short_vetoes
+        direction = PositionSide.LONG if best_is_long else PositionSide.SHORT
+        signal_regime = (
+            MarketRegime.OVERCROWDED
+            if long_vetoes and short_vetoes
+            else regime
+        )
 
-        if long_vetoes and short_vetoes:
+        if best_score >= self.settings.score_threshold:
             return StrategySignal(
                 symbol=symbol,
                 timestamp=current.timestamp,
-                action=SignalAction.NO_TRADE,
-                regime=MarketRegime.OVERCROWDED,
-                score=max(long_score, short_score),
-                vetoes=tuple(sorted(set(long_vetoes + short_vetoes))),
-                reasons=("both sides failed hard filters",),
+                action=(
+                    SignalAction.ENTRY_LONG
+                    if best_is_long
+                    else SignalAction.ENTRY_SHORT
+                ),
+                regime=signal_regime,
+                score=best_score,
+                direction=direction,
+                vetoes=tuple(best_vetoes),
+                reasons=tuple(best_reasons),
                 indicators=current,
             )
 
-        if not long_vetoes and long_score >= self.settings.score_threshold and long_score >= short_score:
-            return StrategySignal(
-                symbol=symbol,
-                timestamp=current.timestamp,
-                action=SignalAction.ENTRY_LONG,
-                regime=regime,
-                score=long_score,
-                reasons=tuple(long_reasons),
-                indicators=current,
-            )
-
-        if not short_vetoes and short_score >= self.settings.score_threshold:
-            return StrategySignal(
-                symbol=symbol,
-                timestamp=current.timestamp,
-                action=SignalAction.ENTRY_SHORT,
-                regime=regime,
-                score=short_score,
-                reasons=tuple(short_reasons),
-                indicators=current,
-            )
-
-        best_score = max(long_score if not long_vetoes else 0, short_score if not short_vetoes else 0)
         if best_score >= self.settings.watch_threshold:
-            reasons = long_reasons if long_score >= short_score else short_reasons
             return StrategySignal(
                 symbol=symbol,
                 timestamp=current.timestamp,
                 action=SignalAction.WATCH,
-                regime=regime,
+                regime=signal_regime,
                 score=best_score,
-                vetoes=tuple(long_vetoes if long_score >= short_score else short_vetoes),
-                reasons=tuple(reasons),
+                direction=direction,
+                vetoes=tuple(best_vetoes),
+                reasons=tuple(best_reasons),
                 indicators=current,
             )
 
@@ -97,9 +89,10 @@ class CompositeStrategy:
             symbol=symbol,
             timestamp=current.timestamp,
             action=SignalAction.NO_TRADE,
-            regime=regime,
+            regime=signal_regime,
             score=best_score,
-            vetoes=tuple(long_vetoes if long_score >= short_score else short_vetoes),
+            direction=direction,
+            vetoes=tuple(best_vetoes),
             reasons=("score below trading threshold",),
             indicators=current,
         )

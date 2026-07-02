@@ -1325,7 +1325,7 @@ def test_periodic_universe_swap_keeps_eligible_old_pool_when_new_warmup_fails() 
     assert engine.symbols == [f"OLD{idx}USDT" for idx in range(30)]
 
 
-def test_auto_main_pool_requires_score_65_and_watch_or_entry_action() -> None:
+def test_auto_main_pool_uses_score_65_regardless_of_signal_action() -> None:
     engine = PaperTradingEngine(
         AppSettings(),
         starting_balance=1000,
@@ -1346,8 +1346,8 @@ def test_auto_main_pool_requires_score_65_and_watch_or_entry_action() -> None:
 
     engine._rebalance_auto_signal_pools()
 
-    assert engine.symbols == ["ENTRYUSDT", "WATCHUSDT"]
-    assert engine._candidate_symbols == ["LOWUSDT", "BLOCKEDUSDT"]
+    assert engine.symbols == ["BLOCKEDUSDT", "ENTRYUSDT", "WATCHUSDT"]
+    assert engine._candidate_symbols == ["LOWUSDT"]
 
     engine.latest_signals["LOWUSDT"] = {
         "action": "ENTRY_SHORT",
@@ -1356,11 +1356,42 @@ def test_auto_main_pool_requires_score_65_and_watch_or_entry_action() -> None:
     engine._rebalance_auto_signal_pools()
 
     assert engine.symbols == [
+        "BLOCKEDUSDT",
         "LOWUSDT",
         "ENTRYUSDT",
         "WATCHUSDT",
     ]
-    assert engine._candidate_symbols == ["BLOCKEDUSDT"]
+    assert engine._candidate_symbols == []
+
+
+@pytest.mark.parametrize(
+    ("score", "expected_action"),
+    [
+        (64, SignalAction.NO_TRADE.value),
+        (65, SignalAction.WATCH.value),
+        (81, SignalAction.WATCH.value),
+        (82, SignalAction.ENTRY_LONG.value),
+    ],
+)
+def test_final_score_band_normalizes_signal_action(
+    score: int,
+    expected_action: str,
+) -> None:
+    signal = _apply_multi_timeframe_context(
+        {
+            "action": SignalAction.WATCH.value,
+            "candidate_action": SignalAction.ENTRY_LONG.value,
+            "score": score,
+            "reasons": (),
+            "vetoes": (),
+            "risk_state": "NORMAL",
+            "trend_state": "TREND_LONG",
+        },
+        {},
+    )
+
+    assert signal["score"] == score
+    assert signal["action"] == expected_action
 
 
 def test_auto_main_pool_never_exceeds_50_symbols() -> None:

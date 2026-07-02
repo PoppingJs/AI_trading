@@ -19,7 +19,9 @@ The strategy avoids single-indicator prediction. It scores market state instead:
 - Momentum filter: `RSI14`.
 - Stop buffer: structural high/low plus ATR buffer.
 
-Entry signals must pass the score threshold and hard vetoes:
+Signals below 65 are `NO_TRADE`; scores from 65 to 81 remain under
+observation, and scores of at least 82 establish a directional entry signal.
+Hard vetoes remain visible on the signal and are enforced by automatic entry:
 
 - No long chase when RSI is overheated, price closes above upper BOLL, funding is hot, long side is crowded, or OI spikes.
 - No short chase when RSI is oversold, price closes below lower BOLL, funding is very negative, short side is crowded, or OI spikes.

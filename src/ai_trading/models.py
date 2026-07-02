@@ -81,6 +81,7 @@ class StrategySignal:
     action: SignalAction
     regime: MarketRegime
     score: int
+    direction: PositionSide | None = None
     vetoes: tuple[str, ...] = ()
     reasons: tuple[str, ...] = ()
     indicators: IndicatorSnapshot | None = None

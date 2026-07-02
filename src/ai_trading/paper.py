@@ -577,10 +577,6 @@ class PaperTradingEngine:
             symbol: index
             for index, symbol in enumerate(self._universe_symbols)
         }
-        entry_actions = {
-            SignalAction.ENTRY_LONG.value,
-            SignalAction.ENTRY_SHORT.value,
-        }
         eligible: list[str] = []
         for symbol in self._universe_symbols:
             if symbol not in fresh or symbol in position_set:
@@ -588,25 +584,11 @@ class PaperTradingEngine:
             signal = self.latest_signals.get(symbol)
             if not isinstance(signal, dict):
                 continue
-            action = str(signal.get("action") or "")
             score = int(signal.get("score") or 0)
-            if (
-                score >= AUTO_MAIN_POOL_MIN_SCORE
-                and action
-                in {
-                    SignalAction.WATCH.value,
-                    *entry_actions,
-                }
-            ):
+            if score >= AUTO_MAIN_POOL_MIN_SCORE:
                 eligible.append(symbol)
         eligible.sort(
             key=lambda symbol: (
-                1
-                if str(
-                    self.latest_signals.get(symbol, {}).get("action") or ""
-                )
-                in entry_actions
-                else 0,
                 int(
                     self.latest_signals.get(symbol, {}).get("score") or 0
                 ),
@@ -1722,7 +1704,14 @@ class PaperTradingEngine:
         )
         signal = strategy.generate_signal(symbol, base_candles, indicators)
         cycle = strategy.smart_money_cycle(base_candles, indicators)
-        signal_side = "LONG" if signal.action == SignalAction.ENTRY_LONG else "SHORT" if signal.action == SignalAction.ENTRY_SHORT else None
+        signal_side = signal.direction.value if signal.direction else None
+        candidate_action = (
+            SignalAction.ENTRY_LONG.value
+            if signal.direction == PositionSide.LONG
+            else SignalAction.ENTRY_SHORT.value
+            if signal.direction == PositionSide.SHORT
+            else None
+        )
         trend_state = strategy.trend_state(signal_side, indicators)
         risk_state = strategy.risk_state(indicators)
         current = indicators[-1] if indicators else None
@@ -1731,6 +1720,7 @@ class PaperTradingEngine:
             "timestamp": signal.timestamp.isoformat(),
             "signal_timeframe": signal_timeframe,
             "action": signal.action.value,
+            "candidate_action": candidate_action,
             "regime": signal.regime.value,
             "trend_state": trend_state,
             "risk_state": risk_state,
@@ -5840,7 +5830,7 @@ def _apply_multi_timeframe_context(signal: dict[str, object], context: dict[str,
     reasons = list(out.get("reasons") or [])
     vetoes = list(out.get("vetoes") or [])
     score = int(out.get("score") or 0)
-    action = str(out.get("action") or "")
+    action = str(out.get("candidate_action") or out.get("action") or "")
     daily_bias = str(context.get("daily_bias") or "NEUTRAL")
     h4 = context.get("h4_structure") if isinstance(context.get("h4_structure"), dict) else {}
     h1_structure = context.get("h1_structure") if isinstance(context.get("h1_structure"), dict) else {}
@@ -6076,6 +6066,7 @@ def _apply_multi_timeframe_context(signal: dict[str, object], context: dict[str,
     reasons.append(str(context.get("summary") or "multi-timeframe context neutral"))
     stage_probe = {
         **out,
+        "action": action,
         "score": max(0, score),
         "reasons": tuple(reasons),
         "h1_trigger": h1,
@@ -6098,7 +6089,19 @@ def _apply_multi_timeframe_context(signal: dict[str, object], context: dict[str,
     if trend_stage_phase == TREND_STAGE_LATE and action in {SignalAction.ENTRY_LONG.value, SignalAction.ENTRY_SHORT.value}:
         out["leverage_cap"] = min(int(out.get("leverage_cap") or 99), 5)
         reasons.append("trend late stage; wait for a new pullback before fresh entry")
-    out["score"] = max(0, score)
+    final_score = max(0, score)
+    out["score"] = final_score
+    if final_score < AUTO_MAIN_POOL_MIN_SCORE:
+        out["action"] = SignalAction.NO_TRADE.value
+    elif final_score < AUTO_ENTRY_MIN_SCORE:
+        out["action"] = SignalAction.WATCH.value
+    elif action in {
+        SignalAction.ENTRY_LONG.value,
+        SignalAction.ENTRY_SHORT.value,
+    }:
+        out["action"] = action
+    else:
+        out["action"] = SignalAction.WATCH.value
     out["reasons"] = tuple(reasons)
     out["vetoes"] = tuple(vetoes)
     out["daily_bias"] = daily_bias

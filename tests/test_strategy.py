@@ -5,7 +5,7 @@ from datetime import UTC, datetime, timedelta
 
 from ai_trading.config import StrategySettings
 from ai_trading.indicators import build_indicators
-from ai_trading.models import Candle, DerivativesSnapshot, SignalAction
+from ai_trading.models import Candle, DerivativesSnapshot, PositionSide, SignalAction
 from ai_trading.strategy import CompositeStrategy, MarketStructure, _volume_breakout_retest_confirmation
 
 
@@ -26,6 +26,33 @@ def test_strategy_defers_overheated_rsi_to_multi_timeframe_context() -> None:
     assert signal.action == SignalAction.NO_TRADE
     assert "RSI overheated for long entry" not in signal.vetoes
     assert "long side overcrowded" in signal.vetoes
+
+
+def test_strategy_uses_score_bands_and_keeps_risk_conditions_as_vetoes() -> None:
+    candles, derivatives = _trending_market()
+    indicators = build_indicators(candles, derivatives)
+    strategy = CompositeStrategy()
+    strategy._score_long = lambda *_: (90, ["long direction"], ["OI spike"])  # type: ignore[method-assign]
+    strategy._score_short = lambda *_: (40, ["short direction"], [])  # type: ignore[method-assign]
+
+    signal = strategy.generate_signal("BTCUSDT", candles, indicators)
+
+    assert signal.action == SignalAction.ENTRY_LONG
+    assert signal.direction == PositionSide.LONG
+    assert signal.vetoes == ("OI spike",)
+
+    strategy._score_long = lambda *_: (70, ["long direction"], ["funding extreme"])  # type: ignore[method-assign]
+    signal = strategy.generate_signal("BTCUSDT", candles, indicators)
+
+    assert signal.action == SignalAction.WATCH
+    assert signal.direction == PositionSide.LONG
+    assert signal.vetoes == ("funding extreme",)
+
+    strategy._score_long = lambda *_: (64, ["long direction"], [])  # type: ignore[method-assign]
+    signal = strategy.generate_signal("BTCUSDT", candles, indicators)
+
+    assert signal.action == SignalAction.NO_TRADE
+    assert signal.score == 64
 
 
 def test_strategy_emits_long_when_score_is_strong() -> None:

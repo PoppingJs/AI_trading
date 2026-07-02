@@ -7,8 +7,8 @@ from typing import Any
 
 @dataclass
 class StrategySettings:
-    score_threshold: int = 75
-    watch_threshold: int = 60
+    score_threshold: int = 82
+    watch_threshold: int = 65
     strict_trend_entry: bool = False
     volume_window: int = 20
     volume_min_ratio: float = 1.2
