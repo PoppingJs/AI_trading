@@ -15,6 +15,7 @@ from ai_trading.paper import (
     DISTRIBUTION_STAGE_MARKDOWN,
     DISTRIBUTION_STAGE_RANGE,
     MARKET_PRICE_STALE_SECONDS,
+    STATE_SAVE_SECONDS,
     PaperStateError,
     PaperTradingEngine,
     _clear_transient_auto_entry_blocks,
@@ -69,6 +70,10 @@ from ai_trading.paper import (
     _update_position_excursions,
     _update_entry_position_fields,
 )
+
+
+def test_periodic_state_checkpoint_is_throttled_to_five_minutes() -> None:
+    assert STATE_SAVE_SECONDS == 300.0
 
 
 class FakeMarketData:
@@ -1419,6 +1424,61 @@ def test_auto_main_pool_never_exceeds_50_symbols() -> None:
     assert set(engine.symbols).isdisjoint(engine._candidate_symbols)
 
 
+def test_auto_main_pool_rebalances_on_15m_close_not_only_1h_close() -> None:
+    engine = PaperTradingEngine(
+        AppSettings(),
+        starting_balance=1000,
+        market_data=FakeMarketData(),
+    )
+    engine._universe_symbols = ["PROMOTEUSDT"]
+    engine.symbols = []
+    engine._candidate_symbols = ["PROMOTEUSDT"]
+    engine.latest_signals = {
+        "PROMOTEUSDT": {
+            "action": SignalAction.WATCH.value,
+            "score": 70,
+        }
+    }
+    engine._symbols_with_latest_closed_timeframe = (  # type: ignore[method-assign]
+        lambda timeframe, now=None: {"PROMOTEUSDT"}
+        if timeframe == "15m"
+        else set()
+    )
+    now = datetime(2026, 7, 3, 2, 15, tzinfo=UTC)
+
+    engine._rebalance_auto_signal_pools_if_due(("1h",), now)
+    assert engine.symbols == []
+
+    engine._rebalance_auto_signal_pools_if_due(("15m",), now)
+    assert engine.symbols == ["PROMOTEUSDT"]
+    assert engine._candidate_symbols == []
+
+
+def test_auto_status_only_exposes_main_pool_signals() -> None:
+    engine = PaperTradingEngine(
+        AppSettings(),
+        starting_balance=1000,
+        market_data=FakeMarketData(),
+    )
+    engine._universe_symbols = ["MAINUSDT", "CANDIDATEUSDT"]
+    engine.symbols = ["MAINUSDT"]
+    engine._candidate_symbols = ["CANDIDATEUSDT"]
+    engine.latest_signals = {
+        "MAINUSDT": {
+            "action": SignalAction.WATCH.value,
+            "score": 70,
+        },
+        "CANDIDATEUSDT": {
+            "action": SignalAction.NO_TRADE.value,
+            "score": 64,
+        },
+    }
+
+    status = engine.status()
+
+    assert list(status["latest_signals"]) == ["MAINUSDT"]
+
+
 def test_pool_rotation_keeps_stale_symbols_in_their_existing_pool() -> None:
     engine = PaperTradingEngine(
         AppSettings(),
@@ -1705,14 +1765,13 @@ def test_entry_timing_turns_good_when_price_reaches_suggested_zone() -> None:
     assert _auto_signal_allowed(signal)
 
 
-def test_entry_position_requires_midpoint_reclaim_inside_scored_zone() -> None:
+def test_entry_position_is_good_immediately_inside_scored_zone() -> None:
     signal = {
         "timestamp": "2026-07-01T00:00:00+00:00",
         "action": SignalAction.ENTRY_LONG.value,
         "score": 90,
         "trend_state": "TREND_LONG",
         "risk_state": "NORMAL",
-        "entry_confirmation_required": True,
         "price": 100.7,
         "entry_levels": {
             "long": {
@@ -1726,13 +1785,13 @@ def test_entry_position_requires_midpoint_reclaim_inside_scored_zone() -> None:
     }
 
     _update_entry_position_fields(signal)
-    assert signal["entry_timing"] == "WAIT"
+    assert signal["entry_timing"] == "GOOD"
 
-    signal["price"] = 99.8
+    signal["price"] = 98.8
     _update_entry_position_fields(signal)
     assert signal["entry_timing"] == "WAIT"
 
-    signal["price"] = 100.2
+    signal["price"] = 99.8
     _update_entry_position_fields(signal)
     assert signal["entry_timing"] == "GOOD"
 
@@ -1744,7 +1803,7 @@ def test_entry_position_rejects_aave_like_lower_single_indicator_zone() -> None:
         "score": 96,
         "trend_state": "TREND_SHORT",
         "risk_state": "NORMAL",
-        "entry_confirmation_required": True,
+        "reasons": ("1h BOLL/EMA pullback rejected with clean risk",),
         "price": 90.93,
         "entry_levels": {
             "short": {
@@ -1777,9 +1836,39 @@ def test_entry_position_rejects_aave_like_lower_single_indicator_zone() -> None:
 
     signal["price"] = 94.5
     _update_entry_position_fields(signal)
+    assert signal["entry_timing"] == "GOOD"
+
+
+def test_correlated_indicator_zones_need_scored_pullback_confirmation() -> None:
+    signal = {
+        "action": SignalAction.ENTRY_LONG.value,
+        "score": 96,
+        "trend_state": "TREND_LONG",
+        "risk_state": "NORMAL",
+        "price": 100.0,
+        "reasons": ("4h structure supports upside",),
+        "entry_levels": {
+            "long": {
+                "h1_boll_mid": {
+                    "low": 99.5,
+                    "high": 100.5,
+                    "price": 100.0,
+                },
+                "h1_ema20_ema60": {
+                    "low": 99.6,
+                    "high": 100.4,
+                    "price": 100.0,
+                },
+            }
+        },
+    }
+
+    _update_entry_position_fields(signal)
     assert signal["entry_timing"] == "WAIT"
 
-    signal["price"] = 94.1
+    signal["reasons"] = (
+        "1h BOLL/EMA pullback held with clean risk",
+    )
     _update_entry_position_fields(signal)
     assert signal["entry_timing"] == "GOOD"
 
@@ -1797,8 +1886,8 @@ def test_separated_ema20_and_ema60_do_not_create_a_bridge_entry_zone() -> None:
     )
 
     assert zone == {
-        "low": pytest.approx(93.55),
-        "high": pytest.approx(94.45),
+        "low": pytest.approx(93.7),
+        "high": pytest.approx(94.3),
         "price": 94.0,
     }
 
@@ -1827,8 +1916,7 @@ def test_oi_context_does_not_become_a_standalone_suggested_entry_zone() -> None:
         levels,
     )
 
-    assert "oi_distribution" not in selected["short"]
-    assert selected["short"]["h1_resistance"]["price"] == 94.3
+    assert selected == {}
 
 
 def test_ma_cluster_breakdown_is_direction_evidence_not_a_short_entry_zone() -> None:
@@ -1856,8 +1944,7 @@ def test_ma_cluster_breakdown_is_direction_evidence_not_a_short_entry_zone() -> 
         levels,
     )
 
-    assert "ma_cluster_breakdown" not in selected["short"]
-    assert set(selected["short"]) == {"h1_resistance"}
+    assert selected == {}
 
 
 def test_high_distribution_handoff_distinguishes_weak_price_from_healthy_recovery() -> None:
@@ -2434,14 +2521,13 @@ def test_distribution_stage_stop_sits_above_the_active_price_structure() -> None
     assert refined == 93.2
 
 
-def test_new_signal_version_requires_a_fresh_zone_reclaim() -> None:
+def test_new_signal_version_does_not_reset_entry_position_inside_zone() -> None:
     signal = {
         "timestamp": "2026-07-01T00:00:00+00:00",
         "action": SignalAction.ENTRY_LONG.value,
         "score": 90,
         "trend_state": "TREND_LONG",
         "risk_state": "NORMAL",
-        "entry_confirmation_required": True,
         "price": 100.0,
         "entry_levels": {
             "long": {
@@ -2460,7 +2546,7 @@ def test_new_signal_version_requires_a_fresh_zone_reclaim() -> None:
     signal["timestamp"] = "2026-07-01T01:00:00+00:00"
     _update_entry_position_fields(signal)
 
-    assert signal["entry_timing"] == "WAIT"
+    assert signal["entry_timing"] == "GOOD"
 
 
 def test_non_entry_signal_timing_is_not_excellent() -> None:
@@ -2783,6 +2869,45 @@ def test_repeated_1h_ema_sweeps_mark_the_timeframe_unreliable() -> None:
     assert reliability["ema60_breach_episodes"] == 1
 
 
+def test_repeated_1h_ema_resistance_sweeps_mark_short_entries_unreliable() -> None:
+    start = datetime(2026, 6, 26, tzinfo=UTC)
+    candles = [
+        Candle(
+            timestamp=start + timedelta(hours=index),
+            open=100.0,
+            high=100.0,
+            low=99.0,
+            close=100.0,
+            volume=1000.0,
+        )
+        for index in range(70)
+    ]
+    for index in (52, 60):
+        candles[index] = Candle(
+            timestamp=candles[index].timestamp,
+            open=100.0,
+            high=102.0,
+            low=99.0,
+            close=100.0,
+            volume=1000.0,
+        )
+    reliability = _one_hour_ema_reliability(
+        candles,
+        [
+            indicator_snapshot(
+                close=100.0,
+                atr=1.0,
+                ema20=100.0,
+            )
+            for _ in candles
+        ],
+    )
+
+    assert reliability["short_state"] == "UNRELIABLE"
+    assert reliability["ema20_resistance_breach_episodes"] == 2
+    assert reliability["ema60_resistance_breach_episodes"] == 1
+
+
 def test_unreliable_1h_long_promotes_entry_stop_and_target_to_4h() -> None:
     signal = {
         "action": SignalAction.ENTRY_LONG.value,
@@ -2850,6 +2975,78 @@ def test_unreliable_1h_long_promotes_entry_stop_and_target_to_4h() -> None:
             adjusted,
             PositionSide.LONG,
             95.0,
+        )
+        == "4h"
+    )
+
+
+def test_unreliable_1h_short_promotes_entry_stop_and_target_to_4h() -> None:
+    signal = {
+        "action": SignalAction.ENTRY_SHORT.value,
+        "score": 92,
+        "trend_state": "TREND_SHORT",
+        "risk_state": "NORMAL",
+        "reasons": (),
+        "vetoes": (),
+        "price": 105.0,
+    }
+    context = {
+        "daily_bias": "NEUTRAL",
+        "h4_structure": {"state": "RANGE_MID"},
+        "h1_structure": {},
+        "h4_ma_cluster": {},
+        "h1_ma_cluster": {},
+        "h4_oi": {"state": "NORMAL"},
+        "h4_oi_valley": {"state": "WATCH"},
+        "h1_trigger": {"direction": "NONE", "state": "WAIT"},
+        "h1_pullback": {"direction": "NONE", "state": "WAIT"},
+        "h1_ema_reliability": {
+            "short_state": "UNRELIABLE",
+            "ema20_resistance_breach_episodes": 2,
+            "ema60_resistance_breach_episodes": 1,
+        },
+        "distribution_short": {"active": False},
+        "m15_precision": {},
+        "entry_levels": {
+            "short": {
+                "h1_resistance": {
+                    "low": 101.0,
+                    "high": 102.0,
+                    "price": 101.5,
+                },
+                "h4_resistance": {
+                    "low": 104.5,
+                    "high": 105.5,
+                    "price": 105.0,
+                },
+                "h4_boll_mid": {
+                    "low": 104.6,
+                    "high": 105.4,
+                    "price": 105.0,
+                },
+                "h4_ema20_ema60": {
+                    "low": 104.7,
+                    "high": 105.3,
+                    "price": 105.0,
+                },
+            }
+        },
+        "summary": "test",
+    }
+
+    adjusted = _apply_multi_timeframe_context(signal, context)
+
+    assert adjusted["entry_timeframe_override"] == "4h"
+    assert set(adjusted["entry_levels"]["short"]) == {
+        "h4_resistance",
+        "h4_boll_mid",
+        "h4_ema20_ema60",
+    }
+    assert (
+        _entry_timeframe_for_signal(
+            adjusted,
+            PositionSide.SHORT,
+            105.0,
         )
         == "4h"
     )
@@ -3174,7 +3371,15 @@ def test_high_area_long_allows_retest_confirmation() -> None:
         "h4_structure": {"state": "BOX_UPPER_HALF"},
         "h1_trigger": {"direction": "LONG", "state": "RETEST"},
         "h1_pullback": {"direction": "NONE", "state": "WAIT"},
-        "entry_levels": {"long": {"h1_support": {"low": 99.0, "high": 101.0, "price": 100.0}}},
+        "entry_levels": {
+            "long": {
+                "breakout_retest": {
+                    "low": 99.0,
+                    "high": 101.0,
+                    "price": 100.0,
+                }
+            }
+        },
         "summary": "MTF: test",
     }
 

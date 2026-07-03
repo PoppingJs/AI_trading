@@ -1467,8 +1467,6 @@ PAPER_DASHBOARD_HTML = """
         'entry position good: live price is inside a scored short entry zone': '实时价格已进入评分认可的做空区间',
         'entry position wait: live price has not reached a scored long entry zone': '实时价格尚未进入评分认可的做多区间',
         'entry position wait: live price has not reached a scored short entry zone': '实时价格尚未进入评分认可的做空区间',
-        'entry position wait: long entry zone touched; waiting for midpoint reclaim': '已进入做多区间，等待重新站上区间中位',
-        'entry position wait: short entry zone touched; waiting for midpoint rejection': '已进入做空区间，等待重新跌回区间中位',
         'entry position wait: live price is at or below 1h BOLL lower; wait for a higher-timeframe bounce': '实时价格位于或跌破1H BOLL下轨，等待1H/4H反抽后再做空',
         'entry position blocked: suggested entry zone unavailable': '评分未生成有效建议入场区'
       };

@@ -28,6 +28,7 @@ AUTO_UNIVERSE_EXCLUDED_SYMBOLS = {"BTCUSDT", "BTCUSDC", "ETHUSDT", "SOLUSDT", "X
 AUTO_UNIVERSE_SCAN_LIMIT = 80
 AUTO_MAIN_POOL_LIMIT = 50
 AUTO_MAIN_POOL_MIN_SCORE = 65
+AUTO_POOL_REBALANCE_TIMEFRAME = "15m"
 CANDIDATE_MIN_QUOTE_VOLUME = 50_000_000
 BTC_EXTREME_4H_AMPLITUDE = 0.08
 ROTATION_MIN_SCORE_GAP = 20
@@ -73,7 +74,9 @@ POSITION_DERIVATIVES_REFRESH_SECONDS = 60.0
 BACKGROUND_DERIVATIVES_REFRESH_SECONDS = 180.0
 FUNDING_REFRESH_SECONDS = 600.0
 UNIVERSE_REFRESH_SECONDS = 900.0
-STATE_SAVE_SECONDS = 15.0
+# Trade/account mutations persist immediately at their call sites. This slower
+# checkpoint only preserves non-critical live snapshots such as marks/signals.
+STATE_SAVE_SECONDS = 300.0
 FULL_DATA_CHECK_SECONDS = 120.0
 MARKET_REQUEST_CONCURRENCY = 3
 WARMUP_BATCH_SIZE = 5
@@ -432,7 +435,7 @@ class PaperTradingEngine:
                 await asyncio.sleep(0)
             self._rebalance_auto_signal_pools(
                 fresh_symbols=self._symbols_with_latest_closed_timeframe(
-                    "1h",
+                    AUTO_POOL_REBALANCE_TIMEFRAME,
                 ),
             )
             self._warmup_complete = True
@@ -669,6 +672,20 @@ class PaperTradingEngine:
             )
         }
 
+    def _rebalance_auto_signal_pools_if_due(
+        self,
+        due_timeframes: tuple[str, ...],
+        now: datetime,
+    ) -> None:
+        if AUTO_POOL_REBALANCE_TIMEFRAME not in due_timeframes:
+            return
+        self._rebalance_auto_signal_pools(
+            fresh_symbols=self._symbols_with_latest_closed_timeframe(
+                AUTO_POOL_REBALANCE_TIMEFRAME,
+                now,
+            ),
+        )
+
     def _auto_main_symbols(self) -> set[str]:
         if not self._auto_universe:
             return set(self.latest_signals)
@@ -863,15 +880,24 @@ class PaperTradingEngine:
         latest_prices = dict(self.latest_prices)
         latest_signals: dict[str, dict[str, object]] = {}
         main_symbols = set(self.symbols)
-        candidate_symbols = set(self._candidate_symbols)
-        ordered_signal_symbols = list(
-            dict.fromkeys(
-                [
-                    *self.account.positions,
-                    *self.symbols,
-                    *self._candidate_symbols,
-                    *self.latest_signals,
-                ]
+        ordered_signal_symbols = (
+            list(
+                dict.fromkeys(
+                    [
+                        *self.account.positions,
+                        *self.symbols,
+                    ]
+                )
+            )
+            if self._auto_universe and self._universe_symbols
+            else list(
+                dict.fromkeys(
+                    [
+                        *self.account.positions,
+                        *self.symbols,
+                        *self.latest_signals,
+                    ]
+                )
             )
         )
         for symbol in ordered_signal_symbols:
@@ -893,12 +919,14 @@ class PaperTradingEngine:
                 if has_position
                 else "MAIN"
                 if symbol in main_symbols
-                else "CANDIDATE"
-                if symbol in candidate_symbols
                 else "OUTSIDE"
             )
             latest_signals[symbol] = payload
-        latest_timeframe_contexts = {symbol: dict(context) for symbol, context in self.latest_timeframe_contexts.items()}
+        latest_timeframe_contexts = {
+            symbol: dict(self.latest_timeframe_contexts[symbol])
+            for symbol in ordered_signal_symbols
+            if symbol in self.latest_timeframe_contexts
+        }
         positions_snapshot = list(self.account.positions.values())
         fills_snapshot = list(self.account.fills[-100:])
         for position in positions_snapshot:
@@ -1016,13 +1044,10 @@ class PaperTradingEngine:
                 if due_timeframes:
                     await self._refresh_closed_timeframes(due_timeframes)
                 await self._refresh_due_derivatives(now)
-                if "1h" in due_timeframes:
-                    self._rebalance_auto_signal_pools(
-                        fresh_symbols=self._symbols_with_latest_closed_timeframe(
-                            "1h",
-                            now,
-                        ),
-                    )
+                self._rebalance_auto_signal_pools_if_due(
+                    due_timeframes,
+                    now,
+                )
                 await self._refresh_universe_and_new_symbols(now)
                 await self._validate_cached_market_data(now)
                 if monotonic_now - last_live_entry_refresh >= LIVE_ENTRY_REFRESH_SECONDS:
@@ -3911,7 +3936,6 @@ def _record_auto_entry_block(signal: dict[str, object], reason: str) -> None:
 
 
 def _update_entry_position_fields(signal: dict[str, object]) -> None:
-    _advance_entry_zone_confirmation(signal)
     entry_position, reason = _signal_entry_timing(signal)
     signal["entry_timing"] = entry_position
     signal["entry_timing_reason"] = reason
@@ -4108,17 +4132,6 @@ def _side_entry_timing(side: PositionSide, price: float, signal: dict[str, objec
             "entry position wait: live price is at or below 1h BOLL lower; wait for a higher-timeframe bounce",
         )
     if _entry_level_group_hit(signal, price, side, include_m15=include_m15):
-        if (
-            signal.get("entry_confirmation_required")
-            and not bool(
-                (
-                    signal.get("entry_zone_confirmation")
-                    if isinstance(signal.get("entry_zone_confirmation"), dict)
-                    else {}
-                ).get("confirmed")
-            )
-        ):
-            return ENTRY_TIMING_WAIT, _wait_zone_reclaim_reason(side)
         return ENTRY_TIMING_GOOD, _entry_zone_reason(side)
     return ENTRY_TIMING_WAIT, _wait_retest_reason(side)
 
@@ -4151,79 +4164,6 @@ def _wait_retest_reason(side: PositionSide) -> str:
     if side == PositionSide.LONG:
         return "entry position wait: live price has not reached a scored long entry zone"
     return "entry position wait: live price has not reached a scored short entry zone"
-
-
-def _wait_zone_reclaim_reason(side: PositionSide) -> str:
-    if side == PositionSide.LONG:
-        return "entry position wait: long entry zone touched; waiting for midpoint reclaim"
-    return "entry position wait: short entry zone touched; waiting for midpoint rejection"
-
-
-def _advance_entry_zone_confirmation(signal: dict[str, object]) -> None:
-    if not signal.get("entry_confirmation_required"):
-        return
-    side = _signal_side(signal)
-    price = _float_or_none(signal.get("price"))
-    if side is None or price is None:
-        signal.pop("entry_zone_confirmation", None)
-        return
-    include_m15 = _strong_m15_pullback_allowed(
-        side,
-        str(signal.get("trend_state") or signal.get("regime") or ""),
-        str(signal.get("risk_state") or "NORMAL"),
-        int(signal.get("score") or 0),
-        signal.get("m15_precision")
-        if isinstance(signal.get("m15_precision"), dict)
-        else {},
-        str(signal.get("smart_money_phase") or ""),
-    )
-    bounds = _entry_zone_bounds(
-        signal,
-        price,
-        side,
-        include_m15=include_m15,
-    )
-    if bounds is None:
-        signal.pop("entry_zone_confirmation", None)
-        return
-    low, high = bounds
-    midpoint = (low + high) / 2
-    tolerance = max(abs(midpoint), high - low, 1.0) * 1e-9
-    signature = (
-        f"{signal.get('timestamp') or ''}|{side.value}|"
-        f"{low:.12g}|{high:.12g}"
-    )
-    existing = (
-        signal.get("entry_zone_confirmation")
-        if isinstance(signal.get("entry_zone_confirmation"), dict)
-        else {}
-    )
-    state = (
-        dict(existing)
-        if existing.get("signature") == signature
-        else {
-            "signature": signature,
-            "touched_midpoint": False,
-            "confirmed": False,
-        }
-    )
-    if state.get("confirmed"):
-        signal["entry_zone_confirmation"] = state
-        return
-    if not state.get("touched_midpoint"):
-        state["touched_midpoint"] = (
-            price <= midpoint + tolerance
-            if side == PositionSide.LONG
-            else price >= midpoint - tolerance
-        )
-        signal["entry_zone_confirmation"] = state
-        return
-    state["confirmed"] = (
-        price >= midpoint - tolerance
-        if side == PositionSide.LONG
-        else price <= midpoint + tolerance
-    )
-    signal["entry_zone_confirmation"] = state
 
 
 def _entry_level_group_hit(signal: dict[str, object], price: float, side: PositionSide, *, include_m15: bool) -> bool:
@@ -4273,16 +4213,54 @@ def _entry_zone_bounds(
         "h4_boll_mid",
         "h1_ema20_ema60",
         "h4_ema20_ema60",
+        "vwap_pullback",
+        "vwap_retest",
     }
     if (
-        len(matched) == 1
-        and matched[0][0] in indicator_only_keys
+        all(key in indicator_only_keys for key, _, _ in matched)
+        and not _indicator_entry_confirmation_present(
+            signal,
+            side,
+            {key for key, _, _ in matched},
+        )
     ):
         return None
     return (
         max(low for _, low, _ in matched),
         min(high for _, _, high in matched),
     )
+
+
+def _indicator_entry_confirmation_present(
+    signal: dict[str, object],
+    side: PositionSide,
+    matched_keys: set[str],
+) -> bool:
+    if not matched_keys & {
+        "h1_boll_mid",
+        "h1_ema20_ema60",
+        "vwap_pullback",
+        "vwap_retest",
+    }:
+        return False
+    reason_text = " | ".join(
+        str(reason).lower()
+        for reason in signal.get("reasons") or ()
+    )
+    tokens = (
+        (
+            "close confirmed near ema20/boll mid",
+            "1h boll/ema pullback held",
+            "vwap pullback held",
+        )
+        if side == PositionSide.LONG
+        else (
+            "close confirmed failed retest",
+            "1h boll/ema pullback rejected",
+            "vwap retest rejected",
+        )
+    )
+    return any(token in reason_text for token in tokens)
 
 
 def _entry_level_keys(side: PositionSide) -> tuple[str, ...]:
@@ -4329,20 +4307,18 @@ def _scored_entry_levels(
         return {}
     side_key = "long" if side == PositionSide.LONG else "short"
     source = all_levels.get(side_key) if isinstance(all_levels.get(side_key), dict) else {}
-    if (
-        side == PositionSide.LONG
-        and str(signal.get("entry_timeframe_override") or "") == "4h"
-    ):
+    if str(signal.get("entry_timeframe_override") or "") == "4h":
+        keys = (
+            ("h4_support", "h4_boll_mid", "h4_ema20_ema60")
+            if side == PositionSide.LONG
+            else ("h4_resistance", "h4_boll_mid", "h4_ema20_ema60")
+        )
         selected = {
             key: source[key]
-            for key in (
-                "h4_support",
-                "h4_boll_mid",
-                "h4_ema20_ema60",
-            )
+            for key in keys
             if _entry_level_has_values(source.get(key))
         }
-        return {"long": selected} if selected else {}
+        return {side_key: selected} if selected else {}
     distribution_stage = str(
         signal.get("distribution_short_stage") or ""
     )
@@ -4376,6 +4352,10 @@ def _scored_entry_levels(
             add("vwap_pullback")
         if "close confirmed near ema20/boll mid" in reason_text or "1h boll/ema pullback held" in reason_text:
             add("h1_support", "h1_boll_mid", "h1_ema20_ema60")
+        if "1h retest confirms long trigger" in reason_text:
+            add("breakout_retest")
+        if "1h fake_breakdown confirms long trigger" in reason_text:
+            add("h1_support", "sweep_reclaim_support")
         if any(token in reason_text for token in ("market structure confirms long", "resistance grind broke upward", "volume pattern confirms long", "volume breakout above resistance", "breakout retest held quietly")):
             add("breakout_retest", "h1_support")
         if any(token in reason_text for token in ("washout confirmed: downside", "downside sweep reclaimed")):
@@ -4386,16 +4366,15 @@ def _scored_entry_levels(
             add("ma20_retest")
         if "4h structure supports upside" in reason_text:
             add("h4_support", "h4_ema20_ema60")
-        if not selected:
-            if str(signal.get("signal_timeframe") or "1h") == "4h":
-                add("h4_support", "h4_ema20_ema60")
-            else:
-                add("h1_support", "h1_boll_mid", "h1_ema20_ema60", "breakout_retest")
     else:
         if "vwap retest rejected" in reason_text:
             add("vwap_retest")
         if "close confirmed failed retest" in reason_text or "1h boll/ema pullback rejected" in reason_text:
             add("h1_resistance", "h1_boll_mid", "h1_ema20_ema60")
+        if "1h retest confirms short trigger" in reason_text:
+            add("breakdown_retest")
+        if "1h fake_breakout confirms short trigger" in reason_text:
+            add("h1_resistance", "sweep_reject_resistance")
         if any(token in reason_text for token in ("market structure confirms short", "support grind broke downward", "volume pattern confirms short", "volume breakdown below support", "breakdown retest rejected quietly")):
             add("breakdown_retest", "h1_resistance")
         if any(token in reason_text for token in ("washout confirmed: upside", "upside sweep rejected")):
@@ -4404,11 +4383,6 @@ def _scored_entry_levels(
             add("ma20_retest")
         if "4h structure supports downside" in reason_text:
             add("h4_resistance", "h4_ema20_ema60")
-        if not selected:
-            if str(signal.get("signal_timeframe") or "1h") == "4h":
-                add("h4_resistance", "h4_ema20_ema60")
-            else:
-                add("h1_resistance", "h1_boll_mid", "h1_ema20_ema60", "breakdown_retest")
     return {side_key: selected} if selected else {}
 
 
@@ -5410,33 +5384,47 @@ def _one_hour_ema_reliability(
     candles: list[Candle],
     indicators: list[IndicatorSnapshot],
 ) -> dict[str, object]:
-    """Detect when 1h EMA support is too easy to sweep for leveraged entries."""
+    """Detect when 1h EMA support/resistance is too easy to sweep."""
     usable = min(len(candles), len(indicators))
     if usable < 60:
         return {
             "state": "UNKNOWN",
+            "long_state": "UNKNOWN",
+            "short_state": "UNKNOWN",
             "ema20_breach_episodes": 0,
             "ema60_breach_episodes": 0,
+            "ema20_resistance_breach_episodes": 0,
+            "ema60_resistance_breach_episodes": 0,
         }
     candles = candles[-usable:]
     indicators = indicators[-usable:]
     ema60_values = ema([candle.close for candle in candles], 60)
     start = max(0, usable - 24)
-    ema20_breaches: list[bool] = []
-    ema60_breaches: list[bool] = []
+    ema20_support_breaches: list[bool] = []
+    ema60_support_breaches: list[bool] = []
+    ema20_resistance_breaches: list[bool] = []
+    ema60_resistance_breaches: list[bool] = []
     for idx in range(start, usable):
         indicator = indicators[idx]
         ema20_value = indicator.ema20
         ema60_value = ema60_values[idx]
         atr = indicator.atr14 or candles[idx].close * 0.01
         tolerance = atr * 0.10
-        ema20_breaches.append(
+        ema20_support_breaches.append(
             ema20_value is not None
             and candles[idx].low < float(ema20_value) - tolerance
         )
-        ema60_breaches.append(
+        ema60_support_breaches.append(
             ema60_value is not None
             and candles[idx].low < float(ema60_value) - tolerance
+        )
+        ema20_resistance_breaches.append(
+            ema20_value is not None
+            and candles[idx].high > float(ema20_value) + tolerance
+        )
+        ema60_resistance_breaches.append(
+            ema60_value is not None
+            and candles[idx].high > float(ema60_value) + tolerance
         )
 
     def episodes(values: list[bool]) -> int:
@@ -5446,14 +5434,27 @@ def _one_hour_ema_reliability(
             if value and (idx == 0 or not values[idx - 1])
         )
 
-    ema20_episodes = episodes(ema20_breaches)
-    ema60_episodes = episodes(ema60_breaches)
-    unreliable = ema20_episodes >= 2 or ema60_episodes >= 1
+    ema20_episodes = episodes(ema20_support_breaches)
+    ema60_episodes = episodes(ema60_support_breaches)
+    ema20_resistance_episodes = episodes(ema20_resistance_breaches)
+    ema60_resistance_episodes = episodes(ema60_resistance_breaches)
+    long_unreliable = ema20_episodes >= 2 or ema60_episodes >= 1
+    short_unreliable = (
+        ema20_resistance_episodes >= 2
+        or ema60_resistance_episodes >= 1
+    )
+    long_state = "UNRELIABLE" if long_unreliable else "RELIABLE"
+    short_state = "UNRELIABLE" if short_unreliable else "RELIABLE"
     return {
-        "state": "UNRELIABLE" if unreliable else "RELIABLE",
+        # Keep state as the legacy alias for long-side support reliability.
+        "state": long_state,
+        "long_state": long_state,
+        "short_state": short_state,
         "ema20_breach_episodes": ema20_episodes,
         "ema60_breach_episodes": ema60_episodes,
-        "lookback_hours": len(ema20_breaches),
+        "ema20_resistance_breach_episodes": ema20_resistance_episodes,
+        "ema60_resistance_breach_episodes": ema60_resistance_episodes,
+        "lookback_hours": len(ema20_support_breaches),
     }
 
 
@@ -5736,7 +5737,7 @@ def _range_around_values(values: list[float | None], buffer: float) -> dict[str,
 
 def _indicator_buffer(indicator: IndicatorSnapshot | None, price: float | None) -> float:
     if indicator and indicator.atr14:
-        return indicator.atr14 * 0.45
+        return indicator.atr14 * 0.30
     if price:
         return price * 0.003
     return 0.0
@@ -5881,15 +5882,34 @@ def _apply_multi_timeframe_context(signal: dict[str, object], context: dict[str,
         m15_precision,
         smart_money_phase,
     )
+    long_ema_unreliable = (
+        str(
+            h1_ema_reliability.get("long_state")
+            or h1_ema_reliability.get("state")
+            or "UNKNOWN"
+        )
+        == "UNRELIABLE"
+    )
+    short_ema_unreliable = (
+        str(h1_ema_reliability.get("short_state") or "UNKNOWN")
+        == "UNRELIABLE"
+    )
     if (
         action == SignalAction.ENTRY_LONG.value
-        and str(h1_ema_reliability.get("state") or "UNKNOWN")
-        == "UNRELIABLE"
+        and long_ema_unreliable
         and not m15_long_exception
     ):
         entry_timeframe_override = "4h"
         reasons.append(
             "1h EMA20/EMA60 repeatedly breached; promote entry, stop, and target to 4h"
+        )
+    elif (
+        action == SignalAction.ENTRY_SHORT.value
+        and short_ema_unreliable
+    ):
+        entry_timeframe_override = "4h"
+        reasons.append(
+            "1h EMA20/EMA60 repeatedly breached as resistance; promote entry, stop, and target to 4h"
         )
     rsi14 = _float_or_none(out.get("rsi14"))
     weak_deleverage_rebound = _weak_deleverage_rebound(out, h4_oi, h1_pullback)
@@ -6125,7 +6145,8 @@ def _apply_multi_timeframe_context(signal: dict[str, object], context: dict[str,
     out["entry_guardrails"] = entry_guardrails
     out["entry_levels"] = _scored_entry_levels(stage_probe, entry_levels)
     out["trend_stage_phase"] = trend_stage_phase
-    out["entry_confirmation_required"] = True
+    out.pop("entry_confirmation_required", None)
+    out.pop("entry_zone_confirmation", None)
     _update_entry_position_fields(out)
     return out
 
