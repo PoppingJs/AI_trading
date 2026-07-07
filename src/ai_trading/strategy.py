@@ -7,6 +7,9 @@ from ai_trading.config import StrategySettings
 from ai_trading.models import Candle, IndicatorSnapshot, MarketRegime, PositionSide, SignalAction, StrategySignal
 
 
+DIRECTION_SCORE_GAP_FOR_DIRECT_ENTRY = 8
+
+
 class CompositeStrategy:
     """EMA/MA/BOLL/VOL/OI/long-short/RSI/funding scoring strategy."""
 
@@ -49,6 +52,8 @@ class CompositeStrategy:
         best_reasons = long_reasons if best_is_long else short_reasons
         best_vetoes = long_vetoes if best_is_long else short_vetoes
         direction = PositionSide.LONG if best_is_long else PositionSide.SHORT
+        opposite_score = short_score if best_is_long else long_score
+        direction_score_gap = best_score - opposite_score
         signal_regime = (
             MarketRegime.OVERCROWDED
             if long_vetoes and short_vetoes
@@ -56,6 +61,23 @@ class CompositeStrategy:
         )
 
         if best_score >= self.settings.score_threshold:
+            if direction_score_gap < DIRECTION_SCORE_GAP_FOR_DIRECT_ENTRY:
+                return StrategySignal(
+                    symbol=symbol,
+                    timestamp=current.timestamp,
+                    action=SignalAction.WATCH,
+                    regime=signal_regime,
+                    score=best_score,
+                    direction=direction,
+                    vetoes=tuple(best_vetoes),
+                    reasons=tuple(
+                        best_reasons
+                        + [
+                            "long/short score gap is narrow; wait for higher-timeframe structure confirmation",
+                        ]
+                    ),
+                    indicators=current,
+                )
             return StrategySignal(
                 symbol=symbol,
                 timestamp=current.timestamp,
@@ -332,24 +354,35 @@ class CompositeStrategy:
                 reasons.append("volume is acceptable but not strong")
 
         if current.oi_change is not None:
-            if self.settings.oi_mild_change_min <= current.oi_change < self.settings.oi_extreme_change:
+            if current.oi_change >= self.settings.oi_extreme_change:
+                score -= 8
+                reasons.append("open interest spike risk; long quality reduced until structure confirms")
+            elif self.settings.oi_mild_change_min <= current.oi_change < self.settings.oi_extreme_change:
                 score += 15
                 reasons.append("open interest rising mildly with price")
             elif abs(current.oi_change) < self.settings.oi_mild_change_min:
                 score += 6
                 reasons.append("open interest stable")
 
-        if current.long_short_ratio is not None and current.long_short_ratio < self.settings.long_short_overcrowded_long:
-            score += 10
-            reasons.append("long/short ratio is not overcrowded long")
+        if current.long_short_ratio is not None:
+            if current.long_short_ratio < self.settings.long_short_overcrowded_long:
+                score += 10
+                reasons.append("long/short ratio is not overcrowded long")
+            else:
+                score -= 10
+                reasons.append("long/short ratio overcrowded for longs; quality reduced but not hard blocked")
 
         if current.rsi14 is not None and 45 <= current.rsi14 <= 68:
             score += 10
             reasons.append("RSI in healthy long-trend range")
 
-        if current.funding_rate is not None and current.funding_rate < self.settings.funding_hot_long:
-            score += 10
-            reasons.append("funding rate is not overheated for longs")
+        if current.funding_rate is not None:
+            if current.funding_rate >= self.settings.funding_hot_long:
+                score -= 8
+                reasons.append("funding overheated for longs; quality reduced but not hard blocked")
+            else:
+                score += 10
+                reasons.append("funding rate is not overheated for longs")
 
         if cycle.long_bias > 0:
             score += cycle.long_bias
@@ -439,24 +472,35 @@ class CompositeStrategy:
                 reasons.append("volume is acceptable but not strong")
 
         if current.oi_change is not None:
-            if self.settings.oi_mild_change_min <= current.oi_change < self.settings.oi_extreme_change:
+            if current.oi_change >= self.settings.oi_extreme_change:
+                score -= 8
+                reasons.append("open interest spike risk; short quality reduced until structure confirms")
+            elif self.settings.oi_mild_change_min <= current.oi_change < self.settings.oi_extreme_change:
                 score += 15
                 reasons.append("open interest rising mildly with falling price")
             elif abs(current.oi_change) < self.settings.oi_mild_change_min:
                 score += 6
                 reasons.append("open interest stable")
 
-        if current.long_short_ratio is not None and current.long_short_ratio > self.settings.long_short_overcrowded_short:
-            score += 10
-            reasons.append("long/short ratio is not overcrowded short")
+        if current.long_short_ratio is not None:
+            if current.long_short_ratio > self.settings.long_short_overcrowded_short:
+                score += 10
+                reasons.append("long/short ratio is not overcrowded short")
+            else:
+                score -= 10
+                reasons.append("long/short ratio overcrowded for shorts; quality reduced but not hard blocked")
 
         if current.rsi14 is not None and 32 <= current.rsi14 <= 55:
             score += 10
             reasons.append("RSI in healthy short-trend range")
 
-        if current.funding_rate is not None and current.funding_rate > self.settings.funding_hot_short:
-            score += 10
-            reasons.append("funding rate is not overheated for shorts")
+        if current.funding_rate is not None:
+            if current.funding_rate <= self.settings.funding_hot_short:
+                score -= 8
+                reasons.append("funding overheated for shorts; quality reduced but not hard blocked")
+            else:
+                score += 10
+                reasons.append("funding rate is not overheated for shorts")
 
         if cycle.short_bias > 0:
             score += cycle.short_bias
@@ -470,12 +514,6 @@ class CompositeStrategy:
         vetoes: list[str] = []
         if _atr_pct(current) >= self.settings.extreme_atr_pct:
             vetoes.append("extreme volatility: skip new long entry")
-        if current.long_short_ratio is not None and current.long_short_ratio >= self.settings.long_short_overcrowded_long:
-            vetoes.append("long side overcrowded")
-        if current.funding_rate is not None and current.funding_rate >= self.settings.funding_hot_long:
-            vetoes.append("funding too hot for long entry")
-        if current.oi_change is not None and current.oi_change >= self.settings.oi_extreme_change:
-            vetoes.append("open interest spike risks liquidation sweep")
         return vetoes
 
     def _strict_long_vetoes(self, candles: Sequence[Candle], indicators: Sequence[IndicatorSnapshot]) -> list[str]:
@@ -509,12 +547,6 @@ class CompositeStrategy:
         vetoes: list[str] = []
         if _atr_pct(current) >= self.settings.extreme_atr_pct:
             vetoes.append("extreme volatility: skip new short entry")
-        if current.long_short_ratio is not None and current.long_short_ratio <= self.settings.long_short_overcrowded_short:
-            vetoes.append("short side overcrowded")
-        if current.funding_rate is not None and current.funding_rate <= self.settings.funding_hot_short:
-            vetoes.append("funding too negative for short entry")
-        if current.oi_change is not None and current.oi_change >= self.settings.oi_extreme_change:
-            vetoes.append("open interest spike risks liquidation sweep")
         return vetoes
 
     def _strict_short_vetoes(self, candles: Sequence[Candle], indicators: Sequence[IndicatorSnapshot]) -> list[str]:

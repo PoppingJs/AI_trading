@@ -9,12 +9,14 @@ import pytest
 
 from ai_trading.api import create_app
 from ai_trading.config import AppSettings
-from ai_trading.models import Candle, IndicatorSnapshot, PositionSide, SignalAction
+from ai_trading.models import Candle, IndicatorSnapshot, Position, PositionSide, SignalAction
 from ai_trading.paper import (
     DISTRIBUTION_STAGE_DESCENDING,
     DISTRIBUTION_STAGE_MARKDOWN,
     DISTRIBUTION_STAGE_RANGE,
     MARKET_PRICE_STALE_SECONDS,
+    SETUP_H1_PULLBACK_LONG,
+    SETUP_H4_PULLBACK_SHORT,
     STATE_SAVE_SECONDS,
     PaperStateError,
     PaperTradingEngine,
@@ -52,9 +54,12 @@ from ai_trading.paper import (
     _preferred_exit_indicator,
     _protect_confirmed_breakout_position,
     _precision_stop_allowed,
+    _position_profit_management_enabled,
+    _position_reached_initial_r,
     _refine_stop_with_ma_cluster,
     _refine_stop_with_precision,
     _refine_stop_with_distribution_stage,
+    _refine_stop_with_setup_structure,
     _refine_stop_with_retest_structure,
     _refine_take_profit_with_ma_cluster,
     _pyramid_allowed,
@@ -1199,6 +1204,29 @@ def test_risk_exit_reason_is_specific_to_one_way_position_risk() -> None:
     assert _risk_exit_reason(PositionSide.LONG, "TREND_LONG", "LONG_CROWD") is None
 
 
+def test_risk_exit_management_waits_until_position_reaches_one_r() -> None:
+    position = Position(
+        symbol="TESTUSDT",
+        side=PositionSide.LONG,
+        entry_price=100.0,
+        quantity=1.0,
+        opened_at=datetime(2026, 1, 1, tzinfo=UTC),
+        stop_price=95.0,
+        take_profit_1=105.0,
+        take_profit_2=110.0,
+        metadata={"initial_stop_distance": 5.0},
+    )
+
+    assert not _position_reached_initial_r(position, 99.0)
+    assert not _position_reached_initial_r(position, 104.9)
+    assert _position_reached_initial_r(position, 105.0)
+
+    position.metadata["max_favorable_distance"] = 5.1
+    assert _position_reached_initial_r(position, 101.0)
+    assert _position_profit_management_enabled(position, 101.0)
+    assert not _position_profit_management_enabled(position, 99.0)
+
+
 def test_auto_top50_universe_refreshes_symbols() -> None:
     engine = PaperTradingEngine(AppSettings(), starting_balance=1000, market_data=FakeMarketData())
     engine.latest_signals["STALEUSDT"] = {"score": 99}
@@ -1873,6 +1901,85 @@ def test_correlated_indicator_zones_need_scored_pullback_confirmation() -> None:
     assert signal["entry_timing"] == "GOOD"
 
 
+def test_four_hour_override_allows_scored_h4_indicator_zone() -> None:
+    signal = {
+        "action": SignalAction.ENTRY_SHORT.value,
+        "score": 96,
+        "trend_state": "ONE_WAY_DOWN",
+        "risk_state": "NORMAL",
+        "entry_timeframe_override": "4h",
+        "price": 100.0,
+        "reasons": ("4h structure supports downside",),
+        "entry_levels": {
+            "short": {
+                "h4_ema20_ema60": {
+                    "low": 99.5,
+                    "high": 100.5,
+                    "price": 100.0,
+                },
+            }
+        },
+    }
+
+    _update_entry_position_fields(signal)
+
+    assert signal["entry_timing"] == "GOOD"
+
+
+def test_setup_type_selects_compatible_scored_entry_zone_without_reason_text() -> None:
+    levels = {
+        "long": {
+            "h1_ema20_ema60": {
+                "low": 99.0,
+                "high": 101.0,
+                "price": 100.0,
+            },
+        },
+    }
+
+    selected = _scored_entry_levels(
+        {
+            "action": SignalAction.ENTRY_LONG.value,
+            "setup_type": SETUP_H1_PULLBACK_LONG,
+            "reasons": (),
+        },
+        levels,
+    )
+
+    assert selected == {"long": {"h1_ema20_ema60": levels["long"]["h1_ema20_ema60"]}}
+
+
+def test_multi_timeframe_context_publishes_setup_type_for_four_hour_short_override() -> None:
+    signal = {
+        "action": SignalAction.ENTRY_SHORT.value,
+        "candidate_action": SignalAction.ENTRY_SHORT.value,
+        "score": 90,
+        "trend_state": "ONE_WAY_DOWN",
+        "risk_state": "NORMAL",
+        "price": 100.0,
+        "reasons": ("base short direction",),
+    }
+    context = {
+        "summary": "context",
+        "daily_bias": "NEUTRAL",
+        "h1_ema_reliability": {"short_state": "UNRELIABLE"},
+        "entry_levels": {
+            "short": {
+                "h4_ema20_ema60": {
+                    "low": 99.0,
+                    "high": 101.0,
+                    "price": 100.0,
+                },
+            },
+        },
+    }
+
+    adjusted = _apply_multi_timeframe_context(signal, context)
+
+    assert adjusted["setup_type"] == SETUP_H4_PULLBACK_SHORT
+    assert set(adjusted["entry_levels"]["short"]) == {"h4_ema20_ema60"}
+
+
 def test_separated_ema20_and_ema60_do_not_create_a_bridge_entry_zone() -> None:
     indicator = indicator_snapshot(
         close=90.93,
@@ -2205,6 +2312,12 @@ def test_confirmed_four_hour_oi_valley_exits_short_and_needs_wick_for_long() -> 
             take_profit_2=96.0,
         )
     )
+    assert _oi_valley_short_exit_reason(
+        short_position,
+        {"h4_oi_valley": {"state": "CONFIRMED"}},
+    ) is None
+
+    short_position.metadata["max_favorable_distance"] = 2.1
     assert _oi_valley_short_exit_reason(
         short_position,
         {"h4_oi_valley": {"state": "CONFIRMED"}},
@@ -3335,6 +3448,42 @@ def test_multi_timeframe_healthy_pullback_adds_score() -> None:
     assert not adjusted["vetoes"]
 
 
+def test_high_score_without_core_entry_structure_is_capped_below_auto_entry() -> None:
+    signal = {
+        "action": "ENTRY_LONG",
+        "score": 110,
+        "risk_state": "NORMAL",
+        "price": 100.0,
+        "reasons": (
+            "funding rate is not overheated for longs",
+            "volume is acceptable but not strong",
+        ),
+        "vetoes": (),
+    }
+    context = {
+        "entry_levels": {
+            "long": {
+                "h1_support": {
+                    "low": 99.0,
+                    "high": 101.0,
+                    "price": 100.0,
+                },
+            }
+        },
+        "summary": "MTF: test",
+    }
+
+    adjusted = _apply_multi_timeframe_context(signal, context)
+
+    assert adjusted["score"] == 81
+    assert adjusted["action"] == SignalAction.WATCH.value
+    assert adjusted["entry_levels"] == {}
+    assert (
+        "core entry structure absent; score capped below auto-entry threshold"
+        in adjusted["reasons"]
+    )
+
+
 def test_high_area_long_waits_for_pullback_confirmation() -> None:
     signal = {
         "action": "ENTRY_LONG",
@@ -3847,6 +3996,48 @@ def test_4h_retest_stop_uses_4h_resistance() -> None:
     )
 
     assert stop > 112.0
+
+
+def test_setup_structure_stop_prefers_setup_timeframe_over_entry_timeframe() -> None:
+    context = {
+        "h1_structure": {
+            "resistance_zone_high": 102.0,
+            "resistance": 101.5,
+        },
+        "h4_structure": {
+            "resistance_zone_high": 112.0,
+            "resistance": 111.0,
+        },
+    }
+    indicator = indicator_snapshot(close=100.0, atr=2.0)
+
+    stop, basis = _refine_stop_with_setup_structure(
+        PositionSide.SHORT,
+        104.0,
+        100.0,
+        {"setup_type": SETUP_H4_PULLBACK_SHORT},
+        context,
+        indicator,
+        timeframe="1h",
+    )
+
+    assert stop > 112.0
+    assert basis == "4h_structure"
+
+
+def test_setup_structure_stop_falls_back_when_structure_is_missing() -> None:
+    stop, basis = _refine_stop_with_setup_structure(
+        PositionSide.LONG,
+        98.0,
+        100.0,
+        {"setup_type": SETUP_H1_PULLBACK_LONG},
+        {},
+        indicator_snapshot(close=100.0, atr=1.0),
+        timeframe="1h",
+    )
+
+    assert stop == 98.0
+    assert basis == "volatility_fallback"
 
 
 def test_retest_structure_refines_long_stop_outside_support_and_ema60() -> None:

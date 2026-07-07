@@ -21,11 +21,36 @@ def test_strategy_defers_overheated_rsi_to_multi_timeframe_context() -> None:
         boll_upper=current.close - 1,
     )
 
-    signal = CompositeStrategy().generate_signal("BTCUSDT", candles, indicators)
+    strategy = CompositeStrategy()
+    signal = strategy.generate_signal("BTCUSDT", candles, indicators)
+    _, long_reasons, long_vetoes = strategy._score_long(candles, indicators)
 
     assert signal.action == SignalAction.NO_TRADE
     assert "RSI overheated for long entry" not in signal.vetoes
-    assert "long side overcrowded" in signal.vetoes
+    assert "funding too hot for long entry" not in signal.vetoes
+    assert "long side overcrowded" not in long_vetoes
+    assert "long/short ratio overcrowded for longs; quality reduced but not hard blocked" in long_reasons
+
+
+def test_funding_and_oi_spike_reduce_score_without_standalone_veto() -> None:
+    candles, derivatives = _trending_market()
+    indicators = build_indicators(candles, derivatives)
+    current = indicators[-1]
+    indicators[-1] = replace(
+        current,
+        rsi14=58,
+        long_short_ratio=1.2,
+        funding_rate=0.001,
+        oi_change=0.06,
+    )
+
+    score, reasons, vetoes = CompositeStrategy()._score_long(candles, indicators)
+
+    assert score > 0
+    assert "funding too hot for long entry" not in vetoes
+    assert "open interest spike risks liquidation sweep" not in vetoes
+    assert "funding overheated for longs; quality reduced but not hard blocked" in reasons
+    assert "open interest spike risk; long quality reduced until structure confirms" in reasons
 
 
 def test_strategy_uses_score_bands_and_keeps_risk_conditions_as_vetoes() -> None:
@@ -53,6 +78,38 @@ def test_strategy_uses_score_bands_and_keeps_risk_conditions_as_vetoes() -> None
 
     assert signal.action == SignalAction.NO_TRADE
     assert signal.score == 64
+
+
+def test_strategy_waits_when_long_short_score_gap_is_narrow() -> None:
+    candles, derivatives = _trending_market()
+    indicators = build_indicators(candles, derivatives)
+    strategy = CompositeStrategy()
+    strategy._score_long = lambda *_: (90, ["long direction"], [])  # type: ignore[method-assign]
+    strategy._score_short = lambda *_: (86, ["short direction"], [])  # type: ignore[method-assign]
+
+    signal = strategy.generate_signal("BTCUSDT", candles, indicators)
+
+    assert signal.action == SignalAction.WATCH
+    assert signal.direction == PositionSide.LONG
+    assert "long/short score gap is narrow; wait for higher-timeframe structure confirmation" in signal.reasons
+
+
+def test_long_short_ratio_overcrowding_reduces_quality_without_common_veto() -> None:
+    candles, derivatives = _trending_market()
+    indicators = build_indicators(candles, derivatives)
+    current = indicators[-1]
+    indicators[-1] = replace(
+        current,
+        rsi14=58,
+        long_short_ratio=2.4,
+        funding_rate=0.0001,
+        oi_change=0.003,
+    )
+
+    _, long_reasons, long_vetoes = CompositeStrategy()._score_long(candles, indicators)
+
+    assert "long side overcrowded" not in long_vetoes
+    assert "long/short ratio overcrowded for longs; quality reduced but not hard blocked" in long_reasons
 
 
 def test_strategy_emits_long_when_score_is_strong() -> None:
