@@ -5,7 +5,14 @@ from datetime import UTC, datetime, timedelta
 
 from ai_trading.config import StrategySettings
 from ai_trading.indicators import build_indicators
-from ai_trading.models import Candle, DerivativesSnapshot, PositionSide, SignalAction
+from ai_trading.models import (
+    SETUP_H1_PULLBACK_LONG,
+    SETUP_H1_STRUCTURE_LONG,
+    Candle,
+    DerivativesSnapshot,
+    PositionSide,
+    SignalAction,
+)
 from ai_trading.strategy import CompositeStrategy, MarketStructure, _volume_breakout_retest_confirmation
 
 
@@ -23,7 +30,7 @@ def test_strategy_defers_overheated_rsi_to_multi_timeframe_context() -> None:
 
     strategy = CompositeStrategy()
     signal = strategy.generate_signal("BTCUSDT", candles, indicators)
-    _, long_reasons, long_vetoes = strategy._score_long(candles, indicators)
+    _, long_reasons, long_vetoes, _ = strategy._score_long(candles, indicators)
 
     assert signal.action == SignalAction.NO_TRADE
     assert "RSI overheated for long entry" not in signal.vetoes
@@ -44,7 +51,7 @@ def test_funding_and_oi_spike_reduce_score_without_standalone_veto() -> None:
         oi_change=0.06,
     )
 
-    score, reasons, vetoes = CompositeStrategy()._score_long(candles, indicators)
+    score, reasons, vetoes, _ = CompositeStrategy()._score_long(candles, indicators)
 
     assert score > 0
     assert "funding too hot for long entry" not in vetoes
@@ -57,23 +64,25 @@ def test_strategy_uses_score_bands_and_keeps_risk_conditions_as_vetoes() -> None
     candles, derivatives = _trending_market()
     indicators = build_indicators(candles, derivatives)
     strategy = CompositeStrategy()
-    strategy._score_long = lambda *_: (90, ["long direction"], ["OI spike"])  # type: ignore[method-assign]
-    strategy._score_short = lambda *_: (40, ["short direction"], [])  # type: ignore[method-assign]
+    strategy._score_long = lambda *_: (90, ["long direction"], ["OI spike"], SETUP_H1_STRUCTURE_LONG)  # type: ignore[method-assign]
+    strategy._score_short = lambda *_: (40, ["short direction"], [], "")  # type: ignore[method-assign]
 
     signal = strategy.generate_signal("BTCUSDT", candles, indicators)
 
     assert signal.action == SignalAction.ENTRY_LONG
     assert signal.direction == PositionSide.LONG
     assert signal.vetoes == ("OI spike",)
+    assert signal.setup_type == SETUP_H1_STRUCTURE_LONG
 
-    strategy._score_long = lambda *_: (70, ["long direction"], ["funding extreme"])  # type: ignore[method-assign]
+    strategy._score_long = lambda *_: (70, ["long direction"], ["funding extreme"], SETUP_H1_PULLBACK_LONG)  # type: ignore[method-assign]
     signal = strategy.generate_signal("BTCUSDT", candles, indicators)
 
     assert signal.action == SignalAction.WATCH
     assert signal.direction == PositionSide.LONG
     assert signal.vetoes == ("funding extreme",)
+    assert signal.setup_type == SETUP_H1_PULLBACK_LONG
 
-    strategy._score_long = lambda *_: (64, ["long direction"], [])  # type: ignore[method-assign]
+    strategy._score_long = lambda *_: (64, ["long direction"], [], "")  # type: ignore[method-assign]
     signal = strategy.generate_signal("BTCUSDT", candles, indicators)
 
     assert signal.action == SignalAction.NO_TRADE
@@ -84,13 +93,14 @@ def test_strategy_waits_when_long_short_score_gap_is_narrow() -> None:
     candles, derivatives = _trending_market()
     indicators = build_indicators(candles, derivatives)
     strategy = CompositeStrategy()
-    strategy._score_long = lambda *_: (90, ["long direction"], [])  # type: ignore[method-assign]
-    strategy._score_short = lambda *_: (86, ["short direction"], [])  # type: ignore[method-assign]
+    strategy._score_long = lambda *_: (90, ["long direction"], [], SETUP_H1_PULLBACK_LONG)  # type: ignore[method-assign]
+    strategy._score_short = lambda *_: (86, ["short direction"], [], "")  # type: ignore[method-assign]
 
     signal = strategy.generate_signal("BTCUSDT", candles, indicators)
 
     assert signal.action == SignalAction.WATCH
     assert signal.direction == PositionSide.LONG
+    assert signal.setup_type == SETUP_H1_PULLBACK_LONG
     assert "long/short score gap is narrow; wait for higher-timeframe structure confirmation" in signal.reasons
 
 
@@ -106,7 +116,7 @@ def test_long_short_ratio_overcrowding_reduces_quality_without_common_veto() -> 
         oi_change=0.003,
     )
 
-    _, long_reasons, long_vetoes = CompositeStrategy()._score_long(candles, indicators)
+    _, long_reasons, long_vetoes, _ = CompositeStrategy()._score_long(candles, indicators)
 
     assert "long side overcrowded" not in long_vetoes
     assert "long/short ratio overcrowded for longs; quality reduced but not hard blocked" in long_reasons
@@ -196,9 +206,10 @@ def test_strategy_rewards_vwap_pullback_as_score_not_filter() -> None:
         funding_rate=0.0001,
     )
 
-    score, reasons, vetoes = CompositeStrategy(settings)._score_long(candles, indicators)
+    score, reasons, vetoes, setup_type = CompositeStrategy(settings)._score_long(candles, indicators)
 
     assert score > 0
+    assert setup_type == SETUP_H1_PULLBACK_LONG
     assert "VWAP pullback held; average cost support favors long" in reasons
     assert "VWAP pullback held; average cost support favors long" not in vetoes
 

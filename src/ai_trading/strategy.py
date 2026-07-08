@@ -4,7 +4,18 @@ from dataclasses import dataclass
 from collections.abc import Sequence
 
 from ai_trading.config import StrategySettings
-from ai_trading.models import Candle, IndicatorSnapshot, MarketRegime, PositionSide, SignalAction, StrategySignal
+from ai_trading.models import (
+    SETUP_H1_PULLBACK_LONG,
+    SETUP_H1_PULLBACK_SHORT,
+    SETUP_H1_STRUCTURE_LONG,
+    SETUP_H1_STRUCTURE_SHORT,
+    Candle,
+    IndicatorSnapshot,
+    MarketRegime,
+    PositionSide,
+    SignalAction,
+    StrategySignal,
+)
 
 
 DIRECTION_SCORE_GAP_FOR_DIRECT_ENTRY = 8
@@ -45,12 +56,13 @@ class CompositeStrategy:
             )
 
         regime = self._detect_regime(current)
-        long_score, long_reasons, long_vetoes = self._score_long(candles, indicators)
-        short_score, short_reasons, short_vetoes = self._score_short(candles, indicators)
+        long_score, long_reasons, long_vetoes, long_setup_type = self._score_long(candles, indicators)
+        short_score, short_reasons, short_vetoes, short_setup_type = self._score_short(candles, indicators)
         best_is_long = long_score >= short_score
         best_score = long_score if best_is_long else short_score
         best_reasons = long_reasons if best_is_long else short_reasons
         best_vetoes = long_vetoes if best_is_long else short_vetoes
+        best_setup_type = long_setup_type if best_is_long else short_setup_type
         direction = PositionSide.LONG if best_is_long else PositionSide.SHORT
         opposite_score = short_score if best_is_long else long_score
         direction_score_gap = best_score - opposite_score
@@ -77,6 +89,7 @@ class CompositeStrategy:
                         ]
                     ),
                     indicators=current,
+                    setup_type=best_setup_type,
                 )
             return StrategySignal(
                 symbol=symbol,
@@ -92,6 +105,7 @@ class CompositeStrategy:
                 vetoes=tuple(best_vetoes),
                 reasons=tuple(best_reasons),
                 indicators=current,
+                setup_type=best_setup_type,
             )
 
         if best_score >= self.settings.watch_threshold:
@@ -105,6 +119,7 @@ class CompositeStrategy:
                 vetoes=tuple(best_vetoes),
                 reasons=tuple(best_reasons),
                 indicators=current,
+                setup_type=best_setup_type,
             )
 
         return StrategySignal(
@@ -117,6 +132,7 @@ class CompositeStrategy:
             vetoes=tuple(best_vetoes),
             reasons=("score below trading threshold",),
             indicators=current,
+            setup_type=best_setup_type,
         )
 
     def exit_signal(self, position_side: str, indicators: IndicatorSnapshot) -> StrategySignal | None:
@@ -274,7 +290,7 @@ class CompositeStrategy:
             return MarketRegime.TREND_SHORT
         return MarketRegime.CHOP
 
-    def _score_long(self, candles: Sequence[Candle], indicators: Sequence[IndicatorSnapshot]) -> tuple[int, list[str], list[str]]:
+    def _score_long(self, candles: Sequence[Candle], indicators: Sequence[IndicatorSnapshot]) -> tuple[int, list[str], list[str], str]:
         current = indicators[-1]
         previous = indicators[-2]
         cycle = self.smart_money_cycle(candles, indicators)
@@ -283,6 +299,7 @@ class CompositeStrategy:
         score = 0
         reasons: list[str] = []
         vetoes = self._common_long_vetoes(current) + strict_vetoes
+        setup_type = ""
         sweep_veto = _sweep_veto(candles[-1], current, side="LONG", settings=self.settings)
         if sweep_veto:
             vetoes.append(sweep_veto)
@@ -301,12 +318,14 @@ class CompositeStrategy:
             not_extended = (current.close - current.ema20) <= current.atr14 * self.settings.max_extension_atr
             if (reclaimed_mid or near_pullback_zone) and not_extended:
                 score += 15
+                setup_type = SETUP_H1_PULLBACK_LONG
                 reasons.append("close confirmed near EMA20/BOLL mid without chasing upper band")
 
         latest_candle = candles[-1]
         if current.vwap is not None and current.atr14 is not None and current.atr14 > 0:
             if latest_candle.low <= current.vwap + current.atr14 * self.settings.vwap_near_atr and current.close >= current.vwap:
                 score += 6
+                setup_type = setup_type or SETUP_H1_PULLBACK_LONG
                 reasons.append("VWAP pullback held; average cost support favors long")
             elif current.close > current.vwap + current.atr14 * self.settings.vwap_extension_atr:
                 score -= 6
@@ -315,6 +334,7 @@ class CompositeStrategy:
         if current.kc_mid is not None and current.atr14 is not None and current.atr14 > 0:
             if latest_candle.low <= current.kc_mid + current.atr14 * self.settings.keltner_near_atr and current.close >= current.kc_mid:
                 score += 5
+                setup_type = setup_type or SETUP_H1_PULLBACK_LONG
                 reasons.append("KC mid pullback held; volatility channel support favors long")
 
         if current.quote_flow_ratio is not None:
@@ -326,23 +346,29 @@ class CompositeStrategy:
 
         if structure.long_confirmed:
             score += 12
+            setup_type = SETUP_H1_STRUCTURE_LONG
             reasons.append("market structure confirms long: breakout or retest held")
 
         if structure.long_breakout_after_grind:
             score += 10
+            setup_type = SETUP_H1_STRUCTURE_LONG
             reasons.append("market structure: resistance grind broke upward, shorts may be squeezed")
 
         volume_score, volume_reason = _volume_breakout_retest_confirmation(candles, indicators, structure, "LONG", self.settings)
         if volume_reason:
             score += volume_score
+            if volume_score > 0:
+                setup_type = setup_type or SETUP_H1_STRUCTURE_LONG
             reasons.append(volume_reason)
 
         if _long_washout_confirmed(candles[-1], current, structure, self.settings):
             score += 14
+            setup_type = SETUP_H1_STRUCTURE_LONG
             reasons.append("washout confirmed: downside wick swept support, OI dropped, close reclaimed key level")
 
         if _lower_sweep_reclaimed(candles[-1], current, self.settings):
             score += 8
+            setup_type = SETUP_H1_STRUCTURE_LONG
             reasons.append("downside sweep reclaimed support; stop-run filter favors long")
 
         if current.volume_ratio is not None:
@@ -390,9 +416,9 @@ class CompositeStrategy:
         if cycle.long_veto:
             vetoes.append(cycle.long_veto)
 
-        return score, reasons, vetoes
+        return score, reasons, vetoes, setup_type
 
-    def _score_short(self, candles: Sequence[Candle], indicators: Sequence[IndicatorSnapshot]) -> tuple[int, list[str], list[str]]:
+    def _score_short(self, candles: Sequence[Candle], indicators: Sequence[IndicatorSnapshot]) -> tuple[int, list[str], list[str], str]:
         current = indicators[-1]
         previous = indicators[-2]
         cycle = self.smart_money_cycle(candles, indicators)
@@ -401,6 +427,7 @@ class CompositeStrategy:
         score = 0
         reasons: list[str] = []
         vetoes = self._common_short_vetoes(current) + strict_vetoes
+        setup_type = ""
         sweep_veto = _sweep_veto(candles[-1], current, side="SHORT", settings=self.settings)
         if sweep_veto:
             vetoes.append(sweep_veto)
@@ -419,12 +446,14 @@ class CompositeStrategy:
             not_extended = (current.ema20 - current.close) <= current.atr14 * self.settings.max_extension_atr
             if (failed_mid or near_retest_zone) and not_extended:
                 score += 15
+                setup_type = SETUP_H1_PULLBACK_SHORT
                 reasons.append("close confirmed failed retest near EMA20/BOLL mid")
 
         latest_candle = candles[-1]
         if current.vwap is not None and current.atr14 is not None and current.atr14 > 0:
             if latest_candle.high >= current.vwap - current.atr14 * self.settings.vwap_near_atr and current.close <= current.vwap:
                 score += 6
+                setup_type = setup_type or SETUP_H1_PULLBACK_SHORT
                 reasons.append("VWAP retest rejected; average cost resistance favors short")
             elif current.close < current.vwap - current.atr14 * self.settings.vwap_extension_atr:
                 score -= 6
@@ -433,6 +462,7 @@ class CompositeStrategy:
         if current.kc_mid is not None and current.atr14 is not None and current.atr14 > 0:
             if latest_candle.high >= current.kc_mid - current.atr14 * self.settings.keltner_near_atr and current.close <= current.kc_mid:
                 score += 5
+                setup_type = setup_type or SETUP_H1_PULLBACK_SHORT
                 reasons.append("KC mid retest rejected; volatility channel resistance favors short")
 
         if current.quote_flow_ratio is not None:
@@ -444,23 +474,29 @@ class CompositeStrategy:
 
         if structure.short_confirmed:
             score += 12
+            setup_type = SETUP_H1_STRUCTURE_SHORT
             reasons.append("market structure confirms short: breakdown or retest failed")
 
         if structure.short_breakdown_after_grind:
             score += 10
+            setup_type = SETUP_H1_STRUCTURE_SHORT
             reasons.append("market structure: support grind broke downward, longs may be liquidated")
 
         volume_score, volume_reason = _volume_breakout_retest_confirmation(candles, indicators, structure, "SHORT", self.settings)
         if volume_reason:
             score += volume_score
+            if volume_score > 0:
+                setup_type = setup_type or SETUP_H1_STRUCTURE_SHORT
             reasons.append(volume_reason)
 
         if _short_washout_confirmed(candles[-1], current, structure, self.settings):
             score += 14
+            setup_type = SETUP_H1_STRUCTURE_SHORT
             reasons.append("washout confirmed: upside wick swept resistance, OI dropped, close rejected key level")
 
         if _upper_sweep_rejected(candles[-1], current, self.settings):
             score += 8
+            setup_type = SETUP_H1_STRUCTURE_SHORT
             reasons.append("upside sweep rejected resistance; stop-run filter favors short")
 
         if current.volume_ratio is not None:
@@ -508,7 +544,7 @@ class CompositeStrategy:
         if cycle.short_veto:
             vetoes.append(cycle.short_veto)
 
-        return score, reasons, vetoes
+        return score, reasons, vetoes, setup_type
 
     def _common_long_vetoes(self, current: IndicatorSnapshot) -> list[str]:
         vetoes: list[str] = []

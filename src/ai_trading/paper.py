@@ -17,7 +17,26 @@ from typing import Literal
 from ai_trading.binance import BinanceFuturesMarketData
 from ai_trading.config import AppSettings
 from ai_trading.indicators import build_indicators, ema, sma
-from ai_trading.models import Candle, DerivativesSnapshot, IndicatorSnapshot, Position, PositionSide, SignalAction, Trade
+from ai_trading.models import (
+    SETUP_DISTRIBUTION_STAGE1_SHORT,
+    SETUP_DISTRIBUTION_STAGE2_SHORT,
+    SETUP_DISTRIBUTION_STAGE3_SHORT,
+    SETUP_H1_PULLBACK_LONG,
+    SETUP_H1_PULLBACK_SHORT,
+    SETUP_H1_STRUCTURE_LONG,
+    SETUP_H1_STRUCTURE_SHORT,
+    SETUP_H4_PULLBACK_LONG,
+    SETUP_H4_PULLBACK_SHORT,
+    SETUP_M15_SQUEEZE_TACTICAL_LONG,
+    SETUP_OI_VALLEY_REVERSAL_LONG,
+    Candle,
+    DerivativesSnapshot,
+    IndicatorSnapshot,
+    Position,
+    PositionSide,
+    SignalAction,
+    Trade,
+)
 from ai_trading.strategy import CompositeStrategy
 
 
@@ -59,17 +78,6 @@ TREND_STAGE_NEUTRAL = "NEUTRAL"
 DISTRIBUTION_STAGE_RANGE = "HIGH_DISTRIBUTION_RANGE"
 DISTRIBUTION_STAGE_DESCENDING = "DESCENDING_DISTRIBUTION"
 DISTRIBUTION_STAGE_MARKDOWN = "MARKDOWN_ACCELERATION"
-SETUP_M15_SQUEEZE_TACTICAL_LONG = "M15_SQUEEZE_TACTICAL_LONG"
-SETUP_H1_PULLBACK_LONG = "H1_PULLBACK_LONG"
-SETUP_H1_STRUCTURE_LONG = "H1_STRUCTURE_LONG"
-SETUP_H4_PULLBACK_LONG = "H4_PULLBACK_LONG"
-SETUP_OI_VALLEY_REVERSAL_LONG = "OI_VALLEY_REVERSAL_LONG"
-SETUP_H1_PULLBACK_SHORT = "H1_PULLBACK_SHORT"
-SETUP_H1_STRUCTURE_SHORT = "H1_STRUCTURE_SHORT"
-SETUP_H4_PULLBACK_SHORT = "H4_PULLBACK_SHORT"
-SETUP_DISTRIBUTION_STAGE1_SHORT = "DISTRIBUTION_STAGE1_SHORT"
-SETUP_DISTRIBUTION_STAGE2_SHORT = "DISTRIBUTION_STAGE2_SHORT"
-SETUP_DISTRIBUTION_STAGE3_SHORT = "DISTRIBUTION_STAGE3_SHORT"
 AUTO_ENTRY_MIN_SCORE = 82
 CORE_STRUCTURE_SCORE_CAP = AUTO_ENTRY_MIN_SCORE - 1
 MIN_ENTRY_REWARD_R = 1.2
@@ -1771,6 +1779,7 @@ class PaperTradingEngine:
             "reasons": signal.reasons,
             "vetoes": signal.vetoes,
             "smart_money_phase": cycle.phase,
+            "setup_type": signal.setup_type,
         }
         self.latest_signals[symbol] = _apply_multi_timeframe_context(payload, mtf_context)
         self.account.latest_signals[symbol] = dict(self.latest_signals[symbol])
@@ -4419,6 +4428,7 @@ def _core_scored_entry_zone_hit(
     *,
     reasons: Sequence[object],
     entry_timeframe_override: str | None,
+    setup_type: str | None = None,
     action: str | None = None,
 ) -> bool:
     price = _float_or_none(signal.get("price"))
@@ -4432,6 +4442,8 @@ def _core_scored_entry_zone_hit(
         probe["entry_timeframe_override"] = entry_timeframe_override
     else:
         probe.pop("entry_timeframe_override", None)
+    if setup_type:
+        probe["setup_type"] = setup_type
     scored_levels = _scored_entry_levels(probe, all_entry_levels)
     if not scored_levels:
         return False
@@ -4447,89 +4459,52 @@ def _core_scored_entry_zone_hit(
     )
 
 
-def _infer_entry_setup_type(signal: dict[str, object]) -> str:
-    """Classify the setup without replacing the existing reason-based logic."""
-    side = _signal_side(signal)
-    if side is None:
-        return ""
-    distribution_stage = str(signal.get("distribution_short_stage") or "")
-    if side == PositionSide.SHORT and distribution_stage:
-        if distribution_stage == DISTRIBUTION_STAGE_RANGE:
-            return SETUP_DISTRIBUTION_STAGE1_SHORT
-        if distribution_stage == DISTRIBUTION_STAGE_DESCENDING:
-            return SETUP_DISTRIBUTION_STAGE2_SHORT
-        if distribution_stage == DISTRIBUTION_STAGE_MARKDOWN:
-            return SETUP_DISTRIBUTION_STAGE3_SHORT
-    if str(signal.get("entry_timeframe_override") or "") == "4h":
-        return SETUP_H4_PULLBACK_LONG if side == PositionSide.LONG else SETUP_H4_PULLBACK_SHORT
-    reason_text = " | ".join(
-        str(reason).lower()
-        for reason in signal.get("reasons") or ()
-    )
+def _setup_priority(setup_type: str) -> int:
+    return {
+        SETUP_M15_SQUEEZE_TACTICAL_LONG: 95,
+        SETUP_OI_VALLEY_REVERSAL_LONG: 95,
+        SETUP_DISTRIBUTION_STAGE1_SHORT: 95,
+        SETUP_DISTRIBUTION_STAGE2_SHORT: 95,
+        SETUP_DISTRIBUTION_STAGE3_SHORT: 90,
+        SETUP_H4_PULLBACK_LONG: 85,
+        SETUP_H4_PULLBACK_SHORT: 85,
+        SETUP_H1_PULLBACK_LONG: 75,
+        SETUP_H1_PULLBACK_SHORT: 75,
+        SETUP_H1_STRUCTURE_LONG: 65,
+        SETUP_H1_STRUCTURE_SHORT: 65,
+    }.get(setup_type, 0)
+
+
+def _prefer_setup_type(current: str, candidate: str) -> str:
+    if not candidate:
+        return current
+    if not current:
+        return candidate
+    if _setup_priority(candidate) >= _setup_priority(current):
+        return candidate
+    return current
+
+
+def _ma_cluster_setup_type(
+    side: PositionSide,
+    h4_cluster: dict[str, object],
+    h1_cluster: dict[str, object],
+) -> str:
+    h1_state = str(h1_cluster.get("state") or "UNKNOWN")
+    h4_state = str(h4_cluster.get("state") or "UNKNOWN")
     if side == PositionSide.LONG:
-        precision = (
-            signal.get("m15_precision")
-            if isinstance(signal.get("m15_precision"), dict)
-            else {}
-        )
-        if _strong_m15_pullback_allowed(
-            side,
-            str(signal.get("trend_state") or ""),
-            str(signal.get("risk_state") or "NORMAL"),
-            int(signal.get("score") or 0),
-            precision,
-            str(signal.get("smart_money_phase") or ""),
-        ):
-            return SETUP_M15_SQUEEZE_TACTICAL_LONG
-        if "4h oi valley formed after retail capitulation" in reason_text:
-            return SETUP_OI_VALLEY_REVERSAL_LONG
-        if (
-            "close confirmed near ema20/boll mid" in reason_text
-            or "1h boll/ema pullback held" in reason_text
-            or "ma cluster retest held" in reason_text
-        ):
+        if h1_state == "RETEST_UP":
             return SETUP_H1_PULLBACK_LONG
-        if any(
-            token in reason_text
-            for token in (
-                "1h retest confirms long trigger",
-                "1h fake_breakdown confirms long trigger",
-                "market structure confirms long",
-                "resistance grind broke upward",
-                "volume pattern confirms long",
-                "volume breakout above resistance",
-                "breakout retest held quietly",
-                "washout confirmed: downside",
-                "downside sweep reclaimed",
-            )
-        ):
+        if h1_state == "BREAKOUT_UP":
             return SETUP_H1_STRUCTURE_LONG
-        if "4h structure supports upside" in reason_text:
+        if h4_state == "RETEST_UP":
             return SETUP_H4_PULLBACK_LONG
     else:
-        if (
-            "close confirmed failed retest" in reason_text
-            or "1h boll/ema pullback rejected" in reason_text
-            or "ma cluster retest rejected" in reason_text
-            or "vwap retest rejected" in reason_text
-        ):
+        if h1_state == "RETEST_DOWN":
             return SETUP_H1_PULLBACK_SHORT
-        if any(
-            token in reason_text
-            for token in (
-                "1h retest confirms short trigger",
-                "1h fake_breakout confirms short trigger",
-                "market structure confirms short",
-                "support grind broke downward",
-                "volume pattern confirms short",
-                "volume breakdown below support",
-                "breakdown retest rejected quietly",
-                "washout confirmed: upside",
-                "upside sweep rejected",
-            )
-        ):
+        if h1_state == "BREAKDOWN_DOWN":
             return SETUP_H1_STRUCTURE_SHORT
-        if "4h structure supports downside" in reason_text:
+        if h4_state == "RETEST_DOWN":
             return SETUP_H4_PULLBACK_SHORT
     return ""
 
@@ -6064,19 +6039,16 @@ def _weak_deleverage_rebound(
 
 def _oi_valley_long_reversal_confirmed(
     h4_oi_valley: dict[str, object],
-    reasons: list[object],
+    h1_trigger: dict[str, object],
+    h1_pullback: dict[str, object],
 ) -> bool:
     if str(h4_oi_valley.get("state") or "") != "CONFIRMED":
         return False
-    reason_text = " | ".join(str(reason).lower() for reason in reasons)
-    return any(
-        marker in reason_text
-        for marker in (
-            "washout confirmed: downside wick swept support",
-            "downside sweep reclaimed support",
-            "lower wick sweep reclaimed",
-            "capitulation absorption",
-        )
+    h1_direction = str(h1_trigger.get("direction") or "NONE")
+    h1_state = str(h1_trigger.get("state") or "UNKNOWN")
+    return (
+        h1_direction == "LONG"
+        and h1_state == "FAKE_BREAKDOWN"
     )
 
 
@@ -6115,6 +6087,7 @@ def _apply_multi_timeframe_context(signal: dict[str, object], context: dict[str,
     trend_state = str(out.get("trend_state") or "")
     smart_money_phase = str(out.get("smart_money_phase") or "")
     distribution_short_stage = _distribution_short_stage(out, context)
+    setup_type = str(out.get("setup_type") or "")
     handoff_confirmed = (
         str(high_distribution_handoff.get("state") or "")
         == "CONFIRMED"
@@ -6154,6 +6127,10 @@ def _apply_multi_timeframe_context(signal: dict[str, object], context: dict[str,
         and not m15_long_exception
     ):
         entry_timeframe_override = "4h"
+        setup_type = _prefer_setup_type(
+            setup_type,
+            SETUP_H4_PULLBACK_LONG,
+        )
         reasons.append(
             "1h EMA20/EMA60 repeatedly breached; promote entry, stop, and target to 4h"
         )
@@ -6162,6 +6139,10 @@ def _apply_multi_timeframe_context(signal: dict[str, object], context: dict[str,
         and short_ema_unreliable
     ):
         entry_timeframe_override = "4h"
+        setup_type = _prefer_setup_type(
+            setup_type,
+            SETUP_H4_PULLBACK_SHORT,
+        )
         reasons.append(
             "1h EMA20/EMA60 repeatedly breached as resistance; promote entry, stop, and target to 4h"
         )
@@ -6169,9 +6150,15 @@ def _apply_multi_timeframe_context(signal: dict[str, object], context: dict[str,
     weak_deleverage_rebound = _weak_deleverage_rebound(out, h4_oi, h1_pullback)
     oi_valley_long_reversal = _oi_valley_long_reversal_confirmed(
         h4_oi_valley,
-        reasons,
+        h1,
+        h1_pullback,
     )
     if action == SignalAction.ENTRY_LONG.value:
+        if m15_long_exception:
+            setup_type = _prefer_setup_type(
+                setup_type,
+                SETUP_M15_SQUEEZE_TACTICAL_LONG,
+            )
         if daily_bias == "BEAR":
             score -= 10
             reasons.append("1d bearish bias; long position size reduced")
@@ -6185,8 +6172,20 @@ def _apply_multi_timeframe_context(signal: dict[str, object], context: dict[str,
         score += ma_score
         reasons.extend(ma_reasons)
         vetoes.extend(ma_vetoes)
+        setup_type = _prefer_setup_type(
+            setup_type,
+            _ma_cluster_setup_type(
+                PositionSide.LONG,
+                h4_ma_cluster,
+                h1_ma_cluster,
+            ),
+        )
         if h1_direction == "LONG":
             score += 10
+            setup_type = _prefer_setup_type(
+                setup_type,
+                SETUP_H1_STRUCTURE_LONG,
+            )
             reasons.append(f"1h {h1_state.lower()} confirms long trigger")
         elif h1_direction == "SHORT":
             vetoes.append("1h trigger opposes long entry")
@@ -6198,6 +6197,10 @@ def _apply_multi_timeframe_context(signal: dict[str, object], context: dict[str,
                 vetoes.append("4h OI drained and volume is weak; EMA/BOLL bounce is not a clean long pullback")
             elif pullback_state == "HEALTHY_PULLBACK" and risk_state == "NORMAL":
                 score += 12
+                setup_type = _prefer_setup_type(
+                    setup_type,
+                    SETUP_H1_PULLBACK_LONG,
+                )
                 reasons.append("1h BOLL/EMA pullback held with clean risk")
             elif pullback_state == "HIGH_PULLBACK" and risk_state in {"LONG_CROWD", "OI_ABNORMAL", "FUNDING_HOT"}:
                 score -= 20
@@ -6209,6 +6212,7 @@ def _apply_multi_timeframe_context(signal: dict[str, object], context: dict[str,
                 PositionSide.LONG,
                 reasons=reasons,
                 entry_timeframe_override=entry_timeframe_override,
+                setup_type=setup_type,
                 action=action,
             ):
                 pass
@@ -6221,6 +6225,10 @@ def _apply_multi_timeframe_context(signal: dict[str, object], context: dict[str,
                 smart_money_phase,
             ):
                 score += 6
+                setup_type = _prefer_setup_type(
+                    setup_type,
+                    SETUP_M15_SQUEEZE_TACTICAL_LONG,
+                )
                 reasons.append("one-way uptrend 15m BOLL/EMA9 pullback confirmed; allow tactical long")
             else:
                 score -= 12
@@ -6246,6 +6254,10 @@ def _apply_multi_timeframe_context(signal: dict[str, object], context: dict[str,
             reasons.append("4h OI rebounds after deleverage and price breaks out; strong long restored")
         if oi_valley_long_reversal:
             score += 12
+            setup_type = _prefer_setup_type(
+                setup_type,
+                SETUP_OI_VALLEY_REVERSAL_LONG,
+            )
             reasons.append(
                 "4h OI valley formed after retail capitulation; downside wick reclaimed support"
             )
@@ -6269,6 +6281,10 @@ def _apply_multi_timeframe_context(signal: dict[str, object], context: dict[str,
         vetoes.extend(rsi_vetoes)
     elif action == SignalAction.ENTRY_SHORT.value:
         if distribution_short_stage == DISTRIBUTION_STAGE_RANGE:
+            setup_type = _prefer_setup_type(
+                setup_type,
+                SETUP_DISTRIBUTION_STAGE1_SHORT,
+            )
             score -= 8
             out["leverage_cap"] = min(
                 int(out.get("leverage_cap") or 99),
@@ -6282,10 +6298,18 @@ def _apply_multi_timeframe_context(signal: dict[str, object], context: dict[str,
                 "stage 1 high distribution: only a tiny short at a confirmed prior-high rejection"
             )
         elif distribution_short_stage == DISTRIBUTION_STAGE_DESCENDING:
+            setup_type = _prefer_setup_type(
+                setup_type,
+                SETUP_DISTRIBUTION_STAGE2_SHORT,
+            )
             reasons.append(
                 "stage 2 descending distribution: short only at the projected lower-high trendline"
             )
         elif distribution_short_stage == DISTRIBUTION_STAGE_MARKDOWN:
+            setup_type = _prefer_setup_type(
+                setup_type,
+                SETUP_DISTRIBUTION_STAGE3_SHORT,
+            )
             reasons.append(
                 "stage 3 markdown acceleration: 1h/4h EMA/BOLL bounce rejection is eligible"
             )
@@ -6302,14 +6326,30 @@ def _apply_multi_timeframe_context(signal: dict[str, object], context: dict[str,
         score += ma_score
         reasons.extend(ma_reasons)
         vetoes.extend(ma_vetoes)
+        setup_type = _prefer_setup_type(
+            setup_type,
+            _ma_cluster_setup_type(
+                PositionSide.SHORT,
+                h4_ma_cluster,
+                h1_ma_cluster,
+            ),
+        )
         if h1_direction == "SHORT":
             score += 10
+            setup_type = _prefer_setup_type(
+                setup_type,
+                SETUP_H1_STRUCTURE_SHORT,
+            )
             reasons.append(f"1h {h1_state.lower()} confirms short trigger")
         elif h1_direction == "LONG":
             vetoes.append("1h trigger opposes short entry")
         if pullback_direction == "SHORT":
             if pullback_state == "HEALTHY_PULLBACK" and risk_state == "NORMAL":
                 score += 12
+                setup_type = _prefer_setup_type(
+                    setup_type,
+                    SETUP_H1_PULLBACK_SHORT,
+                )
                 reasons.append("1h BOLL/EMA pullback rejected with clean risk")
             elif pullback_state == "LOW_PULLBACK" and risk_state in {"SHORT_CROWD", "OI_ABNORMAL", "FUNDING_HOT"}:
                 score -= 20
@@ -6321,6 +6361,7 @@ def _apply_multi_timeframe_context(signal: dict[str, object], context: dict[str,
                 PositionSide.SHORT,
                 reasons=reasons,
                 entry_timeframe_override=entry_timeframe_override,
+                setup_type=setup_type,
                 action=action,
             ):
                 pass
@@ -6378,7 +6419,6 @@ def _apply_multi_timeframe_context(signal: dict[str, object], context: dict[str,
         "m15_precision": m15_precision,
         "entry_guardrails": entry_guardrails,
     }
-    setup_type = _infer_entry_setup_type(stage_probe)
     if setup_type:
         stage_probe["setup_type"] = setup_type
     selected_entry_levels = _scored_entry_levels(stage_probe, entry_levels)
@@ -7393,3 +7433,4 @@ def _pnl_history_payload(
         }
         for timestamp in sorted(samples)
     ]
+

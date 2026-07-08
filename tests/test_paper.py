@@ -17,6 +17,7 @@ from ai_trading.paper import (
     MARKET_PRICE_STALE_SECONDS,
     SETUP_H1_PULLBACK_LONG,
     SETUP_H4_PULLBACK_SHORT,
+    SETUP_OI_VALLEY_REVERSAL_LONG,
     STATE_SAVE_SECONDS,
     PaperStateError,
     PaperTradingEngine,
@@ -1978,6 +1979,71 @@ def test_multi_timeframe_context_publishes_setup_type_for_four_hour_short_overri
 
     assert adjusted["setup_type"] == SETUP_H4_PULLBACK_SHORT
     assert set(adjusted["entry_levels"]["short"]) == {"h4_ema20_ema60"}
+
+
+def test_multi_timeframe_context_sets_h1_pullback_setup_from_source_without_reason_text() -> None:
+    signal = {
+        "action": SignalAction.ENTRY_LONG.value,
+        "candidate_action": SignalAction.ENTRY_LONG.value,
+        "score": 88,
+        "trend_state": "TREND_LONG",
+        "risk_state": "NORMAL",
+        "price": 100.0,
+        "reasons": ("base long direction",),
+    }
+    context = {
+        "summary": "context",
+        "daily_bias": "NEUTRAL",
+        "h1_pullback": {"direction": "LONG", "state": "HEALTHY_PULLBACK"},
+        "h1_trigger": {"direction": "NONE", "state": "WAIT"},
+        "entry_levels": {
+            "long": {
+                "h1_ema20_ema60": {
+                    "low": 99.0,
+                    "high": 101.0,
+                    "price": 100.0,
+                },
+            },
+        },
+    }
+
+    adjusted = _apply_multi_timeframe_context(signal, context)
+
+    assert adjusted["setup_type"] == SETUP_H1_PULLBACK_LONG
+    assert set(adjusted["entry_levels"]["long"]) == {"h1_ema20_ema60"}
+
+
+def test_multi_timeframe_context_sets_oi_valley_setup_from_source_without_reason_text() -> None:
+    signal = {
+        "action": SignalAction.ENTRY_LONG.value,
+        "candidate_action": SignalAction.ENTRY_LONG.value,
+        "score": 82,
+        "trend_state": "TREND_LONG",
+        "risk_state": "NORMAL",
+        "price": 100.0,
+        "reasons": ("base long direction",),
+    }
+    context = {
+        "summary": "context",
+        "daily_bias": "NEUTRAL",
+        "h4_oi_valley": {"state": "CONFIRMED"},
+        "h1_trigger": {"direction": "LONG", "state": "FAKE_BREAKDOWN"},
+        "h1_pullback": {"direction": "NONE", "state": "WAIT"},
+        "entry_levels": {
+            "long": {
+                "sweep_reclaim_support": {
+                    "low": 99.0,
+                    "high": 101.0,
+                    "price": 100.0,
+                },
+            },
+        },
+    }
+
+    adjusted = _apply_multi_timeframe_context(signal, context)
+
+    assert adjusted["setup_type"] == SETUP_OI_VALLEY_REVERSAL_LONG
+    assert set(adjusted["entry_levels"]["long"]) == {"sweep_reclaim_support"}
 
 
 def test_separated_ema20_and_ema60_do_not_create_a_bridge_entry_zone() -> None:
