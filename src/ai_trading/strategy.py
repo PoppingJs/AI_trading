@@ -300,9 +300,10 @@ class CompositeStrategy:
         reasons: list[str] = []
         vetoes = self._common_long_vetoes(current) + strict_vetoes
         setup_type = ""
-        sweep_veto = _sweep_veto(candles[-1], current, side="LONG", settings=self.settings)
-        if sweep_veto:
-            vetoes.append(sweep_veto)
+        sweep_warning = _upper_wick_chase_warning(candles[-1], current, self.settings)
+        if sweep_warning:
+            score -= 4
+            reasons.append(sweep_warning)
 
         if current.ema20 and current.ema50 and current.ma100:
             if current.close > current.ema50 and current.ema20 > current.ema50 and (current.ema50_slope or 0) > 0:
@@ -428,9 +429,10 @@ class CompositeStrategy:
         reasons: list[str] = []
         vetoes = self._common_short_vetoes(current) + strict_vetoes
         setup_type = ""
-        sweep_veto = _sweep_veto(candles[-1], current, side="SHORT", settings=self.settings)
-        if sweep_veto:
-            vetoes.append(sweep_veto)
+        sweep_warning = _lower_wick_chase_warning(candles[-1], current, self.settings)
+        if sweep_warning:
+            score -= 4
+            reasons.append(sweep_warning)
 
         if current.ema20 and current.ema50 and current.ma100:
             if current.close < current.ema50 and current.ema20 < current.ema50 and (current.ema50_slope or 0) < 0:
@@ -771,15 +773,23 @@ def _volume_breakout_retest_confirmation(
     return 0, None
 
 
-def _sweep_veto(candle: Candle, indicator: IndicatorSnapshot, *, side: str, settings: StrategySettings) -> str | None:
+def _upper_wick_chase_warning(candle: Candle, indicator: IndicatorSnapshot, settings: StrategySettings) -> str | None:
     if indicator.atr14 is None or indicator.atr14 <= 0:
         return None
-    upper_wick, lower_wick, close_position = _wick_profile(candle)
+    upper_wick, _, close_position = _wick_profile(candle)
     volume_ok = indicator.volume_ratio is None or indicator.volume_ratio >= 1.1
-    if side == "LONG" and upper_wick >= indicator.atr14 * settings.sweep_wick_atr and close_position <= 0.45 and volume_ok:
-        return "upper wick sweep rejected; avoid chasing long"
-    if side == "SHORT" and lower_wick >= indicator.atr14 * settings.sweep_wick_atr and close_position >= 0.55 and volume_ok:
-        return "lower wick sweep reclaimed; avoid chasing short"
+    if upper_wick >= indicator.atr14 * settings.sweep_wick_atr and close_position <= 0.45 and volume_ok:
+        return "upper wick rejected; wait for pullback or reclaim before adding long"
+    return None
+
+
+def _lower_wick_chase_warning(candle: Candle, indicator: IndicatorSnapshot, settings: StrategySettings) -> str | None:
+    if indicator.atr14 is None or indicator.atr14 <= 0:
+        return None
+    _, lower_wick, close_position = _wick_profile(candle)
+    volume_ok = indicator.volume_ratio is None or indicator.volume_ratio >= 1.1
+    if lower_wick >= indicator.atr14 * settings.sweep_wick_atr and close_position >= 0.55 and volume_ok:
+        return "lower wick reclaimed; wait for bounce or breakdown before adding short"
     return None
 
 

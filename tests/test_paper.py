@@ -46,6 +46,7 @@ from ai_trading.paper import (
     _high_distribution_handoff_exit_reason,
     _leverage_for_signal,
     _leverage_for_entry_quality,
+    _large_timeframe_wick_rejections,
     _margin_for_signal,
     _merge_candles,
     _ma_cluster_signal_adjustment,
@@ -604,7 +605,7 @@ def test_status_surfaces_stale_derivatives_vetoes_when_auto_trade_is_off() -> No
     vetoes = engine.status()["latest_signals"]["TESTUSDT"]["vetoes"]
 
     assert "OI/long-short ratio data is stale for more than 180 seconds" in vetoes
-    assert "current funding rate data is stale for more than 15 minutes" in vetoes
+    assert "current funding rate data is stale for more than 15 minutes" not in vetoes
 
 
 def test_status_clears_persisted_stale_price_veto_after_price_refresh() -> None:
@@ -1762,6 +1763,10 @@ def test_auto_entry_prerequisites_explain_score_direction_and_timing_blocks() ->
 
     assert "final score 81 below auto-entry minimum 82" in blocks
     assert "等待 1H支撑回踩区" in blocks
+    assert _auto_entry_prerequisite_blocks(
+        wait_signal,
+        include_entry_position=False,
+    ) == ("final score 81 below auto-entry minimum 82",)
     assert _auto_entry_prerequisite_blocks({"action": SignalAction.WATCH.value, "score": 90}) == (
         "directional entry signal not established",
     )
@@ -3602,6 +3607,79 @@ def test_multi_timeframe_context_adjusts_score_veto_and_margin() -> None:
     assert _daily_bias_margin_factor("LONG", adjusted) == 0.5
 
 
+def test_large_timeframe_wick_rejections_use_close_ratio() -> None:
+    timestamp = datetime.now(UTC)
+    rejections = _large_timeframe_wick_rejections(
+        {
+            "1h": [
+                Candle(
+                    timestamp=timestamp,
+                    open=100.0,
+                    high=102.0,
+                    low=99.0,
+                    close=100.0,
+                    volume=1_000.0,
+                )
+            ],
+            "4h": [
+                Candle(
+                    timestamp=timestamp,
+                    open=100.0,
+                    high=101.0,
+                    low=97.5,
+                    close=100.0,
+                    volume=1_000.0,
+                )
+            ],
+        }
+    )
+
+    assert rejections["upper"]["timeframe"] == "1h"
+    assert rejections["upper"]["ratio"] == pytest.approx(0.02)
+    assert rejections["lower"]["timeframe"] == "4h"
+    assert rejections["lower"]["ratio"] == pytest.approx(0.025)
+
+
+def test_large_timeframe_wick_rejection_is_hard_veto_for_chasing() -> None:
+    long_signal = {
+        "action": SignalAction.ENTRY_LONG.value,
+        "score": 100,
+        "risk_state": "NORMAL",
+        "reasons": (),
+        "vetoes": (),
+    }
+    long_context = {
+        "daily_bias": "NEUTRAL",
+        "large_wick_rejections": {
+            "upper": {"timeframe": "1h", "ratio": 0.021},
+        },
+        "summary": "MTF: test",
+    }
+
+    long_adjusted = _apply_multi_timeframe_context(long_signal, long_context)
+
+    assert "1H上插针收实2.1%，禁止追多" in long_adjusted["vetoes"]
+
+    short_signal = {
+        "action": SignalAction.ENTRY_SHORT.value,
+        "score": 100,
+        "risk_state": "NORMAL",
+        "reasons": (),
+        "vetoes": (),
+    }
+    short_context = {
+        "daily_bias": "NEUTRAL",
+        "large_wick_rejections": {
+            "lower": {"timeframe": "4h", "ratio": 0.025},
+        },
+        "summary": "MTF: test",
+    }
+
+    short_adjusted = _apply_multi_timeframe_context(short_signal, short_context)
+
+    assert "4H下插针收实2.5%，禁止追空" in short_adjusted["vetoes"]
+
+
 def test_multi_timeframe_healthy_pullback_adds_score() -> None:
     signal = {
         "action": "ENTRY_LONG",
@@ -3848,8 +3926,8 @@ def test_ma_cluster_breakout_scores_and_dense_waits() -> None:
     )
 
     assert score == 0
-    assert not reasons
-    assert "MA cluster dense; wait for breakout or MA20 retest: price=1.29" in vetoes
+    assert "MA cluster dense; wait for breakout or MA20 retest: price=1.29" in reasons
+    assert not vetoes
 
 
 def test_ma_cluster_refines_stop_and_take_profit() -> None:
@@ -4340,7 +4418,7 @@ def test_auto_trade_caps_positions_and_prefers_highest_scores() -> None:
     ) >= 940.0
 
 
-def test_auto_trade_backfills_slot_when_higher_score_candidate_has_low_reward_risk() -> None:
+def test_auto_trade_allows_low_reward_risk_as_quality_downgrade() -> None:
     settings = AppSettings()
     settings.risk.max_open_positions = 1
     engine = PaperTradingEngine(settings, starting_balance=1000, market_data=FakeMarketData())
@@ -4365,10 +4443,11 @@ def test_auto_trade_backfills_slot_when_higher_score_candidate_has_low_reward_ri
 
     asyncio.run(engine._auto_trade_once())
 
-    assert set(engine.account.positions) == {"NEXTUSDT"}
-    blocked = engine.latest_signals["HIGHUSDT"]
-    assert blocked["entry_timing"] == "GOOD"
-    assert any("entry reward/risk" in reason for reason in blocked["vetoes"])
+    assert set(engine.account.positions) == {"HIGHUSDT"}
+    opened = engine.latest_signals["HIGHUSDT"]
+    assert opened["entry_timing"] == "GOOD"
+    assert not any("entry reward/risk" in reason for reason in opened.get("vetoes", ()))
+    assert "实际盈亏比低于 1.20R" in opened.get("reasons", ())
 
 
 def test_auto_trade_uses_generated_take_profit_when_structure_target_is_unavailable() -> None:
@@ -4456,10 +4535,11 @@ def test_auto_trade_does_not_publish_partially_cleared_vetoes() -> None:
         market.release_price.set()
         await asyncio.wait_for(task, timeout=1)
 
-        assert any(
+        assert not any(
             str(reason).startswith("entry reward/risk ")
-            for reason in engine.latest_signals["TESTUSDT"]["vetoes"]
+            for reason in engine.latest_signals["TESTUSDT"].get("vetoes", ())
         )
+        assert "TESTUSDT" in engine.account.positions
 
     asyncio.run(scenario())
 

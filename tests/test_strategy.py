@@ -144,7 +144,7 @@ def test_strategy_emits_long_when_score_is_strong() -> None:
     assert signal.score >= 70
 
 
-def test_strategy_blocks_chasing_after_upper_wick_sweep() -> None:
+def test_strategy_downgrades_but_does_not_block_after_upper_wick_sweep() -> None:
     candles, derivatives = _trending_market()
     indicators = build_indicators(candles, derivatives)
     latest = candles[-1]
@@ -169,7 +169,37 @@ def test_strategy_blocks_chasing_after_upper_wick_sweep() -> None:
 
     signal = CompositeStrategy(StrategySettings(score_threshold=70, strict_trend_entry=False)).generate_signal("BTCUSDT", candles, indicators)
 
-    assert "upper wick sweep rejected; avoid chasing long" in signal.vetoes
+    assert "upper wick sweep rejected; avoid chasing long" not in signal.vetoes
+    assert "upper wick rejected; wait for pullback or reclaim before adding long" in signal.reasons
+
+
+def test_strategy_downgrades_but_does_not_block_after_lower_wick_sweep() -> None:
+    candles, derivatives = _trending_market()
+    indicators = build_indicators(candles, derivatives)
+    latest = candles[-1]
+    candles[-1] = replace(latest, open=120.0, high=121.0, low=114.0, close=120.4, volume=5_000)
+    current = indicators[-1]
+    indicators[-1] = replace(
+        current,
+        close=120.4,
+        ema20=125.0,
+        ema50=127.0,
+        ma100=130.0,
+        boll_mid=126.0,
+        boll_upper=132.0,
+        boll_lower=118.0,
+        rsi14=38,
+        atr14=2.0,
+        volume_ratio=1.6,
+        oi_change=0.003,
+        long_short_ratio=0.8,
+        funding_rate=-0.0001,
+    )
+
+    _, reasons, vetoes, _ = CompositeStrategy(StrategySettings(score_threshold=70, strict_trend_entry=False))._score_short(candles, indicators)
+
+    assert "lower wick sweep reclaimed; avoid chasing short" not in vetoes
+    assert "lower wick reclaimed; wait for bounce or breakdown before adding short" in reasons
 
 
 def test_strategy_rewards_market_structure_breakout() -> None:

@@ -90,6 +90,7 @@ DISTRIBUTION_STAGE_MARKDOWN = "MARKDOWN_ACCELERATION"
 AUTO_ENTRY_MIN_SCORE = 82
 CORE_STRUCTURE_SCORE_CAP = AUTO_ENTRY_MIN_SCORE - 1
 MIN_ENTRY_REWARD_R = 1.2
+LARGE_TIMEFRAME_WICK_REJECTION_PCT = 0.02
 PROFIT_LOCK_SLIPPAGE_PCT = 0.0008
 MIN_PRECISION_STOP_PCT = 0.012
 MIN_PRECISION_STOP_ATR_MULTIPLE = 0.65
@@ -1907,12 +1908,16 @@ class PaperTradingEngine:
             if reentry_reason:
                 _record_auto_entry_block(signal, reentry_reason)
                 continue
-            for reason in _auto_entry_prerequisite_blocks(signal):
+            for reason in _auto_entry_prerequisite_blocks(
+                signal,
+                include_entry_position=False,
+            ):
                 _record_auto_entry_block(signal, reason)
+            entry_position_block = _auto_entry_position_block(signal)
             if self.running:
                 for reason in self._data_freshness_blocks(symbol, signal):
                     _record_auto_entry_block(signal, reason)
-            if signal.get("vetoes"):
+            if signal.get("vetoes") or entry_position_block:
                 continue
             candidates.append((symbol, signal))
         candidates.sort(key=lambda item: int(item[1].get("score") or 0), reverse=True)
@@ -2071,17 +2076,20 @@ class PaperTradingEngine:
                         + self.settings.execution.slippage_rate
                     ),
                 )
-                if reward_r is None:
-                    signal["exit_plan_status"] = "ERROR"
-                    signal["exit_plan_error"] = "reward/risk calculation unavailable after exit-plan generation"
-                    self.last_error = f"{symbol} exit plan assertion failed: reward/risk calculation unavailable"
-                    continue
-                if reward_r < MIN_ENTRY_REWARD_R:
-                    _record_auto_entry_block(
-                        signal,
-                        f"entry reward/risk {reward_r:.2f}R below minimum {MIN_ENTRY_REWARD_R:.2f}R",
-                    )
-                    continue
+                reward_r_unavailable = reward_r is None
+                if reward_r_unavailable:
+                    low_reward_note = "实际盈亏比无法计算"
+                    signal_reasons = list(signal.get("reasons") or ())
+                    if low_reward_note not in signal_reasons:
+                        signal_reasons.append(low_reward_note)
+                    signal["reasons"] = tuple(signal_reasons)
+                    reward_r = 0.0
+                if not reward_r_unavailable and reward_r < MIN_ENTRY_REWARD_R:
+                    low_reward_note = f"实际盈亏比低于 {MIN_ENTRY_REWARD_R:.2f}R"
+                    signal_reasons = list(signal.get("reasons") or ())
+                    if low_reward_note not in signal_reasons:
+                        signal_reasons.append(low_reward_note)
+                    signal["reasons"] = tuple(signal_reasons)
                 signal["exit_plan_status"] = "NORMAL"
                 stop_pct = _entry_stop_pct(entry_price, stop_loss)
                 entry_quality = _entry_quality_grade(
@@ -2254,8 +2262,6 @@ class PaperTradingEngine:
     ) -> tuple[str, ...]:
         now = datetime.now(UTC)
         blocks: list[str] = []
-        if not self._warmup_complete:
-            blocks.append("market warm-up is still running")
         price_updated_at = self._price_updated_at.get(symbol)
         if (
             price_updated_at is None
@@ -2271,14 +2277,6 @@ class PaperTradingEngine:
             or (now - derivatives_updated_at).total_seconds() > DERIVATIVES_STALE_SECONDS
         ):
             blocks.append("OI/long-short ratio data is stale for more than 180 seconds")
-        if getattr(self.market_data, "current_funding_rates", None) is not None:
-            funding_updated_at = self._funding_updated_at.get(symbol)
-            if (
-                funding_updated_at is None
-                or (now - funding_updated_at).total_seconds()
-                > FUNDING_REFRESH_SECONDS * 1.5
-            ):
-                blocks.append("current funding rate data is stale for more than 15 minutes")
         if not self._symbol_cache_valid(symbol):
             cache = self._timeframe_candles.get(symbol, {})
             for timeframe in _required_entry_timeframes(signal):
@@ -4037,7 +4035,11 @@ def _auto_signal_allowed(signal: dict[str, object]) -> bool:
     return not _auto_entry_prerequisite_blocks(signal)
 
 
-def _auto_entry_prerequisite_blocks(signal: dict[str, object]) -> tuple[str, ...]:
+def _auto_entry_prerequisite_blocks(
+    signal: dict[str, object],
+    *,
+    include_entry_position: bool = True,
+) -> tuple[str, ...]:
     blocks: list[str] = []
     action = str(signal.get("action") or "")
     score = int(signal.get("score") or 0)
@@ -4046,14 +4048,26 @@ def _auto_entry_prerequisite_blocks(signal: dict[str, object]) -> tuple[str, ...
         blocks.append("directional entry signal not established")
     if score < AUTO_ENTRY_MIN_SCORE:
         blocks.append(f"final score {score} below auto-entry minimum {AUTO_ENTRY_MIN_SCORE}")
-    if is_entry:
-        entry_position, entry_reason = _signal_entry_timing(signal)
-        if entry_position != ENTRY_TIMING_GOOD:
-            detail = entry_reason or entry_position
-            existing_vetoes = {str(reason) for reason in (signal.get("vetoes") or ())}
-            if detail not in existing_vetoes:
-                blocks.append(detail)
+    entry_position_block = (
+        _auto_entry_position_block(signal)
+        if include_entry_position
+        else None
+    )
+    if entry_position_block:
+        existing_vetoes = {str(reason) for reason in (signal.get("vetoes") or ())}
+        if entry_position_block not in existing_vetoes:
+            blocks.append(entry_position_block)
     return tuple(dict.fromkeys(blocks))
+
+
+def _auto_entry_position_block(signal: dict[str, object]) -> str | None:
+    action = str(signal.get("action") or "")
+    if action not in {SignalAction.ENTRY_LONG.value, SignalAction.ENTRY_SHORT.value}:
+        return None
+    entry_position, entry_reason = _signal_entry_timing(signal)
+    if entry_position == ENTRY_TIMING_GOOD:
+        return None
+    return entry_reason or entry_position
 
 
 def _auto_entry_status_signal(
@@ -4072,7 +4086,10 @@ def _auto_entry_status_signal(
         payload["vetoes"] = ("symbol already has an open position",)
         return payload
     _update_entry_position_fields(payload)
-    for reason in _auto_entry_prerequisite_blocks(payload):
+    for reason in _auto_entry_prerequisite_blocks(
+        payload,
+        include_entry_position=False,
+    ):
         _record_auto_entry_block(payload, reason)
     if not auto_trade:
         _record_auto_entry_block(payload, "auto strategy disabled; new entries are paused")
@@ -5368,6 +5385,7 @@ def _build_multi_timeframe_context(
         settings,
     )
     m15 = _fifteen_minute_precision(timeframe_candles.get("15m", []), timeframe_indicators.get("15m", []), settings)
+    large_wick_rejections = _large_timeframe_wick_rejections(timeframe_candles)
     entry_levels = _entry_level_context(
         h1_structure,
         h4,
@@ -5401,10 +5419,69 @@ def _build_multi_timeframe_context(
         "high_distribution_handoff": high_handoff,
         "distribution_short": distribution_short,
         "m15_precision": m15,
+        "large_wick_rejections": large_wick_rejections,
         "entry_levels": entry_levels,
         "entry_guardrails": entry_guardrails,
         "summary": _multi_timeframe_summary(d1, h4, h1, h1_pullback, h4_oi, h4_ma_cluster, h1_ma_cluster),
     }
+
+
+def _large_timeframe_wick_rejections(
+    timeframe_candles: dict[str, list[Candle]],
+) -> dict[str, dict[str, object]]:
+    rejections: dict[str, dict[str, object]] = {}
+    for timeframe in ("1h", "4h"):
+        candles = timeframe_candles.get(timeframe, [])
+        if not candles:
+            continue
+        candle = candles[-1]
+        close = float(candle.close or 0.0)
+        if close <= 0:
+            continue
+        upper_ratio = max((float(candle.high) - close) / close, 0.0)
+        lower_ratio = max((close - float(candle.low)) / close, 0.0)
+        if upper_ratio >= LARGE_TIMEFRAME_WICK_REJECTION_PCT:
+            _remember_largest_wick_rejection(
+                rejections,
+                "upper",
+                timeframe,
+                upper_ratio,
+            )
+        if lower_ratio >= LARGE_TIMEFRAME_WICK_REJECTION_PCT:
+            _remember_largest_wick_rejection(
+                rejections,
+                "lower",
+                timeframe,
+                lower_ratio,
+            )
+    return rejections
+
+
+def _remember_largest_wick_rejection(
+    rejections: dict[str, dict[str, object]],
+    key: str,
+    timeframe: str,
+    ratio: float,
+) -> None:
+    current = rejections.get(key)
+    if current is not None and float(current.get("ratio") or 0.0) >= ratio:
+        return
+    rejections[key] = {
+        "timeframe": timeframe,
+        "ratio": ratio,
+    }
+
+
+def _large_wick_rejection_veto_text(
+    side: PositionSide,
+    rejection: dict[str, object],
+) -> str:
+    timeframe = str(rejection.get("timeframe") or "").upper()
+    ratio = float(rejection.get("ratio") or 0.0)
+    pct = ratio * 100
+    if side == PositionSide.LONG:
+        return f"{timeframe}上插针收实{pct:.1f}%，禁止追多"
+    return f"{timeframe}下插针收实{pct:.1f}%，禁止追空"
 
 
 def _daily_direction(indicators: list[IndicatorSnapshot]) -> str:
@@ -6389,6 +6466,11 @@ def _apply_multi_timeframe_context(signal: dict[str, object], context: dict[str,
     high_distribution_handoff = context.get("high_distribution_handoff") if isinstance(context.get("high_distribution_handoff"), dict) else {}
     distribution_short = context.get("distribution_short") if isinstance(context.get("distribution_short"), dict) else {}
     m15_precision = context.get("m15_precision") if isinstance(context.get("m15_precision"), dict) else {}
+    large_wick_rejections = (
+        context.get("large_wick_rejections")
+        if isinstance(context.get("large_wick_rejections"), dict)
+        else {}
+    )
     entry_levels = context.get("entry_levels") if isinstance(context.get("entry_levels"), dict) else {}
     entry_guardrails = (
         context.get("entry_guardrails")
@@ -6417,6 +6499,24 @@ def _apply_multi_timeframe_context(signal: dict[str, object], context: dict[str,
         if action == SignalAction.ENTRY_LONG.value:
             vetoes.append(
                 "high distribution handoff complete; avoid new long"
+            )
+    if action == SignalAction.ENTRY_LONG.value:
+        upper_rejection = large_wick_rejections.get("upper")
+        if isinstance(upper_rejection, dict):
+            vetoes.append(
+                _large_wick_rejection_veto_text(
+                    PositionSide.LONG,
+                    upper_rejection,
+                )
+            )
+    elif action == SignalAction.ENTRY_SHORT.value:
+        lower_rejection = large_wick_rejections.get("lower")
+        if isinstance(lower_rejection, dict):
+            vetoes.append(
+                _large_wick_rejection_veto_text(
+                    PositionSide.SHORT,
+                    lower_rejection,
+                )
             )
     entry_timeframe_override: str | None = None
     m15_long_exception = _strong_m15_pullback_allowed(
@@ -6730,6 +6830,7 @@ def _apply_multi_timeframe_context(signal: dict[str, object], context: dict[str,
         "distribution_short_stage": distribution_short_stage,
         "h4_oi": h4_oi,
         "h4_oi_valley": h4_oi_valley,
+        "large_wick_rejections": large_wick_rejections,
         "h1_structure": h1_structure,
         "h4_structure": h4,
         "h1_ma_cluster": h1_ma_cluster,
@@ -6792,6 +6893,7 @@ def _apply_multi_timeframe_context(signal: dict[str, object], context: dict[str,
     out["distribution_short"] = distribution_short
     out["distribution_short_stage"] = distribution_short_stage
     out["m15_precision"] = m15_precision
+    out["large_wick_rejections"] = large_wick_rejections
     out["entry_guardrails"] = entry_guardrails
     if setup_type:
         out["setup_type"] = setup_type
@@ -6920,7 +7022,7 @@ def _ma_cluster_signal_adjustment(
             score += 14
             reasons.append(_ma_cluster_reason("MA cluster retest held near MA20", h1_price or h4_price))
         if h4_state == "DENSE" and h1_state not in {"BREAKOUT_UP", "RETEST_UP"}:
-            vetoes.append(_ma_cluster_reason("MA cluster dense; wait for breakout or MA20 retest", h1_price or h4_price))
+            reasons.append(_ma_cluster_reason("MA cluster dense; wait for breakout or MA20 retest", h1_price or h4_price))
     else:
         if h4_state == "BREAKDOWN_DOWN" or h1_state == "BREAKDOWN_DOWN":
             score += 12
@@ -6929,7 +7031,7 @@ def _ma_cluster_signal_adjustment(
             score += 14
             reasons.append(_ma_cluster_reason("MA cluster retest rejected near MA20", h1_price or h4_price))
         if h4_state == "DENSE" and h1_state not in {"BREAKDOWN_DOWN", "RETEST_DOWN"}:
-            vetoes.append(_ma_cluster_reason("MA cluster dense; wait for breakdown or MA20 retest", h1_price or h4_price))
+            reasons.append(_ma_cluster_reason("MA cluster dense; wait for breakdown or MA20 retest", h1_price or h4_price))
     return score, reasons, vetoes
 
 

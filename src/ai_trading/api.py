@@ -706,7 +706,8 @@ PAPER_DASHBOARD_HTML = """
       'washout confirmed: upside wick swept resistance, OI dropped, close rejected key level': '洗盘确认：上插针扫过压力，OI下降，收盘跌回关键位',
       'downside sweep reclaimed support; stop-run filter favors long': '下插针扫损后收回支撑，偏向做多',
       'upside sweep rejected resistance; stop-run filter favors short': '上插针扫损后跌回压力，偏向做空',
-      'upper wick sweep rejected; avoid chasing long': '上插针跌回，禁止追多',
+      'upper wick sweep rejected; avoid chasing long': '上插针回落，等待回踩确认',
+      'upper wick rejected; wait for pullback or reclaim before adding long': '上插针回落，等待回踩或重新收回',
       'lower wick sweep reclaimed; avoid chasing short': '下插针收回，禁止追空',
       'extreme volatility: skip new long entry': '极端波动，禁止新开多单',
       'extreme volatility: skip new short entry': '极端波动，禁止新开空单',
@@ -837,7 +838,8 @@ PAPER_DASHBOARD_HTML = """
       'RSI oversold for short entry': 'RSI超卖',
       'price closed above upper BOLL; no chase': '价格突破BOLL上轨',
       'price closed below lower BOLL; no chase': '价格跌破BOLL下轨',
-      'upper wick sweep rejected; avoid chasing long': '上插针跌回，禁止追多',
+      'upper wick sweep rejected; avoid chasing long': '上插针回落，等待回踩确认',
+      'upper wick rejected; wait for pullback or reclaim before adding long': '上插针回落，等待回踩或重新收回',
       'lower wick sweep reclaimed; avoid chasing short': '下插针收回，禁止追空',
       'smart money accumulation after OI flush; avoid chasing shorts': 'OI爆减后疑似吸筹',
       'short crowd is vulnerable to a squeeze': '空头拥挤，逼空风险',
@@ -924,8 +926,13 @@ PAPER_DASHBOARD_HTML = """
     function tRiskState(value) { return riskStateText[value] || value || '正常'; }
     function tReason(value) {
       if (!value) return '';
+      const rawReason = String(value);
+      if (
+        rawReason === 'lower wick sweep reclaimed; avoid chasing short'
+        || rawReason === 'lower wick reclaimed; wait for bounce or breakdown before adding short'
+      ) return '下插针收回，等待反抽或重新跌回';
       if (reasonText[value]) return reasonText[value];
-      const reason = String(value);
+      const reason = rawReason;
       const maPrefixes = [
         ['MA cluster breakout up', '均线密集区向上突破'],
         ['MA cluster retest held near MA20', '突破均线密集区后回踩MA20不破'],
@@ -959,6 +966,8 @@ PAPER_DASHBOARD_HTML = """
         if (reason.startsWith(prefix)) return text;
       }
       if (reason.startsWith('entry reward/risk ')) {
+        const preferred = reason.match(/entry reward\\/risk ([0-9.]+)R below preferred ([0-9.]+)R/);
+        if (preferred) return `实际盈亏比${preferred[1]}R，低于偏好${preferred[2]}R，降级开仓`;
         const values = reason.match(/entry reward\\/risk ([0-9.]+)R below minimum ([0-9.]+)R/);
         return values ? `实际盈亏比${values[1]}R，低于最低${values[2]}R` : '实际盈亏比低于最低要求';
       }
@@ -1041,6 +1050,10 @@ PAPER_DASHBOARD_HTML = """
     function tVeto(value) {
       const reason = String(value || '').trim();
       if (!reason) return '';
+      if (
+        reason === 'lower wick sweep reclaimed; avoid chasing short'
+        || reason === 'lower wick reclaimed; wait for bounce or breakdown before adding short'
+      ) return '下插针收回，等待反抽或重新跌回';
       if (vetoText[reason]) return vetoText[reason];
       if (reason === 'directional entry signal not established') return '多/空方向未成立';
       if (reason.startsWith('final score ')) return '评分低于82';
@@ -1053,6 +1066,8 @@ PAPER_DASHBOARD_HTML = """
       const timeframeGap = reason.match(/^(15m|1h|4h) K-line context is missing or discontinuous$/);
       if (timeframeGap) return `${timeframeGap[1]}周期缺失或不连续`;
       if (reason.startsWith('entry reward/risk ')) {
+        const preferred = (reason.match(/below preferred ([0-9.]+)R/) || [])[1] || '';
+        if (preferred) return `盈亏比偏低，降级开仓（偏好${preferred}R）`;
         const minimum = (reason.match(/below minimum ([0-9.]+)R/) || [])[1] || '';
         return minimum ? `盈亏比低于${minimum}R` : '盈亏比不足';
       }
