@@ -457,6 +457,9 @@ def test_transient_entry_blocks_are_removed_but_strategy_veto_remains() -> None:
             "latest price is stale for more than 15 seconds",
             "current funding rate data is stale for more than 15 minutes",
             "symbol excluded from automatic universe",
+            "等待 1H支撑回踩区",
+            "已进入建议区，但未处于优势侧",
+            "暂无有效建议入场区",
             "funding rate too hot for long entry",
         ),
         "entry_timing": "BLOCK",
@@ -1758,7 +1761,7 @@ def test_auto_entry_prerequisites_explain_score_direction_and_timing_blocks() ->
     blocks = _auto_entry_prerequisite_blocks(wait_signal)
 
     assert "final score 81 below auto-entry minimum 82" in blocks
-    assert any(reason.startswith("current entry position is not excellent:") for reason in blocks)
+    assert "等待 1H支撑回踩区" in blocks
     assert _auto_entry_prerequisite_blocks({"action": SignalAction.WATCH.value, "score": 90}) == (
         "directional entry signal not established",
     )
@@ -1805,14 +1808,14 @@ def test_auto_signal_requires_real_entry_zone_for_ordinary_short() -> None:
     timing, reason = _signal_entry_timing(mid_zone_short)
 
     assert timing == "WAIT"
-    assert "scored short entry zone" in reason
+    assert reason == "等待 1H压力反抽区"
     assert not _auto_signal_allowed(mid_zone_short)
 
     resistance_retest = {**mid_zone_short, "price": 261.0}
     timing, reason = _signal_entry_timing(resistance_retest)
 
     assert timing == "GOOD"
-    assert "scored short entry zone" in reason
+    assert reason == "已到优势入场区"
     assert _auto_signal_allowed(resistance_retest)
 
 
@@ -1833,13 +1836,13 @@ def test_entry_timing_turns_good_when_price_reaches_suggested_zone() -> None:
 
     timing, reason = _signal_entry_timing(signal)
     assert timing == "WAIT"
-    assert "scored long entry zone" in reason
+    assert reason == "等待 1H支撑回踩区"
     assert not _auto_signal_allowed(signal)
 
     signal["price"] = 100.0
     timing, reason = _signal_entry_timing(signal)
     assert timing == "GOOD"
-    assert "entry zone" in reason
+    assert reason == "已到优势入场区"
     assert _auto_signal_allowed(signal)
 
 
@@ -1872,6 +1875,45 @@ def test_entry_position_requires_advantage_side_inside_scored_zone() -> None:
     signal["price"] = 99.8
     _update_entry_position_fields(signal)
     assert signal["entry_timing"] == "GOOD"
+
+
+def test_suggested_entry_text_uses_the_same_filtered_entry_levels() -> None:
+    signal = {
+        "action": SignalAction.ENTRY_SHORT.value,
+        "score": 90,
+        "trend_state": "TREND_SHORT",
+        "risk_state": "NORMAL",
+        "price": 98.0,
+        "entry_levels": {
+            "short": {
+                "h1_resistance": {"low": 101.0, "high": 102.0, "price": 101.5},
+                "breakdown_retest": {"low": 99.0, "high": 100.0, "price": 99.5},
+            }
+        },
+    }
+
+    _update_entry_position_fields(signal)
+
+    assert signal["entry_timing"] == "WAIT"
+    assert signal["entry_timing_reason"] == "等待 1H压力反抽区"
+    assert signal["suggested_entry_text"] == (
+        "1H压力反抽区≈101-102；前支撑跌破后反抽确认区≈99-100"
+    )
+
+
+def test_signal_without_filtered_entry_levels_has_no_suggested_entry_zone() -> None:
+    signal = {
+        "action": SignalAction.ENTRY_SHORT.value,
+        "score": 90,
+        "price": 98.0,
+        "entry_levels": {"short": {}},
+    }
+
+    _update_entry_position_fields(signal)
+
+    assert signal["entry_timing"] == "BLOCK"
+    assert signal["entry_timing_reason"] == "暂无有效建议入场区"
+    assert signal["suggested_entry_text"] == "暂无有效建议入场区"
 
 
 def test_entry_position_rejects_aave_like_lower_single_indicator_zone() -> None:
@@ -2132,7 +2174,7 @@ def test_h1_pullback_setup_allows_split_ema60_entry_without_reason_text() -> Non
     timing, reason = _signal_entry_timing(signal)
 
     assert timing == "GOOD"
-    assert "scored long entry zone" in reason
+    assert reason == "已到优势入场区"
 
 
 def test_oi_context_does_not_become_a_standalone_suggested_entry_zone() -> None:
@@ -2822,7 +2864,7 @@ def test_entry_position_only_compares_price_with_zone_in_late_stage() -> None:
     timing, reason = _signal_entry_timing(late_long)
 
     assert timing == "GOOD"
-    assert "scored long entry zone" in reason
+    assert reason == "已到优势入场区"
     assert _auto_signal_allowed(late_long)
 
 
@@ -3383,7 +3425,7 @@ def test_auto_signal_waits_for_1h_4h_retest_in_one_way_down_short() -> None:
     timing, reason = _signal_entry_timing(signal)
 
     assert timing == "WAIT"
-    assert "scored short entry zone" in reason
+    assert reason == "等待 1H压力反抽区"
     assert not _auto_signal_allowed(signal)
 
 
@@ -3409,7 +3451,7 @@ def test_short_at_or_below_closed_h1_boll_lower_waits_for_bounce() -> None:
     timing, reason = _signal_entry_timing(signal)
 
     assert timing == "WAIT"
-    assert "1h BOLL lower" in reason
+    assert reason == "等待 1H/4H压力反抽区"
 
 
 def test_short_above_h1_boll_lower_can_use_scored_retest_zone() -> None:
@@ -3455,7 +3497,7 @@ def test_entry_position_does_not_duplicate_m15_stop_validation() -> None:
     timing, reason = _signal_entry_timing(signal)
 
     assert timing == "GOOD"
-    assert "scored long entry zone" in reason
+    assert reason == "已到优势入场区"
     assert _auto_signal_allowed(signal)
 
 

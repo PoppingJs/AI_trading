@@ -4052,7 +4052,7 @@ def _auto_entry_prerequisite_blocks(signal: dict[str, object]) -> tuple[str, ...
             detail = entry_reason or entry_position
             existing_vetoes = {str(reason) for reason in (signal.get("vetoes") or ())}
             if detail not in existing_vetoes:
-                blocks.append(f"current entry position is not excellent: {detail}")
+                blocks.append(detail)
     return tuple(dict.fromkeys(blocks))
 
 
@@ -4090,6 +4090,7 @@ def _update_entry_position_fields(signal: dict[str, object]) -> None:
     entry_position, reason = _signal_entry_timing(signal)
     signal["entry_timing"] = entry_position
     signal["entry_timing_reason"] = reason
+    signal["suggested_entry_text"] = _suggested_entry_text(signal)
 
 
 _TRANSIENT_AUTO_ENTRY_BLOCK_PREFIXES = (
@@ -4097,6 +4098,9 @@ _TRANSIENT_AUTO_ENTRY_BLOCK_PREFIXES = (
     "final score ",
     "late trend stage",
     "current entry position is not excellent",
+    "等待 ",
+    "已进入建议区",
+    "暂无有效建议入场区",
     "symbol already has an open position",
     "symbol excluded from automatic universe",
     "auto strategy disabled",
@@ -4246,9 +4250,9 @@ def _signal_entry_timing(signal: dict[str, object]) -> tuple[str, str]:
     price = _float_or_none(signal.get("price"))
     entry_levels = signal.get("entry_levels") if isinstance(signal.get("entry_levels"), dict) else {}
     if not entry_levels:
-        return ENTRY_TIMING_BLOCK, "entry position blocked: suggested entry zone unavailable"
+        return ENTRY_TIMING_BLOCK, "暂无有效建议入场区"
     if price is None:
-        return ENTRY_TIMING_WAIT, "entry position wait: latest price unavailable"
+        return ENTRY_TIMING_WAIT, "等待最新价格"
     side = PositionSide.LONG if action == SignalAction.ENTRY_LONG.value else PositionSide.SHORT
     return _side_entry_timing(side, price, signal)
 
@@ -4257,6 +4261,11 @@ def _side_entry_timing(side: PositionSide, price: float, signal: dict[str, objec
     score = int(signal.get("score") or 0)
     risk_state = str(signal.get("risk_state") or "NORMAL")
     trend_state = str(signal.get("trend_state") or signal.get("regime") or "")
+    levels = signal.get("entry_levels") if isinstance(signal.get("entry_levels"), dict) else {}
+    side_key = "long" if side == PositionSide.LONG else "short"
+    side_levels = levels.get(side_key) if isinstance(levels.get(side_key), dict) else {}
+    if not side_levels:
+        return ENTRY_TIMING_BLOCK, "暂无有效建议入场区"
     m15_precision = signal.get("m15_precision") if isinstance(signal.get("m15_precision"), dict) else {}
     smart_money_phase = str(signal.get("smart_money_phase") or "")
     include_m15 = _strong_m15_pullback_allowed(
@@ -4282,17 +4291,20 @@ def _side_entry_timing(side: PositionSide, price: float, signal: dict[str, objec
     ):
         return (
             ENTRY_TIMING_WAIT,
-            "entry position wait: live price is at or below 1h BOLL lower; wait for a higher-timeframe bounce",
+            "等待 1H/4H压力反抽区",
         )
     if _entry_level_group_hit(signal, price, side, include_m15=include_m15):
         return ENTRY_TIMING_GOOD, _entry_zone_reason(side)
-    return ENTRY_TIMING_WAIT, _wait_retest_reason(side)
+    return ENTRY_TIMING_WAIT, _entry_wait_hint(
+        signal,
+        price,
+        side,
+        include_m15=include_m15,
+    )
 
 
 def _entry_zone_reason(side: PositionSide) -> str:
-    if side == PositionSide.LONG:
-        return "entry position good: live price is inside the advantage side of a scored long entry zone"
-    return "entry position good: live price is inside the advantage side of a scored short entry zone"
+    return "已到优势入场区"
 
 
 def _pullback_reason(side: PositionSide) -> str:
@@ -4317,6 +4329,126 @@ def _wait_retest_reason(side: PositionSide) -> str:
     if side == PositionSide.LONG:
         return "entry position wait: live price has not reached a scored long entry zone"
     return "entry position wait: live price has not reached a scored short entry zone"
+
+
+def _entry_level_display_labels(side: PositionSide) -> dict[str, str]:
+    if side == PositionSide.LONG:
+        return {
+            "h1_support": "1H支撑回踩区",
+            "h4_support": "4H支撑回踩区",
+            "h1_boll_mid": "1H BOLL中轨回踩区",
+            "h4_boll_mid": "4H BOLL中轨回踩区",
+            "h1_ema20_ema60": "1H EMA20/EMA60回踩区",
+            "h4_ema20_ema60": "4H EMA20/EMA60回踩区",
+            "h1_ema20": "1H EMA20回踩区",
+            "h1_ema60": "1H EMA60回踩区",
+            "h4_ema20": "4H EMA20回踩区",
+            "h4_ema60": "4H EMA60回踩区",
+            "m15_ema20_ema60": "强单边15m EMA20/EMA60回踩区",
+            "sweep_reclaim_support": "下插针收回支撑确认区",
+            "ma_cluster_breakout": "均线密集突破区",
+            "ma20_retest": "突破均线密集后回踩MA20区",
+            "breakout_retest": "前压力突破后回踩确认区",
+            "vwap_pullback": "VWAP/成交密集区回踩区",
+        }
+    return {
+        "distribution_range_high": "高位派发箱体上沿区",
+        "descending_high_trendline": "下降顶点趋势线反抽区",
+        "h1_resistance": "1H压力反抽区",
+        "h4_resistance": "4H压力反抽区",
+        "h1_boll_mid": "1H BOLL中轨反抽区",
+        "h4_boll_mid": "4H BOLL中轨反抽区",
+        "h1_ema20_ema60": "1H EMA20/EMA60反抽区",
+        "h4_ema20_ema60": "4H EMA20/EMA60反抽区",
+        "h1_ema20": "1H EMA20反抽区",
+        "h1_ema60": "1H EMA60反抽区",
+        "h4_ema20": "4H EMA20反抽区",
+        "h4_ema60": "4H EMA60反抽区",
+        "sweep_reject_resistance": "上插针跌回压力确认区",
+        "ma_cluster_breakdown": "均线密集跌破区",
+        "ma20_retest": "跌破均线密集后反抽MA20区",
+        "breakdown_retest": "前支撑跌破后反抽确认区",
+        "vwap_retest": "VWAP/成交密集区反抽区",
+    }
+
+
+def _entry_wait_label(side: PositionSide, key: str) -> str:
+    labels = _entry_level_display_labels(side)
+    return labels.get(key, "建议入场区")
+
+
+def _entry_level_zone_text(level: object) -> str:
+    if not isinstance(level, dict):
+        return ""
+    low = _float_or_none(level.get("low"))
+    high = _float_or_none(level.get("high"))
+    price = _float_or_none(level.get("price"))
+    values = [value for value in (low, high, price) if value is not None]
+    if not values:
+        return ""
+    zone_low = min(values)
+    zone_high = max(values)
+    if abs(zone_high - zone_low) <= max(abs(zone_low), 1.0) * 1e-9:
+        return _summary_price(zone_low)
+    return f"{_summary_price(zone_low)}-{_summary_price(zone_high)}"
+
+
+def _suggested_entry_text(signal: dict[str, object]) -> str:
+    side = _signal_side(signal)
+    if side is None:
+        return "暂无有效建议入场区"
+    levels = signal.get("entry_levels") if isinstance(signal.get("entry_levels"), dict) else {}
+    side_key = "long" if side == PositionSide.LONG else "short"
+    side_levels = levels.get(side_key) if isinstance(levels.get(side_key), dict) else {}
+    if not side_levels:
+        return "暂无有效建议入场区"
+    labels = _entry_level_display_labels(side)
+    ordered_keys = [key for key in _entry_level_keys(side) if key in side_levels]
+    ordered_keys.extend(key for key in side_levels if key not in ordered_keys)
+    grouped: dict[str, list[str]] = {}
+    for key in ordered_keys:
+        zone = _entry_level_zone_text(side_levels.get(key))
+        if not zone:
+            continue
+        label = labels.get(key, "建议入场区")
+        grouped.setdefault(zone, [])
+        if label not in grouped[zone]:
+            grouped[zone].append(label)
+    if not grouped:
+        return "暂无有效建议入场区"
+    parts = [
+        f"{'/'.join(labels_for_zone)}≈{zone}"
+        for zone, labels_for_zone in grouped.items()
+    ]
+    return "；".join(parts[:3])
+
+
+def _entry_wait_hint(
+    signal: dict[str, object],
+    price: float,
+    side: PositionSide,
+    *,
+    include_m15: bool,
+) -> str:
+    levels = signal.get("entry_levels") if isinstance(signal.get("entry_levels"), dict) else {}
+    side_key = "long" if side == PositionSide.LONG else "short"
+    side_levels = levels.get(side_key) if isinstance(levels.get(side_key), dict) else {}
+    if not side_levels:
+        return "暂无有效建议入场区"
+    keys = _entry_level_keys(side)
+    if include_m15:
+        keys = (*keys, "m15_ema20_ema60")
+    matched_any_zone = any(
+        isinstance(side_levels.get(key), dict)
+        and _entry_level_hit(price, side_levels.get(key))
+        for key in keys
+    )
+    if matched_any_zone:
+        return "已进入建议区，但未处于优势侧"
+    for key in keys:
+        if _entry_level_has_values(side_levels.get(key)):
+            return f"等待 {_entry_wait_label(side, key)}"
+    return "暂无有效建议入场区"
 
 
 def _entry_level_group_hit(signal: dict[str, object], price: float, side: PositionSide, *, include_m15: bool) -> bool:

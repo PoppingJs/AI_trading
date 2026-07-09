@@ -968,6 +968,9 @@ PAPER_DASHBOARD_HTML = """
       if (reason === 'directional entry signal not established') {
         return '多空方向信号尚未成立';
       }
+      if (reason.startsWith('等待 ') || reason.startsWith('已进入建议区') || reason === '暂无有效建议入场区') {
+        return reason;
+      }
       if (reason.startsWith('current entry position is not excellent:')) {
         return '当前入场位置不优秀';
       }
@@ -1041,6 +1044,9 @@ PAPER_DASHBOARD_HTML = """
       if (vetoText[reason]) return vetoText[reason];
       if (reason === 'directional entry signal not established') return '多/空方向未成立';
       if (reason.startsWith('final score ')) return '评分低于82';
+      if (reason.startsWith('等待 ') || reason.startsWith('已进入建议区') || reason === '暂无有效建议入场区') {
+        return reason;
+      }
       if (reason.startsWith('current entry position is not excellent:')) {
         return '当前入场位置不优秀';
       }
@@ -1344,6 +1350,7 @@ PAPER_DASHBOARD_HTML = """
       }
 
       let entryBits = [];
+      const backendEntryText = String(signal.suggested_entry_text || '').trim();
       const levels = entrySideLevels(signal, direction);
       const candidates = [];
       if (direction === '多头') {
@@ -1401,6 +1408,7 @@ PAPER_DASHBOARD_HTML = """
         }
       }
       entryBits = mergedEntryText(candidates);
+      if (backendEntryText) entryBits = [backendEntryText];
       if (!entryBits.length) entryBits.push('边界确认处：暂无有效区间');
       const entryLabel = options.entryLabel || '入场位置';
       const entryLine = `${entryLabel}：${entryBits.slice(0, 3).join('；')}`;
@@ -1453,11 +1461,14 @@ PAPER_DASHBOARD_HTML = """
     function signalEntryPosition(signal) {
       if (signal.entry_timing) {
         const timingText = { GOOD: '优秀', WAIT: '等待', BLOCK: '禁止' };
-        const timingClass = signal.entry_timing === 'GOOD' ? 'pos' : signal.entry_timing === 'BLOCK' ? 'neg' : 'muted';
+        timingText.GOOD = '优秀';
+        timingText.WAIT = '等待';
+        timingText.BLOCK = '观察';
+        const timingClass = signal.entry_timing === 'GOOD' ? 'pos' : 'muted';
         return `<span class="${timingClass}">${timingText[signal.entry_timing] || signal.entry_timing}</span>`;
       }
       const action = String(signal.action || '');
-      return action === 'ENTRY_LONG' || action === 'ENTRY_SHORT' ? '等待' : '禁止';
+      return action === 'ENTRY_LONG' || action === 'ENTRY_SHORT' ? '等待' : '观察';
     }
     function tEntryPositionReason(value) {
       const text = String(value || '');
