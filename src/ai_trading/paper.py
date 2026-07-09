@@ -57,9 +57,18 @@ PYRAMID_MIN_SCORE = 85
 PYRAMID_MARGIN_FRACTION = 0.35
 PYRAMID_MAX_ADDS = 1
 PAPER_DEFAULT_BALANCE = 1200.0
-INITIAL_ENTRY_MARGIN_CAP = 0.78
+INITIAL_ENTRY_MARGIN_CAP = 0.95
 TOTAL_OPEN_RISK_CAP = 0.04
 PYRAMID_TOTAL_MARGIN_CAP = 0.95
+ENTRY_MARGIN_DEPLOYMENT_CAP = 0.95
+ENTRY_MARGIN_BASE_SLOTS = 5
+ENTRY_ADVANTAGE_ZONE_FRACTION = 0.60
+ENTRY_QUALITY_S = "S"
+ENTRY_QUALITY_A = "A"
+ENTRY_QUALITY_B = "B"
+ENTRY_QUALITY_STOP_MAX_10X = 0.065
+ENTRY_QUALITY_STOP_MAX_7X = 0.095
+ENTRY_QUALITY_STOP_MAX_5X = 0.13
 RSI_NORMAL_LONG_MAX = 75.0
 RSI_NORMAL_SHORT_MIN = 25.0
 RSI_STRONG_LONG_PULLBACK = 75.0
@@ -1955,7 +1964,7 @@ class PaperTradingEngine:
                     indicators,
                 )
                 trend_stage = str(signal.get("trend_stage_phase") or _trend_stage_from_signal(signal, preferred_indicator))
-                leverage = min(
+                initial_leverage = min(
                     _leverage_for_signal(
                         score,
                         self.settings.risk.leverage_max,
@@ -1968,7 +1977,7 @@ class PaperTradingEngine:
                 stop_loss, take_profit_1, take_profit_2 = _adaptive_exits(
                     side_enum,
                     entry_price,
-                    leverage,
+                    initial_leverage,
                     trend_state,
                     preferred_indicator,
                 )
@@ -2074,19 +2083,37 @@ class PaperTradingEngine:
                     )
                     continue
                 signal["exit_plan_status"] = "NORMAL"
-                margin, planned_risk_usdt = _risk_sized_margin(
+                stop_pct = _entry_stop_pct(entry_price, stop_loss)
+                entry_quality = _entry_quality_grade(
+                    score=score,
+                    reward_r=reward_r,
+                    stop_pct=stop_pct,
+                    setup_type=str(signal.get("setup_type") or ""),
+                )
+                leverage = _leverage_for_entry_quality(
+                    entry_quality,
+                    stop_pct=stop_pct,
+                    leverage_max=self.settings.risk.leverage_max,
+                    leverage_cap=int(
+                        signal.get("leverage_cap")
+                        or self.settings.risk.leverage_max
+                    ),
+                )
+                if leverage <= 0:
+                    _record_auto_entry_block(
+                        signal,
+                        "entry stop distance too wide for minimum 5x leverage safety",
+                    )
+                    continue
+                margin_factor = _daily_bias_margin_factor(side, signal)
+                margin = _quality_sized_margin(
                     equity=equity,
                     available=available,
                     remaining_total_margin=remaining_total_margin,
-                    current_open_risk_usdt=_current_open_risk_usdt(
-                        self.account.positions.values()
-                    ),
-                    risk_per_trade=self.settings.risk.risk_per_trade,
-                    risk_factor=_daily_bias_margin_factor(side, signal),
-                    entry_price=entry_price,
-                    stop_price=stop_loss,
-                    leverage=leverage,
+                    quality=entry_quality,
+                    margin_factor=margin_factor,
                 )
+                planned_risk_usdt = margin * leverage * stop_pct
                 if margin < 5:
                     _record_auto_entry_block(
                         signal,
@@ -2102,6 +2129,12 @@ class PaperTradingEngine:
                 entry_context["trend_stage_phase"] = trend_stage
                 entry_context["entry_reward_r"] = reward_r
                 entry_context["planned_risk_usdt"] = planned_risk_usdt
+                entry_context["entry_quality"] = entry_quality
+                entry_context["entry_quality_units"] = _entry_quality_units(
+                    entry_quality
+                )
+                entry_context["entry_stop_pct"] = stop_pct
+                entry_context["entry_margin_factor"] = margin_factor
                 await self.open_position(
                     symbol,
                     side,
@@ -2770,6 +2803,10 @@ def _entry_position_text(
             "h4_boll_mid": "4H BOLL中轨回踩",
             "h1_ema20_ema60": "1H EMA20/EMA60回踩",
             "h4_ema20_ema60": "4H EMA20/EMA60回踩",
+            "h1_ema20": "1H EMA20回踩",
+            "h1_ema60": "1H EMA60回踩",
+            "h4_ema20": "4H EMA20回踩",
+            "h4_ema60": "4H EMA60回踩",
             "m15_ema20_ema60": "强单边15m EMA20/EMA60回踩",
             "sweep_reclaim_support": "下插针扫损后收回支撑",
             "ma_cluster_breakout": "上穿均线密集区",
@@ -2787,6 +2824,10 @@ def _entry_position_text(
             "h4_boll_mid": "4H BOLL中轨反抽",
             "h1_ema20_ema60": "1H EMA20/EMA60反抽",
             "h4_ema20_ema60": "4H EMA20/EMA60反抽",
+            "h1_ema20": "1H EMA20反抽",
+            "h1_ema60": "1H EMA60反抽",
+            "h4_ema20": "4H EMA20反抽",
+            "h4_ema60": "4H EMA60反抽",
             "sweep_reject_resistance": "上插针扫空后跌回压力",
             "ma_cluster_breakdown": "下穿均线密集区",
             "ma20_retest": "跌破均线密集后反抽MA20",
@@ -3984,9 +4025,9 @@ def _timeframe_target_candidates(
 
 def _structure_target_candidates(mapping: dict[str, object], side: PositionSide, price: float) -> list[float]:
     if side == PositionSide.LONG:
-        keys = ("resistance_zone_low", "resistance", "resistance_zone_high")
+        keys = ("resistance", "resistance_zone_high")
         return [value for value in (_float_or_none(mapping.get(key)) for key in keys) if value is not None and value > price]
-    keys = ("support_zone_high", "support", "support_zone_low")
+    keys = ("support", "support_zone_low")
     return [value for value in (_float_or_none(mapping.get(key)) for key in keys) if value is not None and value < price]
 
 
@@ -4063,6 +4104,7 @@ _TRANSIENT_AUTO_ENTRY_BLOCK_PREFIXES = (
     "available entry margin ",
     "15m tactical entry lacks ",
     "invalid entry stop",
+    "entry stop distance too wide",
     "entry reward/risk ",
     "auto entry execution failed",
     "BTC 4h extreme volatility",
@@ -4083,6 +4125,7 @@ _AUTO_ENTRY_EVALUATION_RESULT_PREFIXES = (
     "available entry margin ",
     "15m tactical entry lacks ",
     "invalid entry stop",
+    "entry stop distance too wide",
     "entry reward/risk ",
     "auto entry execution failed",
 )
@@ -4248,8 +4291,8 @@ def _side_entry_timing(side: PositionSide, price: float, signal: dict[str, objec
 
 def _entry_zone_reason(side: PositionSide) -> str:
     if side == PositionSide.LONG:
-        return "entry position good: live price is inside a scored long entry zone"
-    return "entry position good: live price is inside a scored short entry zone"
+        return "entry position good: live price is inside the advantage side of a scored long entry zone"
+    return "entry position good: live price is inside the advantage side of a scored short entry zone"
 
 
 def _pullback_reason(side: PositionSide) -> str:
@@ -4323,6 +4366,10 @@ def _entry_zone_bounds(
         "h4_boll_mid",
         "h1_ema20_ema60",
         "h4_ema20_ema60",
+        "h1_ema20",
+        "h1_ema60",
+        "h4_ema20",
+        "h4_ema60",
         "vwap_pullback",
         "vwap_retest",
     }
@@ -4337,10 +4384,34 @@ def _entry_zone_bounds(
         and not _h4_override_indicator_entry_allowed(signal, matched_keys)
     ):
         return None
-    return (
-        max(low for _, low, _ in matched),
-        min(high for _, _, high in matched),
-    )
+    zone_low = max(low for _, low, _ in matched)
+    zone_high = min(high for _, _, high in matched)
+    if not _entry_advantage_zone_hit(
+        price,
+        side,
+        zone_low,
+        zone_high,
+    ):
+        return None
+    return zone_low, zone_high
+
+
+def _entry_advantage_zone_hit(
+    price: float,
+    side: PositionSide,
+    zone_low: float,
+    zone_high: float,
+) -> bool:
+    if zone_low > zone_high:
+        return False
+    width = zone_high - zone_low
+    if width <= 0:
+        return price == zone_low
+    if side == PositionSide.LONG:
+        advantage_ceiling = zone_low + width * ENTRY_ADVANTAGE_ZONE_FRACTION
+        return zone_low <= price <= advantage_ceiling
+    advantage_floor = zone_high - width * ENTRY_ADVANTAGE_ZONE_FRACTION
+    return advantage_floor <= price <= zone_high
 
 
 def _h4_override_indicator_entry_allowed(
@@ -4352,6 +4423,8 @@ def _h4_override_indicator_entry_allowed(
     return bool(matched_keys) and matched_keys <= {
         "h4_boll_mid",
         "h4_ema20_ema60",
+        "h4_ema20",
+        "h4_ema60",
     }
 
 
@@ -4363,9 +4436,63 @@ def _indicator_entry_confirmation_present(
     if not matched_keys & {
         "h1_boll_mid",
         "h1_ema20_ema60",
+        "h1_ema20",
+        "h1_ema60",
+        "h4_boll_mid",
+        "h4_ema20_ema60",
+        "h4_ema20",
+        "h4_ema60",
         "vwap_pullback",
         "vwap_retest",
     }:
+        return False
+    setup_type = str(signal.get("setup_type") or "")
+    h1_pullback = signal.get("h1_pullback") if isinstance(signal.get("h1_pullback"), dict) else {}
+    h1_ma_cluster = signal.get("h1_ma_cluster") if isinstance(signal.get("h1_ma_cluster"), dict) else {}
+    h4_ma_cluster = signal.get("h4_ma_cluster") if isinstance(signal.get("h4_ma_cluster"), dict) else {}
+    h1_state = str(h1_pullback.get("state") or "")
+    h1_direction = str(h1_pullback.get("direction") or "")
+    h1_cluster_state = str(h1_ma_cluster.get("state") or "")
+    h4_cluster_state = str(h4_ma_cluster.get("state") or "")
+    h1_indicator_hit = bool(matched_keys & {
+        "h1_boll_mid",
+        "h1_ema20_ema60",
+        "h1_ema20",
+        "h1_ema60",
+        "vwap_pullback",
+        "vwap_retest",
+    })
+    h4_indicator_hit = bool(matched_keys & {
+        "h4_boll_mid",
+        "h4_ema20_ema60",
+        "h4_ema20",
+        "h4_ema60",
+    })
+    if side == PositionSide.LONG:
+        if h1_indicator_hit and (
+            setup_type == SETUP_H1_PULLBACK_LONG
+            or (h1_direction == "LONG" and h1_state == "HEALTHY_PULLBACK")
+            or h1_cluster_state == "RETEST_UP"
+        ):
+            return True
+        if h4_indicator_hit and (
+            setup_type == SETUP_H4_PULLBACK_LONG
+            or h4_cluster_state == "RETEST_UP"
+        ):
+            return True
+    else:
+        if h1_indicator_hit and (
+            setup_type == SETUP_H1_PULLBACK_SHORT
+            or (h1_direction == "SHORT" and h1_state == "HEALTHY_PULLBACK")
+            or h1_cluster_state == "RETEST_DOWN"
+        ):
+            return True
+        if h4_indicator_hit and (
+            setup_type == SETUP_H4_PULLBACK_SHORT
+            or h4_cluster_state == "RETEST_DOWN"
+        ):
+            return True
+    if h4_indicator_hit and not h1_indicator_hit:
         return False
     reason_text = " | ".join(
         str(reason).lower()
@@ -4396,6 +4523,10 @@ def _entry_level_keys(side: PositionSide) -> tuple[str, ...]:
             "h4_boll_mid",
             "h1_ema20_ema60",
             "h4_ema20_ema60",
+            "h1_ema20",
+            "h1_ema60",
+            "h4_ema20",
+            "h4_ema60",
             "sweep_reclaim_support",
             "ma_cluster_breakout",
             "ma20_retest",
@@ -4412,6 +4543,10 @@ def _entry_level_keys(side: PositionSide) -> tuple[str, ...]:
             "h4_boll_mid",
             "h1_ema20_ema60",
             "h4_ema20_ema60",
+            "h1_ema20",
+            "h1_ema60",
+            "h4_ema20",
+            "h4_ema60",
             "sweep_reject_resistance",
             "ma_cluster_breakdown",
             "ma20_retest",
@@ -4520,10 +4655,14 @@ def _scored_entry_levels(
     side_key = "long" if side == PositionSide.LONG else "short"
     source = all_levels.get(side_key) if isinstance(all_levels.get(side_key), dict) else {}
     if str(signal.get("entry_timeframe_override") or "") == "4h":
-        keys = (
-            ("h4_support", "h4_boll_mid", "h4_ema20_ema60")
-            if side == PositionSide.LONG
-            else ("h4_resistance", "h4_boll_mid", "h4_ema20_ema60")
+        keys = [
+            "h4_support" if side == PositionSide.LONG else "h4_resistance",
+            "h4_boll_mid",
+        ]
+        keys.extend(
+            ["h4_ema20_ema60"]
+            if _entry_level_has_values(source.get("h4_ema20_ema60"))
+            else ["h4_ema20", "h4_ema60"]
         )
         selected = {
             key: source[key]
@@ -4550,15 +4689,24 @@ def _scored_entry_levels(
             if _entry_level_has_values(level):
                 selected[key] = level
 
+    def add_ema(timeframe: str) -> None:
+        merged_key = f"{timeframe}_ema20_ema60"
+        if _entry_level_has_values(source.get(merged_key)):
+            add(merged_key)
+            return
+        add(f"{timeframe}_ema20", f"{timeframe}_ema60")
+
     if side == PositionSide.LONG:
         if setup_type == SETUP_M15_SQUEEZE_TACTICAL_LONG:
             add("m15_ema20_ema60")
         elif setup_type == SETUP_H4_PULLBACK_LONG:
-            add("h4_support", "h4_boll_mid", "h4_ema20_ema60")
+            add("h4_support", "h4_boll_mid")
+            add_ema("h4")
         elif setup_type == SETUP_OI_VALLEY_REVERSAL_LONG:
             add("sweep_reclaim_support", "h1_support", "h4_support")
         elif setup_type == SETUP_H1_PULLBACK_LONG:
-            add("h1_support", "h1_boll_mid", "h1_ema20_ema60", "vwap_pullback", "ma20_retest")
+            add("h1_support", "h1_boll_mid", "vwap_pullback", "ma20_retest")
+            add_ema("h1")
         elif setup_type == SETUP_H1_STRUCTURE_LONG:
             add("breakout_retest", "h1_support", "sweep_reclaim_support", "ma_cluster_breakout")
         precision = signal.get("m15_precision") if isinstance(signal.get("m15_precision"), dict) else {}
@@ -4574,7 +4722,8 @@ def _scored_entry_levels(
         if "vwap pullback held" in reason_text:
             add("vwap_pullback")
         if "close confirmed near ema20/boll mid" in reason_text or "1h boll/ema pullback held" in reason_text:
-            add("h1_support", "h1_boll_mid", "h1_ema20_ema60")
+            add("h1_support", "h1_boll_mid")
+            add_ema("h1")
         if "1h retest confirms long trigger" in reason_text:
             add("breakout_retest")
         if "1h fake_breakdown confirms long trigger" in reason_text:
@@ -4588,18 +4737,22 @@ def _scored_entry_levels(
         if "ma cluster retest held" in reason_text:
             add("ma20_retest")
         if "4h structure supports upside" in reason_text:
-            add("h4_support", "h4_ema20_ema60")
+            add("h4_support")
+            add_ema("h4")
     else:
         if setup_type == SETUP_H4_PULLBACK_SHORT:
-            add("h4_resistance", "h4_boll_mid", "h4_ema20_ema60")
+            add("h4_resistance", "h4_boll_mid")
+            add_ema("h4")
         elif setup_type == SETUP_H1_PULLBACK_SHORT:
-            add("h1_resistance", "h1_boll_mid", "h1_ema20_ema60", "vwap_retest", "ma20_retest")
+            add("h1_resistance", "h1_boll_mid", "vwap_retest", "ma20_retest")
+            add_ema("h1")
         elif setup_type == SETUP_H1_STRUCTURE_SHORT:
             add("breakdown_retest", "h1_resistance", "sweep_reject_resistance", "ma_cluster_breakdown")
         if "vwap retest rejected" in reason_text:
             add("vwap_retest")
         if "close confirmed failed retest" in reason_text or "1h boll/ema pullback rejected" in reason_text:
-            add("h1_resistance", "h1_boll_mid", "h1_ema20_ema60")
+            add("h1_resistance", "h1_boll_mid")
+            add_ema("h1")
         if "1h retest confirms short trigger" in reason_text:
             add("breakdown_retest")
         if "1h fake_breakout confirms short trigger" in reason_text:
@@ -4611,7 +4764,8 @@ def _scored_entry_levels(
         if "ma cluster retest rejected" in reason_text:
             add("ma20_retest")
         if "4h structure supports downside" in reason_text:
-            add("h4_resistance", "h4_ema20_ema60")
+            add("h4_resistance")
+            add_ema("h4")
     return {side_key: selected} if selected else {}
 
 
@@ -4627,6 +4781,13 @@ def _distribution_stage_entry_levels(
             level = source.get(key)
             if _entry_level_has_values(level):
                 selected[key] = level
+
+    def add_ema(timeframe: str) -> None:
+        merged_key = f"{timeframe}_ema20_ema60"
+        if _entry_level_has_values(source.get(merged_key)):
+            add(merged_key)
+            return
+        add(f"{timeframe}_ema20", f"{timeframe}_ema60")
 
     if stage == DISTRIBUTION_STAGE_RANGE:
         reasons = " | ".join(
@@ -4647,12 +4808,12 @@ def _distribution_stage_entry_levels(
         add(
             "h1_boll_mid",
             "h4_boll_mid",
-            "h1_ema20_ema60",
-            "h4_ema20_ema60",
             "ma20_retest",
             "breakdown_retest",
             "vwap_retest",
         )
+        add_ema("h1")
+        add_ema("h4")
     return {"short": selected} if selected else {}
 
 
@@ -4707,7 +4868,7 @@ def _entry_timeframe_for_signal(
         and _entry_level_hit(price, side_levels.get("m15_ema20_ema60"))
     )
     h1_keys = (
-        ("h1_support", "h1_boll_mid", "h1_ema20_ema60", "vwap_pullback")
+        ("h1_support", "h1_boll_mid", "h1_ema20_ema60", "h1_ema20", "h1_ema60", "vwap_pullback")
         if side == PositionSide.LONG
         else (
             "distribution_range_high",
@@ -4715,13 +4876,15 @@ def _entry_timeframe_for_signal(
             "h1_resistance",
             "h1_boll_mid",
             "h1_ema20_ema60",
+            "h1_ema20",
+            "h1_ema60",
             "vwap_retest",
         )
     )
     h4_keys = (
-        ("h4_support", "h4_boll_mid", "h4_ema20_ema60")
+        ("h4_support", "h4_boll_mid", "h4_ema20_ema60", "h4_ema20", "h4_ema60")
         if side == PositionSide.LONG
-        else ("h4_resistance", "h4_boll_mid", "h4_ema20_ema60")
+        else ("h4_resistance", "h4_boll_mid", "h4_ema20_ema60", "h4_ema20", "h4_ema60")
     )
     h1_hit = any(_entry_level_hit(price, side_levels.get(key)) for key in h1_keys)
     h4_hit = any(_entry_level_hit(price, side_levels.get(key)) for key in h4_keys)
@@ -5891,6 +6054,10 @@ def _entry_level_context(
             "h4_boll_mid": _indicator_band(h4_indicator, h4_indicator.boll_mid if h4_indicator else None),
             "h1_ema20_ema60": _ema20_ema60_band(h1_indicator, h1_ma_cluster),
             "h4_ema20_ema60": _ema20_ema60_band(h4_indicator, h4_ma_cluster),
+            "h1_ema20": _ema_level_band(h1_indicator, "ema20", h1_ma_cluster),
+            "h1_ema60": _ema_level_band(h1_indicator, "ema60", h1_ma_cluster),
+            "h4_ema20": _ema_level_band(h4_indicator, "ema20", h4_ma_cluster),
+            "h4_ema60": _ema_level_band(h4_indicator, "ema60", h4_ma_cluster),
             "m15_ema20_ema60": _zone_from_object(m15.get("long_pullback_zone")),
             "sweep_reclaim_support": _zone_from_mapping(h1_structure, "support") or _zone_from_mapping(h4_structure, "support"),
             "ma_cluster_breakout": _cluster_band(h1_ma_cluster) or _cluster_band(h4_ma_cluster),
@@ -5911,6 +6078,10 @@ def _entry_level_context(
             "h4_boll_mid": _indicator_band(h4_indicator, h4_indicator.boll_mid if h4_indicator else None),
             "h1_ema20_ema60": _ema20_ema60_band(h1_indicator, h1_ma_cluster),
             "h4_ema20_ema60": _ema20_ema60_band(h4_indicator, h4_ma_cluster),
+            "h1_ema20": _ema_level_band(h1_indicator, "ema20", h1_ma_cluster),
+            "h1_ema60": _ema_level_band(h1_indicator, "ema60", h1_ma_cluster),
+            "h4_ema20": _ema_level_band(h4_indicator, "ema20", h4_ma_cluster),
+            "h4_ema60": _ema_level_band(h4_indicator, "ema60", h4_ma_cluster),
             "sweep_reject_resistance": _zone_from_mapping(h1_structure, "resistance") or _zone_from_mapping(h4_structure, "resistance"),
             "ma_cluster_breakdown": _cluster_band(h1_ma_cluster) or _cluster_band(h4_ma_cluster),
             "ma20_retest": _ma20_band(h1_ma_cluster, h1_indicator) or _ma20_band(h4_ma_cluster, h4_indicator),
@@ -5980,6 +6151,21 @@ def _indicator_band(indicator: IndicatorSnapshot | None, price: float | None) ->
     return {"low": value - buffer, "high": value + buffer, "price": value}
 
 
+def _ema_level_band(
+    indicator: IndicatorSnapshot | None,
+    ema_key: str,
+    cluster: dict[str, object],
+) -> dict[str, float] | None:
+    value = (
+        indicator.ema20
+        if ema_key == "ema20" and indicator is not None
+        else _float_or_none(cluster.get("ema60"))
+        if ema_key == "ema60"
+        else None
+    )
+    return _indicator_band(indicator, value)
+
+
 def _ema20_ema60_band(indicator: IndicatorSnapshot | None, cluster: dict[str, object]) -> dict[str, float] | None:
     ema60 = _float_or_none(cluster.get("ema60"))
     values = [indicator.ema20 if indicator else None, ema60]
@@ -5994,7 +6180,7 @@ def _ema20_ema60_band(indicator: IndicatorSnapshot | None, cluster: dict[str, ob
         and ema60 is not None
         and abs(float(indicator.ema20) - ema60) > buffer * 2
     ):
-        return _indicator_band(indicator, float(indicator.ema20))
+        return None
     return {"low": min(valid) - buffer, "high": max(valid) + buffer, "price": reference}
 
 
@@ -7188,6 +7374,94 @@ def _margin_for_signal(
         return cap
     target = remaining_total_margin / max(slots_remaining, 1)
     return min(cap, max(floor, target))
+
+
+def _entry_stop_pct(entry_price: float, stop_price: float) -> float:
+    if entry_price <= 0:
+        return 0.0
+    return abs(entry_price - stop_price) / entry_price
+
+
+def _entry_quality_grade(
+    *,
+    score: int,
+    reward_r: float,
+    stop_pct: float,
+    setup_type: str,
+) -> str:
+    setup_is_core = bool(setup_type) and setup_type != SETUP_DISTRIBUTION_STAGE1_SHORT
+    if (
+        setup_is_core
+        and score >= 95
+        and reward_r >= 1.5
+        and stop_pct <= 0.05
+    ):
+        return ENTRY_QUALITY_S
+    if (
+        setup_is_core
+        and score >= 88
+        and reward_r >= MIN_ENTRY_REWARD_R
+        and stop_pct <= ENTRY_QUALITY_STOP_MAX_10X
+    ):
+        return ENTRY_QUALITY_A
+    return ENTRY_QUALITY_B
+
+
+def _max_safe_leverage_for_stop(
+    stop_pct: float,
+    leverage_max: int,
+) -> int:
+    effective_max = max(5, min(int(leverage_max or 10), 10))
+    for leverage, max_stop_pct in (
+        (10, ENTRY_QUALITY_STOP_MAX_10X),
+        (7, ENTRY_QUALITY_STOP_MAX_7X),
+        (5, ENTRY_QUALITY_STOP_MAX_5X),
+    ):
+        if leverage <= effective_max and stop_pct <= max_stop_pct:
+            return leverage
+    return 0
+
+
+def _leverage_for_entry_quality(
+    quality: str,
+    *,
+    stop_pct: float,
+    leverage_max: int,
+    leverage_cap: int | None = None,
+) -> int:
+    capped_max = leverage_max
+    if leverage_cap is not None:
+        capped_max = min(capped_max, max(5, int(leverage_cap)))
+    safe_leverage = _max_safe_leverage_for_stop(stop_pct, capped_max)
+    if safe_leverage <= 0:
+        return 0
+    if quality in {ENTRY_QUALITY_S, ENTRY_QUALITY_A}:
+        return min(10, safe_leverage)
+    return safe_leverage
+
+
+def _entry_quality_units(quality: str) -> int:
+    return 2 if quality == ENTRY_QUALITY_S else 1
+
+
+def _quality_sized_margin(
+    *,
+    equity: float,
+    available: float,
+    remaining_total_margin: float,
+    quality: str,
+    margin_factor: float = 1.0,
+) -> float:
+    if equity <= 0:
+        return 0.0
+    unit_margin = equity * ENTRY_MARGIN_DEPLOYMENT_CAP / ENTRY_MARGIN_BASE_SLOTS
+    target = unit_margin * _entry_quality_units(quality)
+    target *= max(0.0, min(float(margin_factor), 1.0))
+    return min(
+        target,
+        max(available, 0.0),
+        max(remaining_total_margin, 0.0),
+    )
 
 
 def _current_open_risk_usdt(positions: Iterable[Position]) -> float:

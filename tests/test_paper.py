@@ -32,6 +32,7 @@ from ai_trading.paper import (
     _current_open_risk_usdt,
     _daily_bias_margin_factor,
     _daily_pnl_payload,
+    _entry_quality_grade,
     _distribution_short_stage,
     _distribution_short_structure,
     _entry_reward_r,
@@ -44,6 +45,7 @@ from ai_trading.paper import (
     _high_distribution_handoff,
     _high_distribution_handoff_exit_reason,
     _leverage_for_signal,
+    _leverage_for_entry_quality,
     _margin_for_signal,
     _merge_candles,
     _ma_cluster_signal_adjustment,
@@ -67,6 +69,7 @@ from ai_trading.paper import (
     _rotation_candidate_allowed,
     _risk_exit_reason,
     _risk_sized_margin,
+    _quality_sized_margin,
     _scored_entry_levels,
     _signal_entry_timing,
     _stop_exit_reason,
@@ -1697,6 +1700,52 @@ def test_auto_signal_score_tiers_and_margins() -> None:
     assert _margin_for_signal(76, 1000, 950, 5) == 180
 
 
+def test_entry_quality_drives_leverage_and_margin_units() -> None:
+    assert _entry_quality_grade(
+        score=96,
+        reward_r=1.6,
+        stop_pct=0.03,
+        setup_type=SETUP_H1_PULLBACK_LONG,
+    ) == "S"
+    assert _entry_quality_grade(
+        score=90,
+        reward_r=1.25,
+        stop_pct=0.05,
+        setup_type=SETUP_H1_PULLBACK_LONG,
+    ) == "A"
+    assert _entry_quality_grade(
+        score=84,
+        reward_r=1.25,
+        stop_pct=0.08,
+        setup_type=SETUP_H1_PULLBACK_LONG,
+    ) == "B"
+
+    assert _leverage_for_entry_quality("S", stop_pct=0.03, leverage_max=10) == 10
+    assert _leverage_for_entry_quality("A", stop_pct=0.05, leverage_max=10) == 10
+    assert _leverage_for_entry_quality("B", stop_pct=0.08, leverage_max=10) == 7
+    assert _leverage_for_entry_quality("B", stop_pct=0.12, leverage_max=10) == 5
+    assert _leverage_for_entry_quality("B", stop_pct=0.14, leverage_max=10) == 0
+
+    assert _quality_sized_margin(
+        equity=1200,
+        available=1200,
+        remaining_total_margin=1140,
+        quality="S",
+    ) == pytest.approx(456.0)
+    assert _quality_sized_margin(
+        equity=1200,
+        available=1200,
+        remaining_total_margin=1140,
+        quality="A",
+    ) == pytest.approx(228.0)
+    assert _quality_sized_margin(
+        equity=1200,
+        available=100,
+        remaining_total_margin=1140,
+        quality="A",
+    ) == pytest.approx(100.0)
+
+
 def test_auto_entry_prerequisites_explain_score_direction_and_timing_blocks() -> None:
     wait_signal = {
         "action": SignalAction.ENTRY_LONG.value,
@@ -1787,14 +1836,14 @@ def test_entry_timing_turns_good_when_price_reaches_suggested_zone() -> None:
     assert "scored long entry zone" in reason
     assert not _auto_signal_allowed(signal)
 
-    signal["price"] = 100.2
+    signal["price"] = 100.0
     timing, reason = _signal_entry_timing(signal)
     assert timing == "GOOD"
     assert "entry zone" in reason
     assert _auto_signal_allowed(signal)
 
 
-def test_entry_position_is_good_immediately_inside_scored_zone() -> None:
+def test_entry_position_requires_advantage_side_inside_scored_zone() -> None:
     signal = {
         "timestamp": "2026-07-01T00:00:00+00:00",
         "action": SignalAction.ENTRY_LONG.value,
@@ -1814,7 +1863,7 @@ def test_entry_position_is_good_immediately_inside_scored_zone() -> None:
     }
 
     _update_entry_position_fields(signal)
-    assert signal["entry_timing"] == "GOOD"
+    assert signal["entry_timing"] == "WAIT"
 
     signal["price"] = 98.8
     _update_entry_position_fields(signal)
@@ -2058,11 +2107,32 @@ def test_separated_ema20_and_ema60_do_not_create_a_bridge_entry_zone() -> None:
         {"ema60": 91.5},
     )
 
-    assert zone == {
-        "low": pytest.approx(93.7),
-        "high": pytest.approx(94.3),
-        "price": 94.0,
+    assert zone is None
+
+
+def test_h1_pullback_setup_allows_split_ema60_entry_without_reason_text() -> None:
+    signal = {
+        "action": SignalAction.ENTRY_LONG.value,
+        "score": 90,
+        "price": 91.5,
+        "setup_type": SETUP_H1_PULLBACK_LONG,
+        "h1_pullback": {"direction": "LONG", "state": "HEALTHY_PULLBACK"},
+        "entry_levels": {
+            "long": {
+                "h1_ema60": {
+                    "low": 91.2,
+                    "high": 91.8,
+                    "price": 91.5,
+                },
+            },
+        },
+        "reasons": (),
     }
+
+    timing, reason = _signal_entry_timing(signal)
+
+    assert timing == "GOOD"
+    assert "scored long entry zone" in reason
 
 
 def test_oi_context_does_not_become_a_standalone_suggested_entry_zone() -> None:
@@ -2765,8 +2835,8 @@ def test_entry_reward_r_requires_enough_target_space() -> None:
         }
     }
 
-    assert _entry_reward_r(signal, PositionSide.LONG, price=100.0, stop=99.0) == 1.0
-    assert _entry_reward_r(signal, PositionSide.LONG, price=100.0, stop=99.5) == 2.0
+    assert _entry_reward_r(signal, PositionSide.LONG, price=100.0, stop=99.0) == pytest.approx(1.2)
+    assert _entry_reward_r(signal, PositionSide.LONG, price=100.0, stop=99.5) == pytest.approx(2.4)
 
 
 def test_entry_reward_r_uses_target_from_entry_timeframe() -> None:
@@ -4213,15 +4283,19 @@ def test_auto_trade_caps_positions_and_prefers_highest_scores() -> None:
 
     asyncio.run(engine._auto_trade_once())
 
-    assert len(engine.account.positions) == 4
+    assert len(engine.account.positions) == 5
     assert "TEST0USDT" not in engine.account.positions
-    assert set(engine.account.positions) == {"TEST1USDT", "TEST3USDT", "TEST4USDT", "TEST5USDT"}
-    total_risk = sum(
-        abs(position.entry_price - position.stop_price) * position.quantity
+    assert set(engine.account.positions) == {
+        "TEST1USDT",
+        "TEST2USDT",
+        "TEST3USDT",
+        "TEST4USDT",
+        "TEST5USDT",
+    }
+    assert sum(
+        float(position.metadata["margin_usdt"])
         for position in engine.account.positions.values()
-    )
-    assert total_risk <= 40.0 + 1e-6
-    assert engine.status()["available_balance"] >= 600
+    ) >= 940.0
 
 
 def test_auto_trade_backfills_slot_when_higher_score_candidate_has_low_reward_risk() -> None:
