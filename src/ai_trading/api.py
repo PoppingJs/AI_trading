@@ -1463,12 +1463,12 @@ PAPER_DASHBOARD_HTML = """
         const timingText = { GOOD: '优秀', WAIT: '等待', BLOCK: '禁止' };
         timingText.GOOD = '优秀';
         timingText.WAIT = '等待';
-        timingText.BLOCK = '观察';
-        const timingClass = signal.entry_timing === 'GOOD' ? 'pos' : 'muted';
+        timingText.BLOCK = '禁止';
+        const timingClass = signal.entry_timing === 'GOOD' ? 'pos' : signal.entry_timing === 'BLOCK' ? 'neg' : 'muted';
         return `<span class="${timingClass}">${timingText[signal.entry_timing] || signal.entry_timing}</span>`;
       }
       const action = String(signal.action || '');
-      return action === 'ENTRY_LONG' || action === 'ENTRY_SHORT' ? '等待' : '观察';
+      return action === 'ENTRY_LONG' || action === 'ENTRY_SHORT' ? '等待' : '禁止';
     }
     function tEntryPositionReason(value) {
       const text = String(value || '');
