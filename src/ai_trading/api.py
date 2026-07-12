@@ -350,7 +350,7 @@ PAPER_DASHBOARD_HTML = """
     .top-nav a { display: flex; align-items: center; padding: 0 13px; color: #64748b; text-decoration: none; font-size: 13px; font-weight: 700; white-space: nowrap; border-bottom: 2px solid transparent; }
     .top-nav a:hover { color: #1d4ed8; background: #f8fafc; }
     .top-nav a.active { color: #1d4ed8; border-bottom-color: #2563eb; }
-    main { height: calc(100vh - 98px); padding: 10px 16px; width: 100%; box-sizing: border-box; margin: 0; overflow: hidden; display: flex; flex-direction: column; gap: 10px; }
+    main { height: calc(100vh - 98px); padding: 6px 16px; width: 100%; box-sizing: border-box; margin: 0; overflow: hidden; display: flex; flex-direction: column; gap: 6px; }
     .grid { display: grid; gap: 10px; }
     .metrics { grid-template-columns: repeat(7, minmax(0, 1fr)); flex: 0 0 auto; }
     .layout { grid-template-columns: 460px minmax(0, 1fr); align-items: stretch; flex: 1 1 auto; min-height: 0; margin-top: 0 !important; }
@@ -365,9 +365,9 @@ PAPER_DASHBOARD_HTML = """
     .layout > .grid > .card:nth-child(2) thead th { position: sticky; top: 0; z-index: 1; }
     .layout > .grid > .card:last-child { display: flex; flex-direction: column; min-height: 0; overflow: hidden; }
     .card { background: white; border: 1px solid #e5e7eb; border-radius: 8px; padding: 12px; box-shadow: 0 1px 2px rgba(0,0,0,.04); }
-    .metric { min-width: 0; padding: 9px 10px; }
-    .metric span { color: #6b7280; font-size: 12px; }
-    .metric strong { display: block; margin-top: 4px; font-size: 18px; white-space: nowrap; }
+    .metric { min-width: 0; padding: 2px 10px; }
+    .metric span { color: #6b7280; font-size: 12px; line-height: 1; }
+    .metric strong { display: block; margin-top: 1px; font-size: 16px; line-height: 1.1; white-space: nowrap; }
     .positive { color: #047857; }
     .negative { color: #b91c1c; }
     label { display: block; font-size: 12px; color: #4b5563; margin: 10px 0 5px; }
@@ -499,6 +499,8 @@ PAPER_DASHBOARD_HTML = """
       margin-top: 15px;
       box-sizing: border-box;
       padding: 0;
+      display: flex;
+      flex-direction: column;
       background: transparent;
       border: 0;
       border-radius: 0;
@@ -509,7 +511,7 @@ PAPER_DASHBOARD_HTML = """
     .chart-head h2 { font-size: 16px; margin: 0; }
     .chart-head strong { font-size: 16px; font-weight: 800; white-space: nowrap; }
     .chart-head span { font-size: 12px; color: #6b7280; }
-    #pnlChart { width: 100%; height: 315px; display: block; background: transparent; border: 0; border-radius: 0; }
+    #pnlChart { width: 100%; height: auto; min-height: 0; flex: 1 1 auto; display: block; background: transparent; border: 0; border-radius: 0; }
     @media (max-width: 980px) {
       .metrics, .layout { grid-template-columns: 1fr; }
       header { display: block; }
@@ -1962,12 +1964,12 @@ PAPER_DASHBOARD_HTML = """
       }
       const ctx = canvas.getContext('2d');
       ctx.clearRect(0, 0, width, height);
-      const pad = { left: 52 * dpr, right: 6 * dpr, top: 10 * dpr, bottom: 34 * dpr };
+      const pad = { left: 52 * dpr, right: 6 * dpr, top: 10 * dpr, bottom: 20 * dpr };
       const plotW = width - pad.left - pad.right;
       const plotH = height - pad.top - pad.bottom;
       const plotBottom = pad.top + plotH;
       const timeTickTop = plotBottom + 3 * dpr;
-      const timeLabelY = plotBottom + 12 * dpr;
+      const timeLabelY = plotBottom + 8 * dpr;
       ctx.fillStyle = '#fbfcfe';
       ctx.fillRect(0, 0, width, height);
 

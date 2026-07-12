@@ -68,6 +68,17 @@ def test_backtest_and_review_pages_keep_realtime_navigation(tmp_path: Path) -> N
     assert "交易复盘" in review.text
 
 
+def test_realtime_dashboard_reserves_height_for_pnl_time_axis(tmp_path: Path) -> None:
+    client = TestClient(create_app(state_path=tmp_path / "paper_state.json"))
+
+    page = client.get("/").text
+
+    assert ".metric { min-width: 0; padding: 2px 10px; }" in page
+    assert "main { height: calc(100vh - 98px); padding: 6px 16px;" in page
+    assert "#pnlChart { width: 100%; height: auto; min-height: 0; flex: 1 1 auto;" in page
+    assert "const timeLabelY = plotBottom + 8 * dpr;" in page
+
+
 def test_async_demo_backtest_job_and_review_summary(tmp_path: Path) -> None:
     with TestClient(create_app(state_path=tmp_path / "paper_state.json")) as client:
         submitted = client.post(
