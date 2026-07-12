@@ -11,7 +11,9 @@ from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 
+from ai_trading.analytics import analyze_trade_lifecycles
 from ai_trading.backtest import BacktestEngine
+from ai_trading.backtest_jobs import BacktestJobManager
 from ai_trading.binance import BinanceFuturesMarketData
 from ai_trading.cli import _synthetic_market
 from ai_trading.config import AppSettings, load_settings
@@ -19,12 +21,25 @@ from ai_trading.indicators import build_indicators
 from ai_trading.models import SignalAction
 from ai_trading.paper import PAPER_DEFAULT_BALANCE, PaperTradingEngine
 from ai_trading.strategy import CompositeStrategy
+from ai_trading.web_pages import backtest_page, review_page
 
 
 class BacktestRequest(BaseModel):
     symbol: str = "DEMOUSDT"
     starting_equity: float = Field(default=10_000.0, gt=0)
     use_demo_data: bool = True
+    mode: str = Field(default="production", pattern="^(production|legacy)$")
+
+
+class BacktestJobRequest(BaseModel):
+    data_source: str = Field(default="demo", pattern="^(demo|binance|local)$")
+    dataset: str = ""
+    symbol: str = Field(default="DEMOUSDT", min_length=3, max_length=24)
+    start_date: str = ""
+    end_date: str = ""
+    starting_equity: float = Field(default=10_000.0, gt=0)
+    mode: str = Field(default="production", pattern="^(production|legacy)$")
+    base_timeframe: str = Field(default="15m", pattern="^(15m|1h)$")
 
 
 class PaperStartRequest(BaseModel):
@@ -60,6 +75,7 @@ def create_app(settings_path: str | Path = "config/strategy.yaml", state_path: s
             yield
         finally:
             await app.state.paper_engine.close()
+            app.state.backtest_jobs.close()
 
     app = FastAPI(
         title="AI Trading Strategy API",
@@ -74,10 +90,19 @@ def create_app(settings_path: str | Path = "config/strategy.yaml", state_path: s
         starting_balance=PAPER_DEFAULT_BALANCE,
         state_path=resolved_state_path,
     )
+    app.state.backtest_jobs = BacktestJobManager(settings)
 
     @app.get("/", response_class=HTMLResponse)
     def paper_dashboard() -> str:
         return PAPER_DASHBOARD_HTML
+
+    @app.get("/backtest", response_class=HTMLResponse)
+    def backtest_dashboard() -> str:
+        return backtest_page()
+
+    @app.get("/review", response_class=HTMLResponse)
+    def review_dashboard() -> str:
+        return review_page()
 
     @app.get("/api/health")
     def health() -> dict[str, object]:
@@ -128,6 +153,7 @@ def create_app(settings_path: str | Path = "config/strategy.yaml", state_path: s
             strategy_settings=settings.strategy,
             risk_settings=settings.risk,
             execution_settings=settings.execution,
+            mode=request.mode,
         ).run(candles, derivatives)
         return {
             "symbol": request.symbol,
@@ -139,7 +165,49 @@ def create_app(settings_path: str | Path = "config/strategy.yaml", state_path: s
             "trade_count": len(result.trades),
             "trades": [asdict(trade) for trade in result.trades],
             "notes": result.notes,
+            "mode": request.mode,
         }
+
+    @app.get("/api/backtests/datasets", dependencies=[Depends(_require_api_token)])
+    def backtest_datasets() -> dict[str, object]:
+        return {"datasets": app.state.backtest_jobs.datasets()}
+
+    @app.get("/api/backtests/jobs", dependencies=[Depends(_require_api_token)])
+    def list_backtest_jobs(limit: int = 20) -> dict[str, object]:
+        bounded_limit = max(1, min(limit, 100))
+        return {
+            "jobs": [
+                job.payload(include_result=False)
+                for job in app.state.backtest_jobs.list(bounded_limit)
+            ]
+        }
+
+    @app.post("/api/backtests/jobs", dependencies=[Depends(_require_api_token)])
+    def create_backtest_job(request: BacktestJobRequest) -> dict[str, object]:
+        job = app.state.backtest_jobs.submit(request.model_dump())
+        return job.payload(include_result=False)
+
+    @app.get("/api/backtests/jobs/{job_id}", dependencies=[Depends(_require_api_token)])
+    def get_backtest_job(job_id: str, include_result: bool = True) -> dict[str, object]:
+        job = app.state.backtest_jobs.get(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="backtest job not found")
+        return job.payload(include_result=include_result)
+
+    @app.post("/api/backtests/jobs/{job_id}/cancel", dependencies=[Depends(_require_api_token)])
+    def cancel_backtest_job(job_id: str) -> dict[str, object]:
+        job = app.state.backtest_jobs.cancel(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="backtest job not found")
+        return job.payload(include_result=False)
+
+    @app.get("/api/review/summary", dependencies=[Depends(_require_api_token)])
+    def review_summary() -> dict[str, object]:
+        account = app.state.paper_engine.account
+        return analyze_trade_lifecycles(
+            account.fills,
+            starting_equity=account.starting_balance,
+        )
 
     @app.get("/api/paper/status")
     async def paper_status() -> dict[str, object]:
@@ -186,7 +254,7 @@ def create_app(settings_path: str | Path = "config/strategy.yaml", state_path: s
     async def paper_open_order(request: PaperOrderRequest) -> dict[str, object]:
         engine: PaperTradingEngine = app.state.paper_engine
         try:
-            await engine.open_position(
+            await engine.open_position_with_risk(
                 request.symbol,
                 request.side,  # type: ignore[arg-type]
                 margin_usdt=request.margin_usdt,
@@ -277,7 +345,12 @@ PAPER_DASHBOARD_HTML = """
     header { height: 60px; box-sizing: border-box; padding: 12px 24px; background: #111827; color: white; display: flex; justify-content: space-between; align-items: center; gap: 12px; }
     header h1 { margin: 0; font-size: 20px; }
     header p { margin: 4px 0 0; color: #cbd5e1; font-size: 13px; }
-    main { height: calc(100vh - 60px); padding: 10px 16px; width: 100%; box-sizing: border-box; margin: 0; overflow: hidden; display: flex; flex-direction: column; gap: 10px; }
+    .top-nav { height: 38px; box-sizing: border-box; padding: 0 18px; display: flex; align-items: stretch; gap: 4px; background: #fff; border-bottom: 1px solid #e5e7eb; overflow-x: auto; scrollbar-width: none; }
+    .top-nav::-webkit-scrollbar { display: none; }
+    .top-nav a { display: flex; align-items: center; padding: 0 13px; color: #64748b; text-decoration: none; font-size: 13px; font-weight: 700; white-space: nowrap; border-bottom: 2px solid transparent; }
+    .top-nav a:hover { color: #1d4ed8; background: #f8fafc; }
+    .top-nav a.active { color: #1d4ed8; border-bottom-color: #2563eb; }
+    main { height: calc(100vh - 98px); padding: 10px 16px; width: 100%; box-sizing: border-box; margin: 0; overflow: hidden; display: flex; flex-direction: column; gap: 10px; }
     .grid { display: grid; gap: 10px; }
     .metrics { grid-template-columns: repeat(7, minmax(0, 1fr)); flex: 0 0 auto; }
     .layout { grid-template-columns: 460px minmax(0, 1fr); align-items: stretch; flex: 1 1 auto; min-height: 0; margin-top: 0 !important; }
@@ -366,7 +439,7 @@ PAPER_DASHBOARD_HTML = """
     .error { display: none; }
     .error-ticker {
       position: fixed;
-      top: 60px;
+      top: 98px;
       left: 0;
       right: 0;
       z-index: 50;
@@ -452,6 +525,11 @@ PAPER_DASHBOARD_HTML = """
     </div>
     <div class="status" id="updated">loading...</div>
   </header>
+  <nav class="top-nav" aria-label="主要功能">
+    <a class="active" href="/">实时交易</a>
+    <a href="/backtest">历史回测</a>
+    <a href="/review">交易复盘</a>
+  </nav>
   <div class="error-ticker" id="errorTicker" aria-live="polite">
     <span class="error-ticker-text" id="errorTickerText"></span>
   </div>

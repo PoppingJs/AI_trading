@@ -11,7 +11,7 @@ from dataclasses import replace
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 from statistics import median
-from typing import Any
+from typing import Any, Callable
 from typing import Literal
 
 from ai_trading.binance import BinanceFuturesMarketData
@@ -38,6 +38,14 @@ from ai_trading.models import (
     Trade,
 )
 from ai_trading.strategy import CompositeStrategy
+from ai_trading.risk import (
+    AccountRiskSnapshot,
+    PortfolioRiskDecision,
+    PortfolioRiskGate,
+    TradePlan,
+    current_open_risk_usdt,
+    risk_factor_for_quality,
+)
 
 
 PaperSide = Literal["LONG", "SHORT"]
@@ -54,21 +62,17 @@ ROTATION_MIN_SCORE_GAP = 20
 ROTATION_MIN_ATR_PCT = 0.008
 ROTATION_MIN_VOLUME_RATIO = 1.2
 PYRAMID_MIN_SCORE = 85
-PYRAMID_MARGIN_FRACTION = 0.35
 PYRAMID_MAX_ADDS = 1
 PAPER_DEFAULT_BALANCE = 1200.0
-INITIAL_ENTRY_MARGIN_CAP = 0.95
-TOTAL_OPEN_RISK_CAP = 0.04
-PYRAMID_TOTAL_MARGIN_CAP = 0.95
-ENTRY_MARGIN_DEPLOYMENT_CAP = 0.95
-ENTRY_MARGIN_BASE_SLOTS = 5
 ENTRY_ADVANTAGE_ZONE_FRACTION = 0.60
+H4_SHORT_ENTRY_ADVANTAGE_ZONE_FRACTION = 0.50
 ENTRY_QUALITY_S = "S"
 ENTRY_QUALITY_A = "A"
 ENTRY_QUALITY_B = "B"
-ENTRY_QUALITY_STOP_MAX_10X = 0.065
-ENTRY_QUALITY_STOP_MAX_7X = 0.095
-ENTRY_QUALITY_STOP_MAX_5X = 0.13
+ENTRY_QUALITY_STOP_MAX_S = 0.025
+ENTRY_QUALITY_STOP_MAX_10X = 0.04
+ENTRY_QUALITY_STOP_MAX_7X = 0.065
+ENTRY_QUALITY_STOP_MAX_5X = 0.08
 RSI_NORMAL_LONG_MAX = 75.0
 RSI_NORMAL_SHORT_MIN = 25.0
 RSI_STRONG_LONG_PULLBACK = 75.0
@@ -90,6 +94,7 @@ DISTRIBUTION_STAGE_MARKDOWN = "MARKDOWN_ACCELERATION"
 AUTO_ENTRY_MIN_SCORE = 82
 CORE_STRUCTURE_SCORE_CAP = AUTO_ENTRY_MIN_SCORE - 1
 MIN_ENTRY_REWARD_R = 1.2
+FIRST_TAKE_PROFIT_R = 0.8
 LARGE_TIMEFRAME_WICK_REJECTION_PCT = 0.02
 PROFIT_LOCK_SLIPPAGE_PCT = 0.0008
 MIN_PRECISION_STOP_PCT = 0.012
@@ -205,6 +210,11 @@ class PaperFill:
     entry_position: str = ""
     closed_at: datetime | None = None
     return_pct: float = 0.0
+    setup_type: str = ""
+    entry_quality: str = ""
+    planned_risk_usdt: float = 0.0
+    mae_r: float = 0.0
+    mfe_r: float = 0.0
 
 
 @dataclass
@@ -219,6 +229,16 @@ class PaperAccount:
     pnl_history: dict[str, float] = field(default_factory=dict)
     latest_signals: dict[str, dict[str, object]] = field(default_factory=dict)
     reentry_barriers: dict[str, dict[str, str]] = field(default_factory=dict)
+    risk_day_key: str = ""
+    risk_day_start_equity: float = 0.0
+    daily_loss_locked: bool = False
+    risk_week_key: str = ""
+    risk_week_start_equity: float = 0.0
+    weekly_loss_locked: bool = False
+    risk_peak_equity: float = 0.0
+    drawdown_locked: bool = False
+    consecutive_losses: int = 0
+    cooldown_until: datetime | None = None
 
 
 class PaperTradingEngine:
@@ -237,6 +257,8 @@ class PaperTradingEngine:
         interval: str = "1h",
         market_data: BinanceFuturesMarketData | None = None,
         state_path: str | Path | None = None,
+        clock: Callable[[], datetime] | None = None,
+        fill_price_resolver: Callable[[float, PositionSide, bool], float] | None = None,
     ) -> None:
         self.settings = settings
         self.state_path = Path(state_path) if state_path else None
@@ -259,7 +281,12 @@ class PaperTradingEngine:
         self._post_close_pool_review: set[str] = set()
         self.interval = interval
         self.market_data = market_data or BinanceFuturesMarketData()
+        self._clock = clock or (lambda: datetime.now(UTC))
+        self._fill_price_resolver = fill_price_resolver or (
+            lambda price, _side, _entering: price
+        )
         self.strategy = CompositeStrategy(settings.strategy)
+        self.portfolio_risk = PortfolioRiskGate(settings.risk)
         self.latest_prices: dict[str, float] = {
             symbol: mark_price
             for symbol, position in self.account.positions.items()
@@ -269,6 +296,10 @@ class PaperTradingEngine:
         self.latest_indicators: dict[str, list[IndicatorSnapshot]] = {}
         self.latest_timeframe_contexts: dict[str, dict[str, object]] = {}
         self.latest_timeframe_indicators: dict[str, dict[str, list[IndicatorSnapshot]]] = {}
+        self._timeframe_indicator_cache_keys: dict[
+            str,
+            dict[str, tuple[object, ...]],
+        ] = {}
         self.running = False
         self.auto_trade = False
         self.last_error: str | None = None
@@ -307,6 +338,22 @@ class PaperTradingEngine:
         self._warmup_complete = False
         self._stream_symbols: tuple[str, ...] = ()
         self._last_position_management_at: datetime | None = None
+
+    def _now(self) -> datetime:
+        current = self._clock()
+        return current if current.tzinfo is not None else current.replace(tzinfo=UTC)
+
+    def _execution_price(
+        self,
+        price: float,
+        side: PositionSide,
+        *,
+        entering: bool,
+    ) -> float:
+        resolved = float(self._fill_price_resolver(price, side, entering))
+        if not math.isfinite(resolved) or resolved <= 0:
+            raise ValueError("execution price resolver returned an invalid price")
+        return resolved
 
     async def start(self, *, auto_trade: bool = False, poll_seconds: int = 20) -> None:
         async with self._lock:
@@ -377,6 +424,7 @@ class PaperTradingEngine:
             self.latest_indicators.clear()
             self.latest_timeframe_contexts.clear()
             self.latest_timeframe_indicators.clear()
+            self._timeframe_indicator_cache_keys.clear()
             self._timeframe_candles.clear()
             self._timeframe_derivatives.clear()
             self._live_m15_candles.clear()
@@ -446,7 +494,7 @@ class PaperTradingEngine:
             symbols = self._managed_symbols()
             await self._refresh_current_funding_cache(
                 symbols,
-                datetime.now(UTC),
+                self._now(),
             )
             semaphore = asyncio.Semaphore(MARKET_REQUEST_CONCURRENCY)
 
@@ -470,7 +518,7 @@ class PaperTradingEngine:
             )
             self._warmup_complete = True
             if refreshed:
-                now = datetime.now(UTC)
+                now = self._now()
                 self.last_market_update_at = now
                 self.last_error = _format_partial_market_errors(errors) if errors else None
                 self._save_state_unlocked()
@@ -518,14 +566,14 @@ class PaperTradingEngine:
         async with self._lock:
             for symbol, price in prices.items():
                 self._remember_mark_price(symbol, price)
-            self.last_market_update_at = datetime.now(UTC)
+            self.last_market_update_at = self._now()
             self._save_state_unlocked()
         return len(prices)
 
     async def refresh_universe_if_needed(self, *, force: bool = False) -> None:
         if not self._auto_universe:
             return
-        now = datetime.now(UTC)
+        now = self._now()
         if (
             not force
             and self._last_universe_refresh_at is not None
@@ -686,7 +734,7 @@ class PaperTradingEngine:
         timeframe: str,
         now: datetime | None = None,
     ) -> set[str]:
-        current_time = now or datetime.now(UTC)
+        current_time = now or self._now()
         expected_open = _latest_closed_slot(
             timeframe,
             current_time,
@@ -731,6 +779,7 @@ class PaperTradingEngine:
             self.latest_indicators,
             self.latest_timeframe_contexts,
             self.latest_timeframe_indicators,
+            self._timeframe_indicator_cache_keys,
             self._timeframe_candles,
             self._timeframe_derivatives,
             self._live_m15_candles,
@@ -747,6 +796,90 @@ class PaperTradingEngine:
             for symbol in list(mapping):
                 if symbol not in managed:
                     mapping.pop(symbol, None)
+
+    async def open_position_with_risk(
+        self,
+        symbol: str,
+        side: PaperSide,
+        *,
+        margin_usdt: float = 100.0,
+        leverage: int | None = None,
+        stop_loss: float | None = None,
+        take_profit_1: float | None = None,
+        take_profit_2: float | None = None,
+        reason: str = "manual",
+        entry_reasons: list[str] | tuple[str, ...] | None = None,
+        entry_context: dict[str, object] | None = None,
+    ) -> Position:
+        """Risk-gated public entry path used by manual/API orders."""
+
+        symbol = symbol.upper()
+        leverage = min(
+            leverage or self.settings.risk.leverage_default,
+            self.settings.risk.leverage_max,
+        )
+        price = await self._price(symbol)
+        side_enum = PositionSide(side)
+        final_stop = stop_loss or _default_stop(side_enum, price, leverage)
+        final_tp1 = take_profit_1 or _default_take_profit(
+            side_enum,
+            price,
+            final_stop,
+            1,
+        )
+        final_tp2 = take_profit_2 or _default_take_profit(
+            side_enum,
+            price,
+            final_stop,
+            2,
+        )
+        decision = self.portfolio_risk.evaluate(
+            TradePlan(
+                symbol=symbol,
+                side=side_enum,
+                entry_price=price,
+                stop_price=final_stop,
+                take_profit_1=final_tp1,
+                take_profit_2=final_tp2,
+                leverage=leverage,
+            ),
+            self._account_risk_snapshot(self.status()),
+        )
+        if not decision.allowed:
+            detail = decision.reasons[0] if decision.reasons else decision.blocked_code
+            raise ValueError(f"risk gate blocked entry: {detail}")
+        if margin_usdt > decision.margin_required + 1e-9:
+            raise ValueError(
+                "requested margin exceeds risk-gated maximum: "
+                f"{margin_usdt:.2f} > {decision.margin_required:.2f} USDT"
+            )
+        context = _normalize_entry_context(entry_context)
+        stop_pct = _entry_stop_pct(price, final_stop)
+        context.update(
+            {
+                "risk_gate_status": "ALLOWED",
+                "entry_risk_factor": 1.0,
+                "risk_budget_usdt": decision.risk_budget_usdt,
+                "planned_risk_usdt": margin_usdt * leverage * stop_pct,
+                "open_risk_before_usdt": decision.open_risk_before_usdt,
+                "open_risk_after_usdt": (
+                    decision.open_risk_before_usdt
+                    + margin_usdt * leverage * stop_pct
+                ),
+            }
+        )
+        return await self.open_position(
+            symbol,
+            side,
+            margin_usdt=margin_usdt,
+            leverage=leverage,
+            stop_loss=final_stop,
+            take_profit_1=final_tp1,
+            take_profit_2=final_tp2,
+            reason=reason,
+            entry_reasons=entry_reasons,
+            entry_context=context,
+        )
 
     async def open_position(
         self,
@@ -773,15 +906,51 @@ class PaperTradingEngine:
             available = self._available_balance_unlocked()
             if margin_usdt > available:
                 raise ValueError(f"insufficient paper balance: available {available:.2f} USDT")
+            side_enum = PositionSide(side)
+            price = self._execution_price(price, side_enum, entering=True)
+            stop_loss = stop_loss or _default_stop(side_enum, price, leverage)
+            take_profit_1 = take_profit_1 or _default_take_profit(side_enum, price, stop_loss, 1)
+            take_profit_2 = take_profit_2 or _default_take_profit(side_enum, price, stop_loss, 2)
+            normalized_entry_context = _normalize_entry_context(entry_context)
+            if normalized_entry_context.get("risk_gate_status") == "ALLOWED":
+                final_decision = self.portfolio_risk.evaluate(
+                    TradePlan(
+                        symbol=symbol,
+                        side=side_enum,
+                        entry_price=price,
+                        stop_price=stop_loss,
+                        take_profit_1=take_profit_1,
+                        take_profit_2=take_profit_2,
+                        leverage=leverage,
+                        risk_factor=float(
+                            normalized_entry_context.get(
+                                "entry_risk_factor",
+                                1.0,
+                            )
+                        ),
+                    ),
+                    self._account_risk_snapshot(self.status()),
+                )
+                if not final_decision.allowed:
+                    detail = final_decision.reasons[0] if final_decision.reasons else final_decision.blocked_code
+                    raise ValueError(f"risk gate blocked entry at execution: {detail}")
+                if margin_usdt > final_decision.margin_required + 1e-9:
+                    margin_usdt = final_decision.margin_required
+                    if margin_usdt < 5:
+                        raise ValueError(
+                            "current risk capacity leaves entry margin below 5.00 USDT"
+                        )
+                    normalized_entry_context["planned_risk_usdt"] = (
+                        final_decision.planned_risk_usdt
+                    )
+                    normalized_entry_context["open_risk_after_usdt"] = (
+                        final_decision.open_risk_after_usdt
+                    )
             notional = margin_usdt * leverage
             quantity = notional / price
             fee = notional * self.settings.execution.taker_fee_rate
             self.account.wallet_balance -= fee
             self.account.fees_paid += fee
-            side_enum = PositionSide(side)
-            stop_loss = stop_loss or _default_stop(side_enum, price, leverage)
-            take_profit_1 = take_profit_1 or _default_take_profit(side_enum, price, stop_loss, 1)
-            take_profit_2 = take_profit_2 or _default_take_profit(side_enum, price, stop_loss, 2)
             _assert_valid_exit_plan(
                 side_enum,
                 price,
@@ -789,14 +958,13 @@ class PaperTradingEngine:
                 take_profit_1,
                 take_profit_2,
             )
-            normalized_entry_context = _normalize_entry_context(entry_context)
             entry_position = _entry_position_text(side_enum, price, normalized_entry_context, reason)
             position = Position(
                 symbol=symbol,
                 side=side_enum,
                 entry_price=price,
                 quantity=quantity,
-                opened_at=datetime.now(UTC),
+                opened_at=self._now(),
                 stop_price=stop_loss,
                 take_profit_1=take_profit_1,
                 take_profit_2=take_profit_2,
@@ -834,6 +1002,7 @@ class PaperTradingEngine:
                     take_profit_2=take_profit_2,
                     opened_at=position.opened_at,
                     entry_position=entry_position,
+                    **_position_fill_metadata(position),
                 )
             )
             self._save_state_unlocked()
@@ -856,7 +1025,7 @@ class PaperTradingEngine:
         return self._status_unlocked()
 
     def health_status(self) -> dict[str, object]:
-        now = datetime.now(UTC)
+        now = self._now()
         stale_positions = [
             symbol
             for symbol in self.account.positions
@@ -1015,7 +1184,7 @@ class PaperTradingEngine:
             - self.account.starting_balance
             + self.account.fees_paid
         )
-        now = datetime.now(UTC)
+        now = self._now()
         pnl_history = _pnl_history_payload(self.account.pnl_history, total_pnl, now=now)
         return {
             "running": self.running,
@@ -1046,7 +1215,122 @@ class PaperTradingEngine:
             "last_error": self.last_error,
             "market_updated_at": self.last_market_update_at.isoformat() if self.last_market_update_at else None,
             "updated_at": now.isoformat(),
+            "risk": {
+                "open_risk_usdt": current_open_risk_usdt(positions_snapshot),
+                "open_risk_limit_usdt": equity * self.settings.risk.total_open_risk_limit,
+                "daily_loss_locked": self.account.daily_loss_locked,
+                "weekly_loss_locked": self.account.weekly_loss_locked,
+                "drawdown_locked": self.account.drawdown_locked,
+                "consecutive_losses": self.account.consecutive_losses,
+                "cooldown_until": self.account.cooldown_until.isoformat() if self.account.cooldown_until else None,
+            },
         }
+
+    def _account_risk_snapshot(
+        self,
+        status: dict[str, object],
+        *,
+        now: datetime | None = None,
+    ) -> AccountRiskSnapshot:
+        now = now or self._now()
+        equity = float(status["equity"])
+        state_before = (
+            self.account.risk_day_key,
+            self.account.risk_day_start_equity,
+            self.account.daily_loss_locked,
+            self.account.risk_week_key,
+            self.account.risk_week_start_equity,
+            self.account.weekly_loss_locked,
+            self.account.risk_peak_equity,
+            self.account.drawdown_locked,
+            self.account.consecutive_losses,
+            self.account.cooldown_until,
+        )
+        day_key = _trading_day_key(now)
+        week_key = _trading_week_key(now)
+        if self.account.risk_day_key != day_key:
+            self.account.risk_day_key = day_key
+            self.account.risk_day_start_equity = equity
+            self.account.daily_loss_locked = False
+        if self.account.risk_week_key != week_key:
+            self.account.risk_week_key = week_key
+            self.account.risk_week_start_equity = equity
+            self.account.weekly_loss_locked = False
+        if self.account.risk_peak_equity <= 0:
+            self.account.risk_peak_equity = max(
+                self.account.starting_balance,
+                equity,
+            )
+        else:
+            self.account.risk_peak_equity = max(
+                self.account.risk_peak_equity,
+                equity,
+            )
+        if (
+            self.account.risk_day_start_equity > 0
+            and equity <= self.account.risk_day_start_equity * (1 - self.settings.risk.daily_loss_limit)
+        ):
+            self.account.daily_loss_locked = True
+        if (
+            self.account.risk_week_start_equity > 0
+            and equity <= self.account.risk_week_start_equity * (1 - self.settings.risk.weekly_loss_limit)
+        ):
+            self.account.weekly_loss_locked = True
+        if (
+            self.account.risk_peak_equity > 0
+            and equity <= self.account.risk_peak_equity * (1 - self.settings.risk.max_drawdown_circuit_breaker)
+        ):
+            self.account.drawdown_locked = True
+        if self.account.cooldown_until is not None and now >= self.account.cooldown_until:
+            self.account.cooldown_until = None
+            self.account.consecutive_losses = 0
+        snapshot = AccountRiskSnapshot(
+            equity=equity,
+            available_balance=float(status["available_balance"]),
+            used_margin=float(status["used_margin"]),
+            open_positions=tuple(self.account.positions.values()),
+            day_start_equity=self.account.risk_day_start_equity,
+            week_start_equity=self.account.risk_week_start_equity,
+            peak_equity=self.account.risk_peak_equity,
+            daily_loss_locked=self.account.daily_loss_locked,
+            weekly_loss_locked=self.account.weekly_loss_locked,
+            drawdown_locked=self.account.drawdown_locked,
+            consecutive_losses=self.account.consecutive_losses,
+            cooldown_until=self.account.cooldown_until,
+        )
+        state_after = (
+            self.account.risk_day_key,
+            self.account.risk_day_start_equity,
+            self.account.daily_loss_locked,
+            self.account.risk_week_key,
+            self.account.risk_week_start_equity,
+            self.account.weekly_loss_locked,
+            self.account.risk_peak_equity,
+            self.account.drawdown_locked,
+            self.account.consecutive_losses,
+            self.account.cooldown_until,
+        )
+        if state_after != state_before:
+            self._save_state_unlocked()
+        return snapshot
+
+    def _remember_risk_decision(
+        self,
+        signal: dict[str, object],
+        decision: PortfolioRiskDecision,
+    ) -> None:
+        signal["risk_gate_status"] = "ALLOWED" if decision.allowed else "BLOCKED"
+        signal["risk_gate_code"] = decision.blocked_code
+        signal["risk_budget_usdt"] = decision.risk_budget_usdt
+        signal["planned_risk_usdt"] = decision.planned_risk_usdt
+        signal["open_risk_before_usdt"] = decision.open_risk_before_usdt
+        signal["open_risk_after_usdt"] = decision.open_risk_after_usdt
+        if decision.blocked_code == "DAILY_LOSS_LIMIT":
+            self.account.daily_loss_locked = True
+        elif decision.blocked_code == "WEEKLY_LOSS_LIMIT":
+            self.account.weekly_loss_locked = True
+        elif decision.blocked_code == "MAX_DRAWDOWN":
+            self.account.drawdown_locked = True
 
     async def _run_loop(self) -> None:
         loop = asyncio.get_running_loop()
@@ -1055,7 +1339,7 @@ class PaperTradingEngine:
             await self._restart_price_stream_if_needed()
             await self._warm_restored_positions()
             await self.refresh_once()
-            now = datetime.now(UTC)
+            now = self._now()
             self._last_closed_candle_slot = {
                 timeframe: _latest_closed_slot(timeframe, now)
                 for timeframe in SUPPORTED_TIMEFRAMES
@@ -1066,7 +1350,7 @@ class PaperTradingEngine:
 
         while self.running:
             monotonic_now = loop.time()
-            now = datetime.now(UTC)
+            now = self._now()
             try:
                 if not self._warmup_complete:
                     await self._warm_configured_symbols()
@@ -1100,7 +1384,7 @@ class PaperTradingEngine:
         while self.running:
             try:
                 self._manage_open_positions(fresh_only=True)
-                self._last_position_management_at = datetime.now(UTC)
+                self._last_position_management_at = self._now()
             except Exception as exc:  # noqa: BLE001 - safety loop must stay alive
                 self.last_error = f"持仓安全管理异常：{exc}"
             self._price_update_event.clear()
@@ -1118,7 +1402,7 @@ class PaperTradingEngine:
         while self.running:
             try:
                 await self._refresh_rest_price_fallback(
-                    datetime.now(UTC),
+                    self._now(),
                     force=force,
                 )
                 force = False
@@ -1134,7 +1418,7 @@ class PaperTradingEngine:
             return
         await self._refresh_current_funding_cache(
             symbols,
-            datetime.now(UTC),
+            self._now(),
         )
         async with self._scan_lock:
             semaphore = asyncio.Semaphore(MARKET_REQUEST_CONCURRENCY)
@@ -1178,7 +1462,7 @@ class PaperTradingEngine:
         while self.running and symbols == self._stream_symbols:
             try:
                 async for prices in self.market_data.stream_mark_prices(symbols):
-                    now = datetime.now(UTC)
+                    now = self._now()
                     for symbol, price in prices.items():
                         self._remember_mark_price(symbol, float(price))
                     self._last_ws_update_at = now
@@ -1315,18 +1599,18 @@ class PaperTradingEngine:
                 await asyncio.gather(*(refresh_symbol(symbol) for symbol in symbols[start : start + WARMUP_BATCH_SIZE]))
             if errors:
                 self.last_error = _format_partial_market_errors(errors)
-                self._next_candle_retry_at = datetime.now(UTC) + timedelta(seconds=5)
+                self._next_candle_retry_at = self._now() + timedelta(seconds=5)
             else:
                 self._next_candle_retry_at = None
                 for timeframe in timeframes:
-                    self._last_closed_candle_slot[timeframe] = _latest_closed_slot(timeframe, datetime.now(UTC))
+                    self._last_closed_candle_slot[timeframe] = _latest_closed_slot(timeframe, self._now())
 
     async def _refresh_timeframe_incremental(self, symbol: str, timeframe: str) -> bool:
         rows = await self.market_data.klines(symbol, timeframe, limit=3)
         closed = _closed_candles(rows, timeframe)
         if not closed:
             raise ValueError(f"{symbol} {timeframe} closed candle is not available yet")
-        expected_open = _latest_closed_slot(timeframe, datetime.now(UTC)) - timedelta(
+        expected_open = _latest_closed_slot(timeframe, self._now()) - timedelta(
             seconds=_timeframe_seconds(timeframe)
         )
         if closed[-1].timestamp < expected_open:
@@ -1703,7 +1987,7 @@ class PaperTradingEngine:
 
         self._timeframe_candles[symbol] = timeframe_candles
         self._timeframe_derivatives[symbol] = timeframe_derivatives
-        now = datetime.now(UTC)
+        now = self._now()
         if all(
             _derivatives_complete(timeframe_derivatives.get(timeframe, []))
             for timeframe in {self.interval, "1h", "4h"}
@@ -1734,16 +2018,26 @@ class PaperTradingEngine:
         if not base_candles:
             return False
         timeframe_indicators: dict[str, list[IndicatorSnapshot]] = {}
+        cached_indicators = self.latest_timeframe_indicators.get(symbol, {})
+        cached_keys = self._timeframe_indicator_cache_keys.setdefault(symbol, {})
         for timeframe in SUPPORTED_TIMEFRAMES:
             candles = timeframe_candles.get(timeframe, [])
             if not candles:
                 continue
             derivatives = self._timeframe_derivatives.get(symbol, {}).get(timeframe, [])
-            timeframe_indicators[timeframe] = (
-                _build_indicators(candles, derivatives, self.settings)
-                if derivatives
-                else _build_price_only_indicators(candles, self.settings)
-            )
+            cache_key = _indicator_cache_key(candles, derivatives)
+            if (
+                cached_keys.get(timeframe) == cache_key
+                and timeframe in cached_indicators
+            ):
+                timeframe_indicators[timeframe] = cached_indicators[timeframe]
+            else:
+                timeframe_indicators[timeframe] = (
+                    _build_indicators(candles, derivatives, self.settings)
+                    if derivatives
+                    else _build_price_only_indicators(candles, self.settings)
+                )
+                cached_keys[timeframe] = cache_key
         indicators = timeframe_indicators.get(signal_timeframe, [])
         if not indicators:
             return False
@@ -1793,7 +2087,7 @@ class PaperTradingEngine:
         }
         self.latest_signals[symbol] = _apply_multi_timeframe_context(payload, mtf_context)
         self.account.latest_signals[symbol] = dict(self.latest_signals[symbol])
-        self._signal_updated_at[symbol] = datetime.now(UTC)
+        self._signal_updated_at[symbol] = self._now()
         return True
 
     async def _multi_timeframe_context(
@@ -1830,7 +2124,7 @@ class PaperTradingEngine:
             return
         symbol = symbol.upper()
         self.latest_prices[symbol] = price
-        now = datetime.now(UTC)
+        now = self._now()
         if not fresh:
             position = self.account.positions.get(symbol)
             if position is not None:
@@ -1944,12 +2238,8 @@ class PaperTradingEngine:
                 continue
             side = "LONG" if action == SignalAction.ENTRY_LONG.value else "SHORT"
             status = self.status()
-            available = float(status["available_balance"])
             equity = float(status["equity"])
-            used_margin = float(status["used_margin"])
             score = int(signal.get("score") or 0)
-            max_total_margin = equity * INITIAL_ENTRY_MARGIN_CAP
-            remaining_total_margin = max(max_total_margin - used_margin, 0.0)
             try:
                 indicators = self.latest_indicators.get(symbol, [])
                 precision = self.latest_timeframe_contexts.get(symbol, {}).get("m15_precision", {})
@@ -2044,12 +2334,25 @@ class PaperTradingEngine:
                         f"{signal.get('distribution_short_stage')}"
                         "_structure"
                     )
+                round_trip_cost_rate = 2 * (
+                    self.settings.execution.taker_fee_rate
+                    + self.settings.execution.slippage_rate
+                )
+                structure_reward_r = _entry_reward_r(
+                    signal,
+                    side_enum,
+                    entry_price,
+                    stop_loss,
+                    timeframe=entry_timeframe,
+                    round_trip_cost_rate=round_trip_cost_rate,
+                )
                 take_profit_1, take_profit_2 = _take_profits_for_final_stop(
                     signal,
                     side_enum,
                     entry_price,
                     stop_loss,
                     timeframe=entry_timeframe,
+                    round_trip_cost_rate=round_trip_cost_rate,
                 )
                 try:
                     _assert_valid_exit_plan(
@@ -2071,10 +2374,7 @@ class PaperTradingEngine:
                     stop_loss,
                     timeframe=entry_timeframe,
                     planned_target=take_profit_2,
-                    round_trip_cost_rate=2 * (
-                        self.settings.execution.taker_fee_rate
-                        + self.settings.execution.slippage_rate
-                    ),
+                    round_trip_cost_rate=round_trip_cost_rate,
                 )
                 reward_r_unavailable = reward_r is None
                 if reward_r_unavailable:
@@ -2090,22 +2390,45 @@ class PaperTradingEngine:
                     if low_reward_note not in signal_reasons:
                         signal_reasons.append(low_reward_note)
                     signal["reasons"] = tuple(signal_reasons)
+                if (
+                    structure_reward_r is not None
+                    and structure_reward_r < MIN_ENTRY_REWARD_R
+                ):
+                    structure_note = (
+                        "最近结构目标空间不足；先分批止盈，"
+                        "剩余仓位目标不低于 1.20R"
+                    )
+                    signal_reasons = list(signal.get("reasons") or ())
+                    if structure_note not in signal_reasons:
+                        signal_reasons.append(structure_note)
+                    signal["reasons"] = tuple(signal_reasons)
                 signal["exit_plan_status"] = "NORMAL"
                 stop_pct = _entry_stop_pct(entry_price, stop_loss)
+                quality_reward_r = (
+                    min(reward_r, structure_reward_r)
+                    if structure_reward_r is not None
+                    else min(reward_r, MIN_ENTRY_REWARD_R)
+                )
                 entry_quality = _entry_quality_grade(
                     score=score,
-                    reward_r=reward_r,
+                    reward_r=quality_reward_r,
                     stop_pct=stop_pct,
                     setup_type=str(signal.get("setup_type") or ""),
                 )
+                leverage_cap = int(
+                    signal.get("leverage_cap")
+                    or self.settings.risk.leverage_max
+                )
+                if (
+                    structure_reward_r is not None
+                    and structure_reward_r < MIN_ENTRY_REWARD_R
+                ):
+                    leverage_cap = min(leverage_cap, 7)
                 leverage = _leverage_for_entry_quality(
                     entry_quality,
                     stop_pct=stop_pct,
                     leverage_max=self.settings.risk.leverage_max,
-                    leverage_cap=int(
-                        signal.get("leverage_cap")
-                        or self.settings.risk.leverage_max
-                    ),
+                    leverage_cap=leverage_cap,
                 )
                 if leverage <= 0:
                     _record_auto_entry_block(
@@ -2114,14 +2437,33 @@ class PaperTradingEngine:
                     )
                     continue
                 margin_factor = _daily_bias_margin_factor(side, signal)
-                margin = _quality_sized_margin(
-                    equity=equity,
-                    available=available,
-                    remaining_total_margin=remaining_total_margin,
-                    quality=entry_quality,
-                    margin_factor=margin_factor,
+                risk_decision = self.portfolio_risk.evaluate(
+                    TradePlan(
+                        symbol=symbol,
+                        side=side_enum,
+                        entry_price=entry_price,
+                        stop_price=stop_loss,
+                        take_profit_1=take_profit_1,
+                        take_profit_2=take_profit_2,
+                        leverage=leverage,
+                        risk_factor=(
+                            risk_factor_for_quality(entry_quality)
+                            * margin_factor
+                        ),
+                    ),
+                    self._account_risk_snapshot(status),
                 )
-                planned_risk_usdt = margin * leverage * stop_pct
+                self._remember_risk_decision(signal, risk_decision)
+                if not risk_decision.allowed:
+                    _record_auto_entry_block(
+                        signal,
+                        risk_decision.reasons[0]
+                        if risk_decision.reasons
+                        else risk_decision.blocked_code,
+                    )
+                    continue
+                margin = risk_decision.margin_required
+                planned_risk_usdt = risk_decision.planned_risk_usdt
                 if margin < 5:
                     _record_auto_entry_block(
                         signal,
@@ -2136,10 +2478,15 @@ class PaperTradingEngine:
                     entry_context["setup_type"] = signal["setup_type"]
                 entry_context["trend_stage_phase"] = trend_stage
                 entry_context["entry_reward_r"] = reward_r
+                entry_context["entry_structure_reward_r"] = structure_reward_r
                 entry_context["planned_risk_usdt"] = planned_risk_usdt
+                entry_context["risk_budget_usdt"] = risk_decision.risk_budget_usdt
+                entry_context["open_risk_before_usdt"] = risk_decision.open_risk_before_usdt
+                entry_context["open_risk_after_usdt"] = risk_decision.open_risk_after_usdt
+                entry_context["risk_gate_status"] = "ALLOWED"
                 entry_context["entry_quality"] = entry_quality
-                entry_context["entry_quality_units"] = _entry_quality_units(
-                    entry_quality
+                entry_context["entry_risk_factor"] = (
+                    risk_factor_for_quality(entry_quality) * margin_factor
                 )
                 entry_context["entry_stop_pct"] = stop_pct
                 entry_context["entry_margin_factor"] = margin_factor
@@ -2193,6 +2540,20 @@ class PaperTradingEngine:
             return
         best_score = int(best_signal.get("score") or 0)
         position, current_score, rotation_type = replace_target
+        status = self.status()
+        released_margin = float(position.metadata.get("margin_usdt", 0.0))
+        projected_used_margin = max(
+            float(status["used_margin"]) - released_margin,
+            0.0,
+        )
+        if projected_used_margin >= (
+            float(status["equity"]) * self.settings.risk.total_margin_limit
+        ):
+            _record_auto_entry_block(
+                best_signal,
+                "rotation skipped: releasing target would still leave no margin risk capacity",
+            )
+            return
         await self.close_position(
             position.symbol,
             reason=f"rotation exit: {rotation_type}; symbol={best_symbol} score={best_score} current_score={current_score}",
@@ -2214,13 +2575,23 @@ class PaperTradingEngine:
             current_indicator = current_indicators[-1] if current_indicators else None
             if candidate_score - current_score < ROTATION_MIN_SCORE_GAP:
                 continue
-            trend_failed = _position_structure_failed(position, signal)
+            trend_failed = (
+                _confirmed_structure_exit_reason(position, price, signal)
+                is not None
+                or _position_has_explicit_opposite_trend(position, signal)
+            )
             efficiency_stalled = (
                 candidate_is_strong
                 and price is not None
                 and _position_reached_initial_r(position, price)
                 and _position_h4_allows_efficiency_rotation(position, signal)
-                and _position_efficiency_stalled(position, signal, current_indicator, price)
+                and _position_efficiency_stalled(
+                    position,
+                    signal,
+                    current_indicator,
+                    price,
+                    now=self._now(),
+                )
             )
             if not trend_failed and not efficiency_stalled:
                 continue
@@ -2233,7 +2604,7 @@ class PaperTradingEngine:
         return best_target
 
     async def _btc_4h_extreme_volatility(self) -> bool:
-        now = datetime.now(UTC)
+        now = self._now()
         if (
             self._last_btc_extreme_check_at is not None
             and (now - self._last_btc_extreme_check_at).total_seconds() < FULL_DATA_CHECK_SECONDS
@@ -2260,7 +2631,7 @@ class PaperTradingEngine:
         symbol: str,
         signal: dict[str, object] | None = None,
     ) -> tuple[str, ...]:
-        now = datetime.now(UTC)
+        now = self._now()
         blocks: list[str] = []
         price_updated_at = self._price_updated_at.get(symbol)
         if (
@@ -2285,7 +2656,7 @@ class PaperTradingEngine:
         return tuple(blocks)
 
     def _manage_open_positions(self, *, fresh_only: bool = False) -> None:
-        now = datetime.now(UTC)
+        now = self._now()
         for position in list(self.account.positions.values()):
             price = self.latest_prices.get(position.symbol)
             if price is None:
@@ -2323,7 +2694,6 @@ class PaperTradingEngine:
             if (
                 not position.first_tp_done
                 and _take_profit_1_hit(position, price)
-                and profit_management_enabled
             ):
                 self._close_position_fraction_unlocked(
                     position,
@@ -2443,11 +2813,8 @@ class PaperTradingEngine:
 
     def _add_to_strong_positions(self) -> None:
         status = self.status()
-        equity = float(status["equity"])
         available = float(status["available_balance"])
-        used_margin = float(status["used_margin"])
-        remaining_total_margin = max(equity * PYRAMID_TOTAL_MARGIN_CAP - used_margin, 0.0)
-        if min(available, remaining_total_margin) < 20:
+        if available < 20:
             return
         ranked = sorted(
             self.account.positions.values(),
@@ -2463,36 +2830,79 @@ class PaperTradingEngine:
                 continue
             current_margin = float(position.metadata.get("margin_usdt", 0.0))
             leverage = int(position.metadata.get("leverage", self.settings.risk.leverage_default))
-            add_margin = min(current_margin * PYRAMID_MARGIN_FRACTION, equity * 0.10, available, remaining_total_margin)
+            trend_state = str(signal.get("trend_state") or "CHOP")
+            candidate_stop, candidate_tp1, candidate_tp2 = _adaptive_exits(
+                position.side,
+                price,
+                leverage,
+                trend_state,
+                indicator,
+            )
+            final_stop = (
+                max(position.stop_price, candidate_stop)
+                if position.side == PositionSide.LONG
+                else min(position.stop_price, candidate_stop)
+            )
+            final_tp1 = (
+                max(position.take_profit_1, candidate_tp1)
+                if position.side == PositionSide.LONG
+                else min(position.take_profit_1, candidate_tp1)
+            )
+            final_tp2 = (
+                max(position.take_profit_2, candidate_tp2)
+                if position.side == PositionSide.LONG
+                else min(position.take_profit_2, candidate_tp2)
+            )
+            decision = self.portfolio_risk.evaluate(
+                TradePlan(
+                    symbol=position.symbol,
+                    side=position.side,
+                    entry_price=price,
+                    stop_price=final_stop,
+                    take_profit_1=final_tp1,
+                    take_profit_2=final_tp2,
+                    leverage=leverage,
+                    risk_factor=risk_factor_for_quality(
+                        str(position.metadata.get("entry_context", {}).get("entry_quality", "A"))
+                        if isinstance(position.metadata.get("entry_context"), dict)
+                        else "A"
+                    ),
+                    is_addition=True,
+                ),
+                self._account_risk_snapshot(status),
+            )
+            self._remember_risk_decision(signal, decision)
+            if not decision.allowed:
+                continue
+            add_margin = decision.margin_required
             if add_margin < 20:
                 continue
+            fill_price = self._execution_price(
+                price,
+                position.side,
+                entering=True,
+            )
             notional = add_margin * leverage
-            add_quantity = notional / price
+            add_quantity = notional / fill_price
             fee = notional * self.settings.execution.taker_fee_rate
             old_quantity = position.quantity
             position.quantity += add_quantity
-            position.entry_price = ((position.entry_price * old_quantity) + (price * add_quantity)) / position.quantity
+            position.entry_price = ((position.entry_price * old_quantity) + (fill_price * add_quantity)) / position.quantity
             position.metadata["margin_usdt"] = current_margin + add_margin
             position.metadata["adds"] = int(position.metadata.get("adds", 0)) + 1
             self.account.wallet_balance -= fee
             self.account.fees_paid += fee
-            trend_state = str(signal.get("trend_state") or "CHOP")
-            stop_loss, take_profit_1, take_profit_2 = _adaptive_exits(position.side, price, leverage, trend_state, indicator)
-            if position.side == PositionSide.LONG:
-                position.stop_price = max(position.stop_price, stop_loss)
-                position.take_profit_1 = max(position.take_profit_1, take_profit_1)
-                position.take_profit_2 = max(position.take_profit_2, take_profit_2)
-            else:
-                position.stop_price = min(position.stop_price, stop_loss)
-                position.take_profit_1 = min(position.take_profit_1, take_profit_1)
-                position.take_profit_2 = min(position.take_profit_2, take_profit_2)
+            position.stop_price = final_stop
+            position.take_profit_1 = final_tp1
+            position.take_profit_2 = final_tp2
+            position.metadata["planned_risk_usdt"] = decision.open_risk_after_usdt
             self.account.fills.append(
                 PaperFill(
-                    timestamp=datetime.now(UTC),
+                    timestamp=self._now(),
                     symbol=position.symbol,
                     side=position.side,
                     action="ADD",
-                    price=price,
+                    price=fill_price,
                     entry_price=position.entry_price,
                     quantity=add_quantity,
                     realized_pnl=0.0,
@@ -2505,6 +2915,7 @@ class PaperTradingEngine:
                 take_profit_2=position.take_profit_2,
                 opened_at=position.opened_at,
                 entry_position=str(position.metadata.get("entry_position") or ""),
+                **_position_fill_metadata(position),
             )
             )
             self._save_state_unlocked()
@@ -2515,6 +2926,7 @@ class PaperTradingEngine:
             position.symbol
         )
         self.account.positions.pop(position.symbol, None)
+        price = self._execution_price(price, position.side, entering=False)
         close_quantity = (
             position.quantity * max(position.remaining_fraction, 0.0)
         )
@@ -2533,7 +2945,22 @@ class PaperTradingEngine:
         self.account.wallet_balance += realized
         self.account.realized_pnl += realized
         self.account.fees_paid += fee
-        timestamp = datetime.now(UTC)
+        timestamp = self._now()
+        lifecycle_pnl = float(
+            position.metadata.get("lifecycle_realized_pnl", 0.0)
+        ) + realized
+        if lifecycle_pnl < 0:
+            self.account.consecutive_losses += 1
+            if (
+                self.account.consecutive_losses
+                >= self.settings.risk.max_consecutive_losses
+            ):
+                self.account.cooldown_until = timestamp + timedelta(
+                    hours=self.settings.risk.cooldown_hours
+                )
+        else:
+            self.account.consecutive_losses = 0
+            self.account.cooldown_until = None
         trade = Trade(
             symbol=position.symbol,
             side=position.side,
@@ -2574,6 +3001,7 @@ class PaperTradingEngine:
                 ),
                 closed_at=timestamp,
                 return_pct=realized / margin_usdt if margin_usdt else 0.0,
+                **_position_fill_metadata(position),
             )
         )
         if reason.lower().startswith("stop loss"):
@@ -2598,7 +3026,7 @@ class PaperTradingEngine:
         candle_timestamp = (
             candles[-1].timestamp
             if candles
-            else datetime.now(UTC)
+            else self._now()
         )
         self.account.reentry_barriers[position.symbol] = {
             "timeframe": timeframe,
@@ -2630,6 +3058,7 @@ class PaperTradingEngine:
         fraction: float,
         reason: str,
     ) -> Trade:
+        price = self._execution_price(price, position.side, entering=False)
         close_fraction = min(
             max(fraction, 0.0),
             max(position.remaining_fraction, 0.0),
@@ -2661,10 +3090,13 @@ class PaperTradingEngine:
             current_margin - closed_margin,
             0.0,
         )
+        position.metadata["lifecycle_realized_pnl"] = float(
+            position.metadata.get("lifecycle_realized_pnl", 0.0)
+        ) + realized
         self.account.wallet_balance += realized
         self.account.realized_pnl += realized
         self.account.fees_paid += fee
-        timestamp = datetime.now(UTC)
+        timestamp = self._now()
         trade = Trade(
             symbol=position.symbol,
             side=position.side,
@@ -2708,6 +3140,7 @@ class PaperTradingEngine:
                     if closed_margin
                     else 0.0
                 ),
+                **_position_fill_metadata(position),
             )
         )
         return trade
@@ -2967,6 +3400,20 @@ def _paper_account_payload(account: PaperAccount) -> dict[str, Any]:
         "pnl_history": account.pnl_history,
         "latest_signals": account.latest_signals,
         "reentry_barriers": account.reentry_barriers,
+        "risk_day_key": account.risk_day_key,
+        "risk_day_start_equity": account.risk_day_start_equity,
+        "daily_loss_locked": account.daily_loss_locked,
+        "risk_week_key": account.risk_week_key,
+        "risk_week_start_equity": account.risk_week_start_equity,
+        "weekly_loss_locked": account.weekly_loss_locked,
+        "risk_peak_equity": account.risk_peak_equity,
+        "drawdown_locked": account.drawdown_locked,
+        "consecutive_losses": account.consecutive_losses,
+        "cooldown_until": (
+            account.cooldown_until.isoformat()
+            if account.cooldown_until is not None
+            else None
+        ),
     }
 
 
@@ -3040,6 +3487,20 @@ def _paper_account_from_payload(raw: dict[str, Any]) -> PaperAccount:
             ).items()
             if isinstance(barrier, dict)
         },
+        risk_day_key=str(raw.get("risk_day_key") or ""),
+        risk_day_start_equity=float(raw.get("risk_day_start_equity", 0.0)),
+        daily_loss_locked=bool(raw.get("daily_loss_locked", False)),
+        risk_week_key=str(raw.get("risk_week_key") or ""),
+        risk_week_start_equity=float(raw.get("risk_week_start_equity", 0.0)),
+        weekly_loss_locked=bool(raw.get("weekly_loss_locked", False)),
+        risk_peak_equity=float(raw.get("risk_peak_equity", 0.0)),
+        drawdown_locked=bool(raw.get("drawdown_locked", False)),
+        consecutive_losses=int(raw.get("consecutive_losses", 0)),
+        cooldown_until=(
+            _parse_datetime(raw["cooldown_until"])
+            if raw.get("cooldown_until")
+            else None
+        ),
     )
 
 
@@ -3116,7 +3577,49 @@ def _fill_from_payload(payload: dict[str, Any]) -> PaperFill:
         entry_position=str(payload.get("entry_position", "")),
         closed_at=_parse_datetime(payload["closed_at"]) if payload.get("closed_at") else None,
         return_pct=float(payload.get("return_pct", 0.0)),
+        setup_type=str(payload.get("setup_type", "")),
+        entry_quality=str(payload.get("entry_quality", "")),
+        planned_risk_usdt=float(payload.get("planned_risk_usdt", 0.0)),
+        mae_r=float(payload.get("mae_r", 0.0)),
+        mfe_r=float(payload.get("mfe_r", 0.0)),
     )
+
+
+def _position_fill_metadata(position: Position) -> dict[str, object]:
+    context = position.metadata.get("entry_context")
+    if not isinstance(context, dict):
+        context = {}
+    stop_distance = float(
+        position.metadata.get("initial_stop_distance")
+        or abs(position.entry_price - position.stop_price)
+        or 0.0
+    )
+    planned_risk = float(context.get("planned_risk_usdt") or 0.0)
+    if planned_risk <= 0 and stop_distance > 0:
+        planned_risk = stop_distance * position.quantity
+    mae_r = (
+        float(position.metadata.get("max_adverse_distance") or 0.0)
+        / stop_distance
+        if stop_distance > 0
+        else 0.0
+    )
+    mfe_r = (
+        float(position.metadata.get("max_favorable_distance") or 0.0)
+        / stop_distance
+        if stop_distance > 0
+        else 0.0
+    )
+    return {
+        "setup_type": str(
+            context.get("setup_type")
+            or context.get("entry_setup")
+            or ""
+        ),
+        "entry_quality": str(context.get("entry_quality") or ""),
+        "planned_risk_usdt": planned_risk,
+        "mae_r": mae_r,
+        "mfe_r": mfe_r,
+    }
 
 
 def _parse_datetime(value: str | datetime) -> datetime:
@@ -3154,6 +3657,12 @@ def _take_profit_1_hit(position: Position, price: float) -> bool:
 
 
 def _strong_trend_invalidated(position: Position, indicator: IndicatorSnapshot | None) -> bool:
+    # A 4h setup must not be closed by EMA/BOLL weakness alone. Its hard stop
+    # and confirmed 4h structure state remain authoritative; otherwise a
+    # normal 4h retest can be mistaken for a failed trend immediately after
+    # entry.
+    if _exit_timeframe_from_position(position) == "4h":
+        return False
     if indicator is None or indicator.ema50 is None:
         return False
     buffer = (
@@ -3571,17 +4080,55 @@ def _confirmed_structure_exit_reason(position: Position, price: float, signal: d
     h4_state = str(h4.get("state") or "UNKNOWN")
     h1_direction = str(h1.get("direction") or "NONE")
     h1_state = str(h1.get("state") or "UNKNOWN")
+    entry_timeframe = _exit_timeframe_from_position(position)
+    h4_only = entry_timeframe == "4h"
     if position.side == PositionSide.LONG:
         h4_failed = h4_state == "BREAKDOWN_DOWN"
-        h1_failed = h1_direction == "SHORT" and h1_state in {"BREAKDOWN", "RETEST"}
+        h1_failed = (
+            not h4_only
+            and h1_direction == "SHORT"
+            and h1_state in {"BREAKDOWN", "RETEST"}
+        )
         if h4_failed or h1_failed:
-            return _outcome_exit_reason(position, price, "1h/4h body closed below support or EMA/BOLL zone")
+            detail = (
+                "4h body closed below support or EMA/BOLL zone"
+                if h4_only
+                else "1h/4h body closed below support or EMA/BOLL zone"
+            )
+            return _outcome_exit_reason(position, price, detail)
     else:
         h4_failed = h4_state == "BREAKOUT_UP"
-        h1_failed = h1_direction == "LONG" and h1_state in {"BREAKOUT", "RETEST"}
+        h1_failed = (
+            not h4_only
+            and h1_direction == "LONG"
+            and h1_state in {"BREAKOUT", "RETEST"}
+        )
         if h4_failed or h1_failed:
-            return _outcome_exit_reason(position, price, "1h/4h body closed above resistance or EMA/BOLL zone")
+            detail = (
+                "4h body closed above resistance or EMA/BOLL zone"
+                if h4_only
+                else "1h/4h body closed above resistance or EMA/BOLL zone"
+            )
+            return _outcome_exit_reason(position, price, detail)
     return None
+
+
+def _position_has_explicit_opposite_trend(
+    position: Position,
+    signal: dict[str, object],
+) -> bool:
+    """Allow pre-1R rotation only after an explicit one-way reversal."""
+    action = str(signal.get("action") or "")
+    trend = str(signal.get("trend_state") or signal.get("regime") or "")
+    if position.side == PositionSide.LONG:
+        return (
+            action == SignalAction.ENTRY_SHORT.value
+            and trend == "ONE_WAY_DOWN"
+        )
+    return (
+        action == SignalAction.ENTRY_LONG.value
+        and trend == "ONE_WAY_UP"
+    )
 
 
 def _pyramid_allowed(
@@ -3914,18 +4461,21 @@ def _entry_reward_r(
     risk = abs(price - stop) + trading_cost
     if risk <= 0:
         return None
+    # The actual order plan is authoritative. Re-selecting a nearer structure
+    # target here made the displayed reward/risk disagree with the TP2 that
+    # would really be placed.
     target = (
-        None
-        if timeframe == "15m"
-        else _nearest_structure_target(
+        planned_target
+        if _target_is_profitable(side, price, planned_target)
+        else None
+    )
+    if target is None and timeframe != "15m":
+        target = _nearest_structure_target(
             signal,
             side,
             price,
             timeframe=timeframe,
         )
-    )
-    if target is None and _target_is_profitable(side, price, planned_target):
-        target = planned_target
     if target is None:
         return None
     reward = (
@@ -3945,11 +4495,12 @@ def _take_profits_for_final_stop(
     stop_price: float,
     *,
     timeframe: str,
+    round_trip_cost_rate: float = 0.0,
 ) -> tuple[float, float]:
     risk_distance = abs(entry_price - stop_price)
     if risk_distance <= 0:
         return entry_price, entry_price
-    target = (
+    structure_target = (
         None
         if timeframe == "15m"
         else _nearest_structure_target(
@@ -3959,22 +4510,47 @@ def _take_profits_for_final_stop(
             timeframe=timeframe,
         )
     )
-    if target is None:
-        target = _take_profit_from_r(
-            side,
-            entry_price,
-            stop_price,
-            2.0,
+    trading_cost = entry_price * max(round_trip_cost_rate, 0.0)
+    minimum_runner_r = MIN_ENTRY_REWARD_R + (
+        (MIN_ENTRY_REWARD_R + 1.0) * trading_cost / risk_distance
+    )
+    structure_target_r = (
+        abs(structure_target - entry_price) / risk_distance
+        if structure_target is not None
+        else None
+    )
+    if structure_target_r is None:
+        runner_r = max(2.0, minimum_runner_r)
+        first_r = FIRST_TAKE_PROFIT_R
+    elif structure_target_r < minimum_runner_r:
+        # A nearby resistance/support remains useful context, but must not
+        # collapse the whole trade into a 0.03R-0.5R full exit. Use a genuinely
+        # profitable nearby structure as TP1, then keep the remaining position
+        # for a cost-adjusted >=1.20R runner. If the structure cannot even
+        # cover round-trip costs, defer TP1 to the normal 0.8R milestone.
+        cost_r = trading_cost / risk_distance
+        first_r = (
+            structure_target_r
+            if structure_target_r > cost_r
+            else FIRST_TAKE_PROFIT_R
         )
-    target_r = abs(target - entry_price) / risk_distance
-    first_r = 1.0 if target_r > 1.0 else target_r * 0.5
+        runner_r = minimum_runner_r
+    else:
+        first_r = FIRST_TAKE_PROFIT_R
+        runner_r = structure_target_r
     take_profit_1 = _take_profit_from_r(
         side,
         entry_price,
         stop_price,
         first_r,
     )
-    return take_profit_1, target
+    take_profit_2 = _take_profit_from_r(
+        side,
+        entry_price,
+        stop_price,
+        runner_r,
+    )
+    return take_profit_1, take_profit_2
 
 
 def _nearest_structure_target(
@@ -4530,7 +5106,11 @@ def _entry_zone_bounds(
             side,
             matched_keys,
         )
-        and not _h4_override_indicator_entry_allowed(signal, matched_keys)
+        and not _h4_override_indicator_entry_allowed(
+            signal,
+            side,
+            matched_keys,
+        )
     ):
         return None
     zone_low = max(low for _, low, _ in matched)
@@ -4540,9 +5120,19 @@ def _entry_zone_bounds(
         side,
         zone_low,
         zone_high,
+        fraction=_entry_advantage_zone_fraction(side, matched_keys),
     ):
         return None
     return zone_low, zone_high
+
+
+def _entry_advantage_zone_fraction(
+    side: PositionSide,
+    matched_keys: set[str],
+) -> float:
+    if side == PositionSide.SHORT and any(key.startswith("h4_") for key in matched_keys):
+        return H4_SHORT_ENTRY_ADVANTAGE_ZONE_FRACTION
+    return ENTRY_ADVANTAGE_ZONE_FRACTION
 
 
 def _entry_advantage_zone_hit(
@@ -4550,6 +5140,8 @@ def _entry_advantage_zone_hit(
     side: PositionSide,
     zone_low: float,
     zone_high: float,
+    *,
+    fraction: float = ENTRY_ADVANTAGE_ZONE_FRACTION,
 ) -> bool:
     if zone_low > zone_high:
         return False
@@ -4557,17 +5149,23 @@ def _entry_advantage_zone_hit(
     if width <= 0:
         return price == zone_low
     if side == PositionSide.LONG:
-        advantage_ceiling = zone_low + width * ENTRY_ADVANTAGE_ZONE_FRACTION
+        advantage_ceiling = zone_low + width * fraction
         return zone_low <= price <= advantage_ceiling
-    advantage_floor = zone_high - width * ENTRY_ADVANTAGE_ZONE_FRACTION
+    advantage_floor = zone_high - width * fraction
     return advantage_floor <= price <= zone_high
 
 
 def _h4_override_indicator_entry_allowed(
     signal: dict[str, object],
+    side: PositionSide,
     matched_keys: set[str],
 ) -> bool:
     if str(signal.get("entry_timeframe_override") or "") != "4h":
+        return False
+    trend = str(signal.get("trend_state") or signal.get("regime") or "")
+    if side == PositionSide.LONG and trend not in {"TREND_LONG", "ONE_WAY_UP"}:
+        return False
+    if side == PositionSide.SHORT and trend not in {"TREND_SHORT", "ONE_WAY_DOWN"}:
         return False
     return bool(matched_keys) and matched_keys <= {
         "h4_boll_mid",
@@ -4803,16 +5401,23 @@ def _scored_entry_levels(
         return {}
     side_key = "long" if side == PositionSide.LONG else "short"
     source = all_levels.get(side_key) if isinstance(all_levels.get(side_key), dict) else {}
+    trend_state = str(signal.get("trend_state") or signal.get("regime") or "")
+    directional_trend = (
+        trend_state in {"TREND_LONG", "ONE_WAY_UP"}
+        if side == PositionSide.LONG
+        else trend_state in {"TREND_SHORT", "ONE_WAY_DOWN"}
+    )
     if str(signal.get("entry_timeframe_override") or "") == "4h":
         keys = [
             "h4_support" if side == PositionSide.LONG else "h4_resistance",
-            "h4_boll_mid",
         ]
-        keys.extend(
-            ["h4_ema20_ema60"]
-            if _entry_level_has_values(source.get("h4_ema20_ema60"))
-            else ["h4_ema20", "h4_ema60"]
-        )
+        if directional_trend:
+            keys.append("h4_boll_mid")
+            keys.extend(
+                ["h4_ema20_ema60"]
+                if _entry_level_has_values(source.get("h4_ema20_ema60"))
+                else ["h4_ema20", "h4_ema60"]
+            )
         selected = {
             key: source[key]
             for key in keys
@@ -4849,8 +5454,10 @@ def _scored_entry_levels(
         if setup_type == SETUP_M15_SQUEEZE_TACTICAL_LONG:
             add("m15_ema20_ema60")
         elif setup_type == SETUP_H4_PULLBACK_LONG:
-            add("h4_support", "h4_boll_mid")
-            add_ema("h4")
+            add("h4_support")
+            if directional_trend:
+                add("h4_boll_mid")
+                add_ema("h4")
         elif setup_type == SETUP_OI_VALLEY_REVERSAL_LONG:
             add("sweep_reclaim_support", "h1_support", "h4_support")
         elif setup_type == SETUP_H1_PULLBACK_LONG:
@@ -4890,8 +5497,10 @@ def _scored_entry_levels(
             add_ema("h4")
     else:
         if setup_type == SETUP_H4_PULLBACK_SHORT:
-            add("h4_resistance", "h4_boll_mid")
-            add_ema("h4")
+            add("h4_resistance")
+            if directional_trend:
+                add("h4_boll_mid")
+                add_ema("h4")
         elif setup_type == SETUP_H1_PULLBACK_SHORT:
             add("h1_resistance", "h1_boll_mid", "vwap_retest", "ma20_retest")
             add_ema("h1")
@@ -4915,6 +5524,14 @@ def _scored_entry_levels(
         if "4h structure supports downside" in reason_text:
             add("h4_resistance")
             add_ema("h4")
+    if not directional_trend:
+        for key in (
+            "h4_boll_mid",
+            "h4_ema20_ema60",
+            "h4_ema20",
+            "h4_ema60",
+        ):
+            selected.pop(key, None)
     return {side_key: selected} if selected else {}
 
 
@@ -5158,11 +5775,13 @@ def _position_efficiency_stalled(
     signal: dict[str, object],
     indicator: IndicatorSnapshot | None,
     price: float,
+    *,
+    now: datetime | None = None,
 ) -> bool:
     opened_at = position.opened_at
     if opened_at.tzinfo is None:
         opened_at = opened_at.replace(tzinfo=UTC)
-    if datetime.now(UTC) - opened_at < timedelta(hours=1):
+    if (now or datetime.now(UTC)) - opened_at < timedelta(hours=1):
         return False
     if _position_structure_failed(position, signal):
         return False
@@ -5207,6 +5826,22 @@ def _rotation_efficiency_better(candidate: IndicatorSnapshot | None, current: In
 
 def _build_price_only_indicators(candles: list[Candle], settings: AppSettings) -> list[IndicatorSnapshot]:
     return _build_indicators(candles, [], settings)
+
+
+def _indicator_cache_key(
+    candles: list[Candle],
+    derivatives: list[DerivativesSnapshot],
+) -> tuple[object, ...]:
+    latest_derivative = derivatives[-1] if derivatives else None
+    return (
+        len(candles),
+        candles[-1].timestamp if candles else None,
+        len(derivatives),
+        latest_derivative.timestamp if latest_derivative else None,
+        latest_derivative.open_interest if latest_derivative else None,
+        latest_derivative.long_short_ratio if latest_derivative else None,
+        latest_derivative.funding_rate if latest_derivative else None,
+    )
 
 
 def _build_indicators(
@@ -7589,27 +8224,6 @@ def _near_level(price: float, level: float | None, distance: float) -> bool:
     return abs(price - level) <= distance
 
 
-def _margin_for_signal(
-    score: int,
-    equity: float,
-    remaining_total_margin: float | None = None,
-    slots_remaining: int = 1,
-) -> float:
-    if score >= 85:
-        cap = min(280.0, equity * 0.28)
-        floor = min(180.0, equity * 0.18)
-    elif score >= 78:
-        cap = min(230.0, equity * 0.23)
-        floor = min(150.0, equity * 0.15)
-    else:
-        cap = min(180.0, equity * 0.18)
-        floor = min(100.0, equity * 0.10)
-    if remaining_total_margin is None:
-        return cap
-    target = remaining_total_margin / max(slots_remaining, 1)
-    return min(cap, max(floor, target))
-
-
 def _entry_stop_pct(entry_price: float, stop_price: float) -> float:
     if entry_price <= 0:
         return 0.0
@@ -7628,7 +8242,7 @@ def _entry_quality_grade(
         setup_is_core
         and score >= 95
         and reward_r >= 1.5
-        and stop_pct <= 0.05
+        and stop_pct <= ENTRY_QUALITY_STOP_MAX_S
     ):
         return ENTRY_QUALITY_S
     if (
@@ -7672,92 +8286,6 @@ def _leverage_for_entry_quality(
     if quality in {ENTRY_QUALITY_S, ENTRY_QUALITY_A}:
         return min(10, safe_leverage)
     return safe_leverage
-
-
-def _entry_quality_units(quality: str) -> int:
-    return 2 if quality == ENTRY_QUALITY_S else 1
-
-
-def _quality_sized_margin(
-    *,
-    equity: float,
-    available: float,
-    remaining_total_margin: float,
-    quality: str,
-    margin_factor: float = 1.0,
-) -> float:
-    if equity <= 0:
-        return 0.0
-    unit_margin = equity * ENTRY_MARGIN_DEPLOYMENT_CAP / ENTRY_MARGIN_BASE_SLOTS
-    target = unit_margin * _entry_quality_units(quality)
-    target *= max(0.0, min(float(margin_factor), 1.0))
-    return min(
-        target,
-        max(available, 0.0),
-        max(remaining_total_margin, 0.0),
-    )
-
-
-def _current_open_risk_usdt(positions: Iterable[Position]) -> float:
-    total = 0.0
-    for position in positions:
-        if position.side == PositionSide.LONG:
-            loss_distance = max(
-                position.entry_price - position.stop_price,
-                0.0,
-            )
-        else:
-            loss_distance = max(
-                position.stop_price - position.entry_price,
-                0.0,
-            )
-        total += (
-            loss_distance
-            * position.quantity
-            * max(position.remaining_fraction, 0.0)
-        )
-    return total
-
-
-def _risk_sized_margin(
-    *,
-    equity: float,
-    available: float,
-    remaining_total_margin: float,
-    current_open_risk_usdt: float,
-    risk_per_trade: float,
-    risk_factor: float,
-    entry_price: float,
-    stop_price: float,
-    leverage: int,
-) -> tuple[float, float]:
-    stop_pct = (
-        abs(entry_price - stop_price) / entry_price
-        if entry_price > 0
-        else 0.0
-    )
-    if stop_pct <= 0 or leverage <= 0 or equity <= 0:
-        return 0.0, 0.0
-    remaining_risk = max(
-        equity * TOTAL_OPEN_RISK_CAP - current_open_risk_usdt,
-        0.0,
-    )
-    risk_budget = min(
-        equity * max(risk_per_trade, 0.0) * max(risk_factor, 0.0),
-        remaining_risk,
-    )
-    if risk_budget <= 0:
-        return 0.0, 0.0
-    notional = risk_budget / stop_pct
-    margin = notional / leverage
-    margin = min(
-        margin,
-        equity * 0.28,
-        max(available, 0.0),
-        max(remaining_total_margin, 0.0),
-    )
-    planned_risk = margin * leverage * stop_pct
-    return margin, planned_risk
 
 
 def _default_stop(side: PositionSide, price: float, leverage: int) -> float:
@@ -7868,6 +8396,12 @@ def _trading_day_key(timestamp: datetime) -> str:
     if local.hour < 8:
         local -= timedelta(days=1)
     return local.date().isoformat()
+
+
+def _trading_week_key(timestamp: datetime) -> str:
+    trading_day = datetime.fromisoformat(_trading_day_key(timestamp)).date()
+    iso_year, iso_week, _ = trading_day.isocalendar()
+    return f"{iso_year}-W{iso_week:02d}"
 
 
 def _next_trading_day_key(day: str) -> str:

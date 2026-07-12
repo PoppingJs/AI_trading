@@ -63,6 +63,7 @@ risk:
   risk_per_trade: 0.01
   single_symbol_margin_limit: 0.10
   total_margin_limit: 0.35
+  total_open_risk_limit: 0.04
   max_open_positions: 5
   daily_loss_limit: 0.02
   weekly_loss_limit: 0.15

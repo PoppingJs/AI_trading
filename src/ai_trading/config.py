@@ -70,6 +70,7 @@ class RiskSettings:
     risk_per_trade: float = 0.01
     single_symbol_margin_limit: float = 0.10
     total_margin_limit: float = 0.35
+    total_open_risk_limit: float = 0.04
     max_open_positions: int = 5
     daily_loss_limit: float = 0.02
     weekly_loss_limit: float = 0.15

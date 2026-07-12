@@ -20,6 +20,11 @@ def main() -> None:
     parser.add_argument("--candles-csv", help="CSV with timestamp,open,high,low,close,volume")
     parser.add_argument("--derivatives-csv", help="CSV with timestamp,open_interest,long_short_ratio,funding_rate")
     parser.add_argument("--equity", type=float, default=10_000.0, help="Starting equity")
+    parser.add_argument(
+        "--legacy-backtest",
+        action="store_true",
+        help="Use the frozen single-timeframe legacy backtest baseline",
+    )
     args = parser.parse_args()
 
     settings = load_settings(args.config)
@@ -32,6 +37,7 @@ def main() -> None:
             strategy_settings=settings.strategy,
             risk_settings=settings.risk,
             execution_settings=settings.execution,
+            mode="legacy" if args.legacy_backtest else "production",
         ).run(candles, derivatives)
         print(f"symbol={args.symbol}")
         print(f"ending_equity={result.ending_equity:.2f} return={result.total_return:.2%} trades={len(result.trades)}")
@@ -61,6 +67,7 @@ def main() -> None:
             strategy_settings=settings.strategy,
             risk_settings=settings.risk,
             execution_settings=settings.execution,
+            mode="legacy" if args.legacy_backtest else "production",
         ).run(candles, derivatives)
         print(f"latest_signal={signal.action.value} score={signal.score} regime={signal.regime.value}")
         print(f"reasons={'; '.join(signal.reasons)}")

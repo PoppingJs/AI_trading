@@ -53,7 +53,7 @@ config/strategy.yaml        Strategy, risk, and execution defaults
 src/ai_trading/indicators.py EMA/MA/BOLL/RSI/ATR/VOL calculations
 src/ai_trading/strategy.py   Composite scoring and hard vetoes
 src/ai_trading/risk.py       Position sizing, stop loss, take profit planning
-src/ai_trading/backtest.py   Paper-style backtest engine
+src/ai_trading/backtest.py   Production-parity replay and frozen legacy baseline
 src/ai_trading/binance.py    Read-only Binance USDT-M market discovery
 src/ai_trading/universe.py   Top20 + data quality filtering
 src/ai_trading/api.py        FastAPI service skeleton
@@ -73,6 +73,12 @@ python -m pip install -e ".[dev]"
 ```bash
 ai-trading --demo
 ```
+
+The default backtest replays the same multi-timeframe paper-trading decision
+path on a point-in-time clock. Signals can fill no earlier than the next market
+event, OHLC ambiguity is adverse-first, and portfolio runs share one account.
+Use `--legacy-backtest` only to compare against the frozen single-timeframe
+research baseline.
 
 This runs the strategy on synthetic 15m-style data and prints the latest signal
 plus a basic backtest summary.
@@ -105,6 +111,10 @@ Endpoints:
 - `GET /api/markets/top20`
 - `GET /api/signals/demo`
 - `POST /api/backtests/run`
+- `POST /api/backtests/jobs`
+- `GET /api/backtests/jobs/{job_id}`
+- `POST /api/backtests/jobs/{job_id}/cancel`
+- `GET /api/review/summary`
 
 OpenAPI docs are available at:
 
@@ -116,6 +126,14 @@ The paper trading dashboard is available at:
 
 ```text
 http://127.0.0.1:8000/
+```
+
+The same top navigation opens the production-parity historical replay and the
+read-only trade-lifecycle review pages:
+
+```text
+http://127.0.0.1:8000/backtest
+http://127.0.0.1:8000/review
 ```
 
 It starts with a local 1200 USDT paper account. You can:

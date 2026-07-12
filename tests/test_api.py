@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import time
 
 from fastapi.testclient import TestClient
 
@@ -52,3 +53,46 @@ def test_dashboard_uses_concise_chinese_veto_copy(tmp_path: Path) -> None:
     assert "signalEntryTiming(s)" not in page
     assert "reasons.includes('score below trading threshold')" not in page
     assert "['币种','动作','状态','风险','主力周期','分数','入场位置','原因','否决']" in page
+
+
+def test_backtest_and_review_pages_keep_realtime_navigation(tmp_path: Path) -> None:
+    with TestClient(create_app(state_path=tmp_path / "paper_state.json")) as client:
+        realtime = client.get("/")
+        backtest = client.get("/backtest")
+        review = client.get("/review")
+
+    assert realtime.status_code == backtest.status_code == review.status_code == 200
+    assert 'href="/backtest"' in realtime.text
+    assert 'href="/review"' in realtime.text
+    assert "历史回测" in backtest.text
+    assert "交易复盘" in review.text
+
+
+def test_async_demo_backtest_job_and_review_summary(tmp_path: Path) -> None:
+    with TestClient(create_app(state_path=tmp_path / "paper_state.json")) as client:
+        submitted = client.post(
+            "/api/backtests/jobs",
+            json={
+                "data_source": "demo",
+                "symbol": "DEMOUSDT",
+                "starting_equity": 10_000,
+                "mode": "production",
+                "base_timeframe": "15m",
+            },
+        )
+        assert submitted.status_code == 200
+        job_id = submitted.json()["id"]
+
+        payload = submitted.json()
+        deadline = time.monotonic() + 5
+        while payload["status"] in {"QUEUED", "RUNNING"} and time.monotonic() < deadline:
+            time.sleep(0.02)
+            payload = client.get(f"/api/backtests/jobs/{job_id}").json()
+
+        assert payload["status"] == "COMPLETED"
+        assert payload["result"]["mode"] == "production"
+        assert "analysis" in payload["result"]
+
+        summary = client.get("/api/review/summary")
+        assert summary.status_code == 200
+        assert summary.json()["metrics"]["completed"] == 0

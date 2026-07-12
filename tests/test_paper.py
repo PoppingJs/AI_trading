@@ -10,6 +10,7 @@ import pytest
 from ai_trading.api import create_app
 from ai_trading.config import AppSettings
 from ai_trading.models import Candle, IndicatorSnapshot, Position, PositionSide, SignalAction
+from ai_trading.risk import TradePlan
 from ai_trading.paper import (
     DISTRIBUTION_STAGE_DESCENDING,
     DISTRIBUTION_STAGE_MARKDOWN,
@@ -29,7 +30,6 @@ from ai_trading.paper import (
     _auto_signal_allowed,
     _candidate_prefilter_allowed,
     _confirmed_structure_exit_reason,
-    _current_open_risk_usdt,
     _daily_bias_margin_factor,
     _daily_pnl_payload,
     _entry_quality_grade,
@@ -47,10 +47,10 @@ from ai_trading.paper import (
     _leverage_for_signal,
     _leverage_for_entry_quality,
     _large_timeframe_wick_rejections,
-    _margin_for_signal,
     _merge_candles,
     _ma_cluster_signal_adjustment,
     _one_hour_ema_reliability,
+    _paper_account_from_payload,
     _oi_valley_short_exit_reason,
     _pnl_history_payload,
     _profit_drawdown_exit_reason,
@@ -69,11 +69,10 @@ from ai_trading.paper import (
     _pyramid_allowed,
     _rotation_candidate_allowed,
     _risk_exit_reason,
-    _risk_sized_margin,
-    _quality_sized_margin,
     _scored_entry_levels,
     _signal_entry_timing,
     _stop_exit_reason,
+    _strong_trend_invalidated,
     _structure_take_profit_reason,
     _take_profits_for_final_stop,
     _tighten_short_support_stop,
@@ -84,6 +83,132 @@ from ai_trading.paper import (
 
 def test_periodic_state_checkpoint_is_throttled_to_five_minutes() -> None:
     assert STATE_SAVE_SECONDS == 300.0
+
+
+def test_legacy_paper_state_loads_with_safe_risk_defaults() -> None:
+    account = _paper_account_from_payload(
+        {
+            "starting_balance": 1000.0,
+            "wallet_balance": 950.0,
+            "positions": {},
+            "fills": [],
+        }
+    )
+
+    assert account.risk_peak_equity == 0.0
+    assert not account.daily_loss_locked
+    assert not account.weekly_loss_locked
+    assert not account.drawdown_locked
+    assert account.consecutive_losses == 0
+    assert account.cooldown_until is None
+
+
+def test_account_risk_snapshot_latches_daily_loss_and_drawdown() -> None:
+    settings = AppSettings()
+    settings.risk.daily_loss_limit = 0.02
+    settings.risk.max_drawdown_circuit_breaker = 0.20
+    engine = PaperTradingEngine(
+        settings,
+        starting_balance=1000,
+        market_data=FakeMarketData(),
+    )
+    now = datetime(2026, 7, 12, 4, 0, tzinfo=UTC)
+    engine._account_risk_snapshot(engine.status(), now=now)
+    engine.account.wallet_balance = 790.0
+
+    snapshot = engine._account_risk_snapshot(engine.status(), now=now)
+
+    assert snapshot.daily_loss_locked
+    assert snapshot.drawdown_locked
+
+
+def test_manual_risk_entry_rejects_margin_above_single_symbol_limit() -> None:
+    engine = PaperTradingEngine(
+        AppSettings(),
+        starting_balance=1000,
+        market_data=FakeMarketData(),
+    )
+
+    with pytest.raises(ValueError, match="risk-gated maximum"):
+        asyncio.run(
+            engine.open_position_with_risk(
+                "BTCUSDT",
+                "LONG",
+                margin_usdt=200,
+                leverage=5,
+            )
+        )
+
+
+def test_three_losing_position_lifecycles_start_cooldown() -> None:
+    engine = PaperTradingEngine(
+        AppSettings(),
+        starting_balance=1000,
+        market_data=FakeMarketData(),
+    )
+    for index in range(3):
+        symbol = f"LOSS{index}USDT"
+        position = asyncio.run(
+            engine.open_position(
+                symbol,
+                "LONG",
+                margin_usdt=50,
+                leverage=5,
+                stop_loss=98.0,
+            )
+        )
+        engine._close_position_unlocked(position, 98.0, "stop loss")
+
+    assert engine.account.consecutive_losses == 3
+    assert engine.account.cooldown_until is not None
+    decision = engine.portfolio_risk.evaluate(
+        TradePlan(
+            symbol="NEXTUSDT",
+            side=PositionSide.LONG,
+            entry_price=100.0,
+            stop_price=98.0,
+            take_profit_1=102.0,
+            take_profit_2=104.0,
+            leverage=5,
+        ),
+        engine._account_risk_snapshot(engine.status()),
+    )
+    assert not decision.allowed
+    assert decision.blocked_code == "LOSS_COOLDOWN"
+
+
+def test_replay_clock_and_execution_price_are_injectable() -> None:
+    replay_time = datetime(2025, 5, 1, 8, 0, tzinfo=UTC)
+    engine = PaperTradingEngine(
+        AppSettings(),
+        starting_balance=1000,
+        market_data=FakeMarketData(),
+        clock=lambda: replay_time,
+        fill_price_resolver=lambda price, side, entering: (
+            price * 1.001
+            if side == PositionSide.LONG and entering
+            else price * 0.999
+            if side == PositionSide.LONG
+            else price
+        ),
+    )
+    position = asyncio.run(
+        engine.open_position(
+            "CLOCKUSDT",
+            "LONG",
+            margin_usdt=50,
+            leverage=5,
+            stop_loss=98.0,
+            take_profit_1=102.0,
+            take_profit_2=104.0,
+        )
+    )
+
+    assert position.opened_at == replay_time
+    assert position.entry_price == pytest.approx(100.1)
+    trade = engine._close_position_unlocked(position, 100.0, "replay close")
+    assert trade.closed_at == replay_time
+    assert trade.exit_price == pytest.approx(99.9)
 
 
 class FakeMarketData:
@@ -214,6 +339,36 @@ def test_take_profit_1_partially_closes_and_moves_stop_above_break_even() -> Non
     assert position.first_tp_done
     assert position.remaining_fraction == pytest.approx(0.65)
     assert position.metadata["margin_usdt"] == pytest.approx(65.0)
+    assert position.stop_price > position.entry_price
+
+
+def test_planned_point_eight_r_partial_profit_does_not_wait_for_one_r() -> None:
+    engine = PaperTradingEngine(
+        AppSettings(),
+        starting_balance=1000,
+        market_data=FakeMarketData(),
+    )
+    position = asyncio.run(
+        engine.open_position(
+            "TEST08RUSDT",
+            "LONG",
+            margin_usdt=100,
+            leverage=5,
+            stop_loss=95.0,
+            take_profit_1=104.0,
+            take_profit_2=106.0,
+        )
+    )
+    engine.latest_prices[position.symbol] = 104.0
+    engine.latest_signals[position.symbol] = {
+        "trend_state": "TREND_LONG",
+        "risk_state": "NORMAL",
+    }
+
+    engine._manage_open_positions()
+
+    assert position.first_tp_done
+    assert position.remaining_fraction < 1.0
     assert position.stop_price > position.entry_price
     assert engine.account.fills[-1].action == "PARTIAL_CLOSE"
     assert engine.account.fills[-1].reason == "take profit: target 1 reached"
@@ -1126,6 +1281,82 @@ def test_confirmed_structure_exit_does_not_close_short_on_healthy_bounce_only() 
     assert _confirmed_structure_exit_reason(position, 192.6, signal) is None
 
 
+def test_four_hour_setup_ignores_one_hour_failure_until_four_hour_breaks() -> None:
+    position = asyncio.run(
+        PaperTradingEngine(
+            AppSettings(),
+            starting_balance=1000,
+            market_data=FakeMarketData(),
+        ).open_position(
+            "BNBUSDT",
+            "SHORT",
+            margin_usdt=100,
+            leverage=5,
+            entry_context={
+                "setup_type": SETUP_H4_PULLBACK_SHORT,
+                "stop_timeframe": "4h",
+            },
+        )
+    )
+    position.entry_price = 573.85
+    position.stop_price = 587.05
+    h1_only_failure = {
+        "h4_structure": {"state": "BOX_LOWER_HALF"},
+        "h1_trigger": {"direction": "LONG", "state": "BREAKOUT"},
+    }
+    h4_failure = {
+        **h1_only_failure,
+        "h4_structure": {"state": "BREAKOUT_UP"},
+    }
+
+    assert _confirmed_structure_exit_reason(
+        position,
+        575.5,
+        h1_only_failure,
+    ) is None
+    assert _confirmed_structure_exit_reason(
+        position,
+        588.0,
+        h4_failure,
+    ) == "stop loss: 4h body closed above resistance or EMA/BOLL zone"
+
+
+def test_four_hour_setup_is_not_closed_by_ema50_weakness_alone() -> None:
+    engine = PaperTradingEngine(
+        AppSettings(),
+        starting_balance=1000,
+        market_data=FakeMarketData(),
+    )
+    h4_position = asyncio.run(
+        engine.open_position(
+            "TEST4HUSDT",
+            "SHORT",
+            margin_usdt=100,
+            leverage=5,
+            entry_context={
+                "setup_type": SETUP_H4_PULLBACK_SHORT,
+                "stop_timeframe": "4h",
+            },
+        )
+    )
+    h1_position = asyncio.run(
+        engine.open_position(
+            "TEST1HUSDT",
+            "SHORT",
+            margin_usdt=100,
+            leverage=5,
+            entry_context={"stop_timeframe": "1h"},
+        )
+    )
+    invalidated = indicator_snapshot(
+        close=103.0,
+        atr=1.0,
+    )
+
+    assert not _strong_trend_invalidated(h4_position, invalidated)
+    assert _strong_trend_invalidated(h1_position, invalidated)
+
+
 def test_breakout_protection_waits_for_real_profit_before_tightening_stop() -> None:
     position = asyncio.run(PaperTradingEngine(AppSettings(), starting_balance=1000, market_data=FakeMarketData()).open_position("BCHUSDT", "SHORT", margin_usdt=100, leverage=10))
     position.entry_price = 190.3
@@ -1697,24 +1928,23 @@ def test_auto_signal_score_tiers_and_margins() -> None:
     assert not _auto_signal_allowed({**base_signal, "score": 90, "risk_state": "NORMAL", "vetoes": ("1h trigger opposes long entry",)})
     assert not _auto_signal_allowed({"score": 90, "risk_state": "NORMAL"})
 
-    assert _margin_for_signal(90, 1000) == 280
-    assert _margin_for_signal(80, 1000) == 230
-    assert _margin_for_signal(76, 1000) == 180
-    assert _margin_for_signal(90, 1000, 950, 5) == 190
-    assert _margin_for_signal(76, 1000, 950, 5) == 180
-
-
-def test_entry_quality_drives_leverage_and_margin_units() -> None:
+def test_entry_quality_drives_leverage_safety() -> None:
+    assert _entry_quality_grade(
+        score=96,
+        reward_r=1.6,
+        stop_pct=0.025,
+        setup_type=SETUP_H1_PULLBACK_LONG,
+    ) == "S"
     assert _entry_quality_grade(
         score=96,
         reward_r=1.6,
         stop_pct=0.03,
         setup_type=SETUP_H1_PULLBACK_LONG,
-    ) == "S"
+    ) == "A"
     assert _entry_quality_grade(
         score=90,
         reward_r=1.25,
-        stop_pct=0.05,
+        stop_pct=0.04,
         setup_type=SETUP_H1_PULLBACK_LONG,
     ) == "A"
     assert _entry_quality_grade(
@@ -1725,30 +1955,11 @@ def test_entry_quality_drives_leverage_and_margin_units() -> None:
     ) == "B"
 
     assert _leverage_for_entry_quality("S", stop_pct=0.03, leverage_max=10) == 10
-    assert _leverage_for_entry_quality("A", stop_pct=0.05, leverage_max=10) == 10
-    assert _leverage_for_entry_quality("B", stop_pct=0.08, leverage_max=10) == 7
-    assert _leverage_for_entry_quality("B", stop_pct=0.12, leverage_max=10) == 5
-    assert _leverage_for_entry_quality("B", stop_pct=0.14, leverage_max=10) == 0
-
-    assert _quality_sized_margin(
-        equity=1200,
-        available=1200,
-        remaining_total_margin=1140,
-        quality="S",
-    ) == pytest.approx(456.0)
-    assert _quality_sized_margin(
-        equity=1200,
-        available=1200,
-        remaining_total_margin=1140,
-        quality="A",
-    ) == pytest.approx(228.0)
-    assert _quality_sized_margin(
-        equity=1200,
-        available=100,
-        remaining_total_margin=1140,
-        quality="A",
-    ) == pytest.approx(100.0)
-
+    assert _leverage_for_entry_quality("A", stop_pct=0.04, leverage_max=10) == 10
+    assert _leverage_for_entry_quality("A", stop_pct=0.05, leverage_max=10) == 7
+    assert _leverage_for_entry_quality("B", stop_pct=0.06, leverage_max=10) == 7
+    assert _leverage_for_entry_quality("B", stop_pct=0.08, leverage_max=10) == 5
+    assert _leverage_for_entry_quality("B", stop_pct=0.081, leverage_max=10) == 0
 
 def test_auto_entry_prerequisites_explain_score_direction_and_timing_blocks() -> None:
     wait_signal = {
@@ -1880,6 +2091,82 @@ def test_entry_position_requires_advantage_side_inside_scored_zone() -> None:
     signal["price"] = 99.8
     _update_entry_position_fields(signal)
     assert signal["entry_timing"] == "GOOD"
+
+
+def test_four_hour_short_entry_requires_upper_half_of_retest_zone() -> None:
+    signal = {
+        "timestamp": "2026-07-10T00:00:00+00:00",
+        "action": SignalAction.ENTRY_SHORT.value,
+        "score": 95,
+        "trend_state": "TREND_SHORT",
+        "risk_state": "NORMAL",
+        "entry_timeframe_override": "4h",
+        "price": 7.75032,
+        "entry_levels": {
+            "short": {
+                "h4_ema20_ema60": {
+                    "low": 7.70310,
+                    "high": 7.80759,
+                    "price": 7.75535,
+                }
+            }
+        },
+    }
+
+    _update_entry_position_fields(signal)
+    assert signal["entry_timing"] == "WAIT"
+
+    signal["price"] = 7.78000
+    _update_entry_position_fields(signal)
+    assert signal["entry_timing"] == "GOOD"
+
+
+def test_four_hour_indicator_override_does_not_create_direction_in_chop() -> None:
+    signal = {
+        "action": SignalAction.ENTRY_SHORT.value,
+        "score": 95,
+        "trend_state": "CHOP",
+        "risk_state": "NORMAL",
+        "entry_timeframe_override": "4h",
+        "price": 7.79,
+        "entry_levels": {
+            "short": {
+                "h4_ema20_ema60": {
+                    "low": 7.70,
+                    "high": 7.80,
+                    "price": 7.75,
+                }
+            }
+        },
+    }
+
+    _update_entry_position_fields(signal)
+
+    assert signal["entry_timing"] == "WAIT"
+
+
+def test_chop_h4_pullback_keeps_boundary_not_mid_indicator_zones() -> None:
+    selected = _scored_entry_levels(
+        {
+            "action": SignalAction.ENTRY_SHORT.value,
+            "trend_state": "CHOP",
+            "setup_type": SETUP_H4_PULLBACK_SHORT,
+            "reasons": ("4h structure supports downside",),
+        },
+        {
+            "short": {
+                "h4_resistance": {"low": 103.0, "high": 104.0},
+                "h4_boll_mid": {"low": 99.5, "high": 100.5},
+                "h4_ema20_ema60": {"low": 99.0, "high": 101.0},
+            }
+        },
+    )
+
+    assert selected == {
+        "short": {
+            "h4_resistance": {"low": 103.0, "high": 104.0},
+        }
+    }
 
 
 def test_suggested_entry_text_uses_the_same_filtered_entry_levels() -> None:
@@ -2919,6 +3206,39 @@ def test_entry_reward_r_uses_planned_target_when_structure_is_unavailable() -> N
     ) == pytest.approx(1.8)
 
 
+def test_entry_reward_r_uses_actual_planned_tp2_over_nearer_structure() -> None:
+    assert _entry_reward_r(
+        {"h1_structure": {"resistance": 100.1}},
+        PositionSide.LONG,
+        price=100.0,
+        stop=99.0,
+        timeframe="1h",
+        planned_target=101.2,
+    ) == pytest.approx(1.2)
+
+
+def test_exit_plan_preserves_one_point_two_r_after_trading_costs() -> None:
+    take_profit_1, take_profit_2 = _take_profits_for_final_stop(
+        {"h1_structure": {"resistance": 100.1}},
+        PositionSide.LONG,
+        100.0,
+        99.0,
+        timeframe="1h",
+        round_trip_cost_rate=0.001,
+    )
+
+    assert take_profit_1 == pytest.approx(100.8)
+    assert _entry_reward_r(
+        {},
+        PositionSide.LONG,
+        price=100.0,
+        stop=99.0,
+        timeframe="1h",
+        planned_target=take_profit_2,
+        round_trip_cost_rate=0.001,
+    ) == pytest.approx(1.2)
+
+
 def test_15m_take_profit_is_rebuilt_from_final_15m_stop() -> None:
     signal = {
         "h1_structure": {"resistance": 120.0},
@@ -2932,7 +3252,7 @@ def test_15m_take_profit_is_rebuilt_from_final_15m_stop() -> None:
         timeframe="15m",
     )
 
-    assert take_profit_1 == 102.0
+    assert take_profit_1 == 101.6
     assert take_profit_2 == 104.0
     assert _entry_reward_r(
         signal,
@@ -2945,16 +3265,17 @@ def test_15m_take_profit_is_rebuilt_from_final_15m_stop() -> None:
 
 
 @pytest.mark.parametrize(
-    ("side", "target", "expected_tp1"),
+    ("side", "target", "expected_tp1", "expected_tp2"),
     (
-        (PositionSide.LONG, 100.01, 100.005),
-        (PositionSide.SHORT, 99.99, 99.995),
+        (PositionSide.LONG, 100.01, 100.01, 101.2),
+        (PositionSide.SHORT, 99.99, 99.99, 98.8),
     ),
 )
-def test_near_structure_target_keeps_tp1_between_entry_and_tp2(
+def test_near_structure_target_becomes_partial_not_full_exit(
     side: PositionSide,
     target: float,
     expected_tp1: float,
+    expected_tp2: float,
 ) -> None:
     structure = (
         {"resistance": target}
@@ -2971,7 +3292,7 @@ def test_near_structure_target_keeps_tp1_between_entry_and_tp2(
     )
 
     assert take_profit_1 == pytest.approx(expected_tp1)
-    assert take_profit_2 == pytest.approx(target)
+    assert take_profit_2 == pytest.approx(expected_tp2)
     assert (
         _exit_plan_error(
             side,
@@ -2997,37 +3318,8 @@ def test_1h_take_profit_does_not_borrow_a_4h_structure_target() -> None:
         timeframe="1h",
     )
 
-    assert take_profit_1 == 99.0
+    assert take_profit_1 == 99.2
     assert take_profit_2 == 98.0
-
-
-def test_risk_sized_margin_keeps_wide_and_narrow_stops_at_same_loss_budget() -> None:
-    wide_margin, wide_risk = _risk_sized_margin(
-        equity=1200.0,
-        available=1200.0,
-        remaining_total_margin=936.0,
-        current_open_risk_usdt=0.0,
-        risk_per_trade=0.01,
-        risk_factor=1.0,
-        entry_price=0.01239,
-        stop_price=0.01089,
-        leverage=5,
-    )
-    narrow_margin, narrow_risk = _risk_sized_margin(
-        equity=1200.0,
-        available=1200.0,
-        remaining_total_margin=936.0,
-        current_open_risk_usdt=0.0,
-        risk_per_trade=0.01,
-        risk_factor=1.0,
-        entry_price=1.848,
-        stop_price=1.801,
-        leverage=5,
-    )
-
-    assert wide_margin < narrow_margin
-    assert wide_risk == pytest.approx(12.0)
-    assert narrow_risk == pytest.approx(12.0)
 
 
 def test_exit_plan_postcondition_validates_stop_and_take_profit_direction() -> None:
@@ -4412,13 +4704,18 @@ def test_auto_trade_caps_positions_and_prefers_highest_scores() -> None:
         "TEST4USDT",
         "TEST5USDT",
     }
-    assert sum(
+    used_margin = sum(
         float(position.metadata["margin_usdt"])
         for position in engine.account.positions.values()
-    ) >= 940.0
+    )
+    assert used_margin <= 1000 * engine.settings.risk.total_margin_limit
+    assert sum(
+        float(position.metadata["entry_context"]["planned_risk_usdt"])
+        for position in engine.account.positions.values()
+    ) <= 1000 * engine.settings.risk.total_open_risk_limit
 
 
-def test_auto_trade_allows_low_reward_risk_as_quality_downgrade() -> None:
+def test_auto_trade_turns_near_structure_target_into_partial_runner_plan() -> None:
     settings = AppSettings()
     settings.risk.max_open_positions = 1
     engine = PaperTradingEngine(settings, starting_balance=1000, market_data=FakeMarketData())
@@ -4445,9 +4742,13 @@ def test_auto_trade_allows_low_reward_risk_as_quality_downgrade() -> None:
 
     assert set(engine.account.positions) == {"HIGHUSDT"}
     opened = engine.latest_signals["HIGHUSDT"]
+    position = engine.account.positions["HIGHUSDT"]
     assert opened["entry_timing"] == "GOOD"
     assert not any("entry reward/risk" in reason for reason in opened.get("vetoes", ()))
-    assert "实际盈亏比低于 1.20R" in opened.get("reasons", ())
+    assert "最近结构目标空间不足；先分批止盈，剩余仓位目标不低于 1.20R" in opened.get("reasons", ())
+    assert position.metadata["leverage"] <= 7
+    assert position.metadata["entry_context"]["entry_reward_r"] == pytest.approx(1.2)
+    assert position.metadata["entry_context"]["entry_structure_reward_r"] < 1.2
 
 
 def test_auto_trade_uses_generated_take_profit_when_structure_target_is_unavailable() -> None:
@@ -4479,6 +4780,7 @@ def test_auto_trade_uses_generated_take_profit_when_structure_target_is_unavaila
     position = engine.account.positions["TESTUSDT"]
     assert position.take_profit_1 > position.entry_price
     assert position.take_profit_2 > position.take_profit_1
+    assert position.metadata["entry_context"]["entry_quality"] != "S"
     assert "entry reward/risk target unavailable" not in engine.latest_signals["TESTUSDT"]["vetoes"]
 
 
@@ -4598,7 +4900,7 @@ def test_auto_trade_rotates_weak_position_for_much_stronger_candidate() -> None:
         asyncio.run(engine.open_position(
             f"TEST{idx}USDT",
             "LONG",
-            margin_usdt=100,
+            margin_usdt=50,
             leverage=5,
             stop_loss=99.0,
         ))
