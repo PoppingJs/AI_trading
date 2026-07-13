@@ -60,15 +60,13 @@ def test_failure_analysis_identifies_wick_stop_recovery() -> None:
 
     assert analysis["metrics"]["completed"] == 1
     assert analysis["metrics"]["win_rate"] == 0.0
-    lifecycle = analysis["lifecycles"][0]
-    assert lifecycle["failure_cause"] == "插针扫损"
-    assert "收盘重新回到止损内侧" in lifecycle["failure_evidence"]
-    assert analysis["failure_causes"][0]["pnl"] < 0
     symbol_summary = analysis["symbol_summaries"][0]
     assert symbol_summary["symbol"] == "TESTUSDT"
-    assert symbol_summary["losses"] == 1
-    assert symbol_summary["causes"] == [{"cause": "插针扫损", "count": 1}]
-    assert "收盘重新回到止损内侧" in symbol_summary["evidence"][0]
+    assert "插针扫损1笔" in symbol_summary["text"]
+    assert "收盘重新回到止损内侧" in symbol_summary["text"]
+    assert "改进建议" in symbol_summary["text"]
+    assert "lifecycles" not in analysis
+    assert "failure_causes" not in analysis
 
 
 def test_open_lifecycle_is_excluded_from_win_rate() -> None:

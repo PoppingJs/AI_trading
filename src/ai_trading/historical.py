@@ -776,9 +776,7 @@ def analyze_replay_failures(
             "closed_trade_pnl": sum(float(row["pnl"]) for row in lifecycles),
         },
         "failure_summary": summary,
-        "failure_causes": ranked_causes,
         "symbol_summaries": _symbol_analysis_summaries(lifecycles),
-        "lifecycles": lifecycles,
     }
 
 
@@ -800,22 +798,40 @@ def _symbol_analysis_summaries(
             detail = str(row.get("failure_evidence") or "").strip()
             if detail and detail not in evidence:
                 evidence.append(detail)
-        summaries.append(
-            {
-                "symbol": symbol,
-                "trades": len(rows),
-                "wins": sum(float(row["pnl"]) > 0 for row in rows),
-                "losses": len(losers),
-                "pnl": sum(float(row["pnl"]) for row in rows),
-                "causes": [
-                    {"cause": cause, "count": count}
-                    for cause, count in sorted(causes.items(), key=lambda item: (-item[1], item[0]))
-                ],
-                "evidence": evidence[:3],
-            }
+        pnl = sum(float(row["pnl"]) for row in rows)
+        wins = sum(float(row["pnl"]) > 0 for row in rows)
+        ranked = sorted(causes.items(), key=lambda item: (-item[1], item[0]))
+        issue_text = "、".join(f"{cause}{count}笔" for cause, count in ranked)
+        recommendations = list(
+            dict.fromkeys(_recommendation_for_cause(cause) for cause, _ in ranked)
         )
+        if not recommendations:
+            recommendations.append("当前完成交易未出现亏损，维持现有入场与退出规则并继续积累样本")
+        parts = [
+            f"完成{len(rows)}笔，胜{wins}负{len(losers)}",
+            f"净收益{pnl:+.2f} U",
+            f"主要问题：{issue_text}" if issue_text else "本区间未发现亏损交易",
+        ]
+        if evidence:
+            parts.append(f"关键观察：{'；'.join(evidence[:3])}")
+        parts.append(f"改进建议：{'；'.join(recommendations)}")
+        summaries.append({"symbol": symbol, "pnl": pnl, "text": "；".join(parts)})
     summaries.sort(key=lambda row: (float(row["pnl"]), str(row["symbol"])))
     return summaries
+
+
+def _recommendation_for_cause(cause: str) -> str:
+    recommendations = {
+        "方向错误": "提高日线与4小时方向一致性要求，方向冲突时放弃入场",
+        "入场过早": "等待价格进入建议区并完成低周期确认后再开仓",
+        "插针扫损": "复核止损是否需要结构外缓冲或收盘确认，避免单根影线直接扫出",
+        "盈利回吐": "达到计划盈利后分批锁盈，并按规则上移保护止损",
+        "轮动负贡献": "提高换仓标的相对优势门槛，优势不足时不轮动",
+        "结构失效": "保留结构止损，并复核入场时结构是否已经接近失效",
+        "时间退出": "检查持仓超时前是否长期缺乏顺向推进，减少低效率占仓",
+        "未分类亏损": "复核该笔方向、入场位置和退出过程，补充可重复的失败分类",
+    }
+    return recommendations.get(cause, "复核同类交易的方向、入场位置与退出节奏")
 
 
 def _lifecycle_payload(

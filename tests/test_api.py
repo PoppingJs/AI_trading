@@ -50,6 +50,19 @@ def test_new_backtest_page_keeps_only_realtime_and_historical_navigation(tmp_pat
     assert "overflow-y:scroll" in backtest.text
     assert "symbol_summaries" in backtest.text
     assert 'class="day-tick"' in backtest.text
+    assert "成交记录与失败归因" not in backtest.text
+    assert "<h2>成交记录</h2>" in backtest.text
+    assert "<th>主力周期</th>" in backtest.text
+    assert "<th>失败根因</th>" not in backtest.text
+    assert "<th>证据</th>" not in backtest.text
+    assert "<th>操作</th>" not in backtest.text
+    assert "closePosition(" not in backtest.text
+    assert "结束时间仍持仓则按市值计入总权益" not in backtest.text
+    assert "固定当前Top50 · 实际可用" not in backtest.text
+    assert "跳过${result.skipped_symbols.length}个数据不完整币种" not in backtest.text
+    assert "<tr><th>币种</th><th>方向</th><th>杠杆</th><th>入场</th><th>现价</th><th>数量</th><th>保证金</th><th>浮盈亏</th><th>收益率</th><th>止损</th><th>止盈</th><th>入场原因</th></tr>" in backtest.text
+    assert "<tr><th>币种</th><th>动作</th><th>状态</th><th>风险</th><th>主力周期</th><th>分数</th><th>入场位置</th><th>原因</th><th>否决</th></tr>" in backtest.text
+    assert "<tr><th>币种</th><th>方向</th><th>杠杆</th><th>开仓均价</th><th>平仓均价</th><th>数量</th><th>止损</th><th>止盈</th><th>收益率</th><th>实现盈亏</th><th>手续费</th><th>开仓时间</th><th>平仓时间</th><th>入场位置</th><th>出场原因</th></tr>" in backtest.text
     assert "本金" not in backtest.text
     assert "标的池" not in backtest.text
     assert "<label>周期</label>" not in backtest.text
@@ -81,6 +94,8 @@ def test_historical_job_replays_current_engine_and_reuses_latest_market_cache(
         assert first["status"] == "COMPLETED", first
         assert first["result"]["summary"]["starting_equity"] == 1200.0
         assert "failure_summary" in first["result"]["analysis"]
+        assert "lifecycles" not in first["result"]["analysis"]
+        assert "failure_causes" not in first["result"]["analysis"]
         assert first["result"]["universe"] == ["TESTUSDT"]
         assert first["result"]["notes"][0].startswith("使用实时模拟交易")
 
