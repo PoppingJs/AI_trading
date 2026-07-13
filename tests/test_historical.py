@@ -5,6 +5,9 @@ from datetime import UTC, datetime, timedelta
 from ai_trading.historical import (
     HistoricalDataset,
     HistoricalSymbolData,
+    SHANGHAI,
+    _floor_time,
+    _inclusive_end_date,
     analyze_replay_failures,
 )
 from ai_trading.models import Candle, PositionSide
@@ -86,6 +89,15 @@ def test_open_lifecycle_is_excluded_from_win_rate() -> None:
     assert analysis["metrics"]["completed"] == 0
     assert analysis["metrics"]["win_rate"] == 0.0
     assert "没有完成交易" in analysis["failure_summary"]
+
+
+def test_current_day_end_is_floored_to_completed_base_interval() -> None:
+    now = datetime(2026, 7, 13, 14, 33, 41, tzinfo=SHANGHAI)
+
+    boundary = _floor_time(now, "15m")
+
+    assert boundary.astimezone(SHANGHAI) == datetime(2026, 7, 13, 14, 30, tzinfo=SHANGHAI)
+    assert _inclusive_end_date(boundary).isoformat() == "2026-07-13"
 
 
 def _fill(

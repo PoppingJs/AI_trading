@@ -187,9 +187,10 @@ class HistoricalReplayManager:
                 self._update(job.id, progress=28, stage="已读取最近一次本地行情缓存")
 
             if len(dataset.symbols) < MIN_USABLE_SYMBOLS:
+                reason_summary = _skipped_reason_summary(dataset.skipped)
                 raise ValueError(
                     f"可完整回放币种仅 {len(dataset.symbols)} 个，少于最低要求 {MIN_USABLE_SYMBOLS} 个；"
-                    "请缩短到币安仍保留 OI/多空比的最近日期"
+                    f"{reason_summary or '请缩短到币安仍保留 OI/多空比的最近日期'}"
                 )
             if job.cancel_requested:
                 self._finish_cancelled(job)
@@ -352,7 +353,13 @@ class HistoricalReplayManager:
             dataset = _dataset_from_payload(payload)
         except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
             return None
-        if dataset.start != start or dataset.end != end:
+        exact_match = dataset.start == start and dataset.end == end
+        current_day_cache_match = (
+            dataset.start == start
+            and dataset.end <= end
+            and _inclusive_end_date(dataset.end) == _inclusive_end_date(end) == datetime.now(SHANGHAI).date()
+        )
+        if not exact_match and not current_day_cache_match:
             return None
         return dataset
 
@@ -583,7 +590,10 @@ async def _download_symbol(
         )
 
     if include_derivatives:
-        derivative_start = start - timedelta(days=DERIVATIVE_WARMUP_DAYS)
+        derivative_start = max(
+            start - timedelta(days=DERIVATIVE_WARMUP_DAYS),
+            _floor_time(datetime.now(UTC) - timedelta(days=30), BASE_TIMEFRAME),
+        )
         funding = await _download_funding(client, symbol, derivative_start, end)
         for timeframe in ("15m", "1h", "4h"):
             derivatives[timeframe] = tuple(
@@ -1157,6 +1167,15 @@ def _symbol_data_problem(data: HistoricalSymbolData, start: datetime, end: datet
     return None
 
 
+def _skipped_reason_summary(rows: Iterable[dict[str, str]]) -> str:
+    counts: dict[str, int] = {}
+    for row in rows:
+        reason = str(row.get("reason") or "未知数据错误")
+        counts[reason] = counts.get(reason, 0) + 1
+    ranked = sorted(counts.items(), key=lambda item: (-item[1], item[0]))[:2]
+    return "；".join(f"{reason}（{count}个）" for reason, count in ranked)
+
+
 def _current_top50(rows: Iterable[FuturesSymbol]) -> list[str]:
     return [
         item.symbol.upper()
@@ -1178,11 +1197,22 @@ def _validated_range(start_value: str, end_value: str) -> tuple[datetime, dateti
     ).astimezone(UTC)
     if end > today_end:
         raise ValueError("结束日期不能晚于今天")
+    end = min(end, _floor_time(datetime.now(UTC), BASE_TIMEFRAME))
     if end <= start:
-        raise ValueError("结束日期必须晚于或等于开始日期")
+        raise ValueError("所选区间还没有已完成的15分钟K线")
     if end - start > timedelta(days=MAX_REPLAY_DAYS):
         raise ValueError(f"为保证 OI/多空比一致，单次历史回测最多 {MAX_REPLAY_DAYS} 天")
     return start, end
+
+
+def _floor_time(value: datetime, timeframe: str) -> datetime:
+    seconds = _TIMEFRAME_SECONDS[timeframe]
+    timestamp = int(value.astimezone(UTC).timestamp())
+    return datetime.fromtimestamp(timestamp - timestamp % seconds, UTC)
+
+
+def _inclusive_end_date(end: datetime):
+    return (end.astimezone(SHANGHAI) - timedelta(microseconds=1)).date()
 
 
 def _parse_date(value: str) -> datetime:
