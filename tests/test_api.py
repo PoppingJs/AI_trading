@@ -35,6 +35,8 @@ def test_new_backtest_page_keeps_only_realtime_and_historical_navigation(tmp_pat
         backtest = client.get("/backtest")
     assert realtime.status_code == backtest.status_code == 200
     assert 'href="/backtest"' in realtime.text
+    assert "\u8bc4\u5206\u4f4e\u4e8e85" in realtime.text
+    assert "\u8bc4\u5206\u4f4e\u4e8e82" not in realtime.text
     assert 'href="/review"' not in realtime.text
     assert "历史回测" in backtest.text
     assert "交易复盘" not in backtest.text

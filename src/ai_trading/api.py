@@ -995,7 +995,7 @@ PAPER_DASHBOARD_HTML = """
         return values ? `实际盈亏比${values[1]}R，低于最低${values[2]}R` : '实际盈亏比低于最低要求';
       }
       if (reason.startsWith('final score ')) {
-        return '评分低于82';
+        return '评分低于85';
       }
       if (reason === 'directional entry signal not established') {
         return '多空方向信号尚未成立';
@@ -1079,7 +1079,7 @@ PAPER_DASHBOARD_HTML = """
       ) return '下插针收回，等待反抽或重新跌回';
       if (vetoText[reason]) return vetoText[reason];
       if (reason === 'directional entry signal not established') return '多/空方向未成立';
-      if (reason.startsWith('final score ')) return '评分低于82';
+      if (reason.startsWith('final score ')) return '评分低于85';
       if (reason.startsWith('等待 ') || reason.startsWith('已进入建议区') || reason === '暂无有效建议入场区') {
         return reason;
       }
