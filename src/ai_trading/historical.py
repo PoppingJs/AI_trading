@@ -767,8 +767,45 @@ def analyze_replay_failures(
         },
         "failure_summary": summary,
         "failure_causes": ranked_causes,
+        "symbol_summaries": _symbol_analysis_summaries(lifecycles),
         "lifecycles": lifecycles,
     }
+
+
+def _symbol_analysis_summaries(
+    lifecycles: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    grouped: dict[str, list[dict[str, object]]] = {}
+    for lifecycle in lifecycles:
+        grouped.setdefault(str(lifecycle["symbol"]), []).append(lifecycle)
+
+    summaries: list[dict[str, object]] = []
+    for symbol, rows in grouped.items():
+        losers = [row for row in rows if float(row["pnl"]) < 0]
+        causes: dict[str, int] = {}
+        evidence: list[str] = []
+        for row in losers:
+            cause = str(row.get("failure_cause") or "未分类亏损")
+            causes[cause] = causes.get(cause, 0) + 1
+            detail = str(row.get("failure_evidence") or "").strip()
+            if detail and detail not in evidence:
+                evidence.append(detail)
+        summaries.append(
+            {
+                "symbol": symbol,
+                "trades": len(rows),
+                "wins": sum(float(row["pnl"]) > 0 for row in rows),
+                "losses": len(losers),
+                "pnl": sum(float(row["pnl"]) for row in rows),
+                "causes": [
+                    {"cause": cause, "count": count}
+                    for cause, count in sorted(causes.items(), key=lambda item: (-item[1], item[0]))
+                ],
+                "evidence": evidence[:3],
+            }
+        )
+    summaries.sort(key=lambda row: (float(row["pnl"]), str(row["symbol"])))
+    return summaries
 
 
 def _lifecycle_payload(
