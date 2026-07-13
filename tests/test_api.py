@@ -39,7 +39,14 @@ def test_new_backtest_page_keeps_only_realtime_and_historical_navigation(tmp_pat
     assert "历史回测" in backtest.text
     assert "交易复盘" not in backtest.text
     assert "开始回测时间" in backtest.text
-    assert "失败分析总结" in backtest.text
+    assert "分析总结" in backtest.text
+    assert "等待启动" not in backtest.text
+    assert "行情缓存" not in backtest.text
+    assert "<span>完成交易</span>" not in backtest.text
+    assert "后台固定使用实时交易同源配置" not in backtest.text
+    assert "按亏损贡献汇总" not in backtest.text
+    assert "grid-template-columns:460px minmax(0,1fr)" in backtest.text
+    assert "['资金','可用','占用保证金','已实现','未实现','手续费','胜率','最大回撤','总收益']" in backtest.text
     assert "本金" not in backtest.text
     assert "标的池" not in backtest.text
     assert "<label>周期</label>" not in backtest.text
