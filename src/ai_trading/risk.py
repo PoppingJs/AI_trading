@@ -21,6 +21,7 @@ class TradePlan:
     leverage: int
     risk_factor: float = 1.0
     is_addition: bool = False
+    requested_margin_usdt: float | None = None
 
 
 @dataclass(frozen=True)
@@ -109,6 +110,31 @@ class PortfolioRiskGate:
             return _portfolio_blocked("MAX_POSITIONS", "max open positions reached", open_risk)
 
         stop_pct = abs(plan.entry_price - plan.stop_price) / plan.entry_price
+        if plan.requested_margin_usdt is not None:
+            requested_margin = max(float(plan.requested_margin_usdt), 0.0)
+            remaining_margin = max(
+                account.equity * self.settings.total_margin_limit - account.used_margin,
+                0.0,
+            )
+            if requested_margin <= 0:
+                return _portfolio_blocked("INVALID_TRADE_PLAN", "requested margin must be positive", open_risk)
+            if requested_margin > remaining_margin + 1e-9:
+                return _portfolio_blocked("MARGIN_LIMIT", "portfolio margin limit reached", open_risk)
+            if requested_margin > account.available_balance + 1e-9:
+                return _portfolio_blocked("MARGIN_LIMIT", "available balance is below requested margin", open_risk)
+            notional = requested_margin * plan.leverage
+            planned_risk = notional * stop_pct
+            return PortfolioRiskDecision(
+                allowed=True,
+                quantity=notional / plan.entry_price,
+                notional=notional,
+                margin_required=requested_margin,
+                planned_risk_usdt=planned_risk,
+                risk_budget_usdt=planned_risk,
+                open_risk_before_usdt=open_risk,
+                open_risk_after_usdt=open_risk + planned_risk,
+            )
+
         configured_risk = account.equity * max(self.settings.risk_per_trade, 0.0) * max(plan.risk_factor, 0.0)
         remaining_open_risk = max(
             account.equity * max(self.settings.total_open_risk_limit, 0.0) - open_risk,
@@ -155,12 +181,6 @@ def current_open_risk_usdt(positions: Sequence[Position]) -> float:
         )
         total += loss_distance * position.quantity * max(position.remaining_fraction, 0.0)
     return total
-
-
-def risk_factor_for_quality(quality: str) -> float:
-    """Quality may reduce risk, but never raise it above the configured budget."""
-
-    return 1.0 if quality in {"S", "A"} else 0.5
 
 
 class RiskManager:

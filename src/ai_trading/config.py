@@ -7,7 +7,7 @@ from typing import Any
 
 @dataclass
 class StrategySettings:
-    score_threshold: int = 82
+    score_threshold: int = 85
     watch_threshold: int = 65
     strict_trend_entry: bool = False
     volume_window: int = 20
@@ -69,7 +69,7 @@ class RiskSettings:
     leverage_max: int = 10
     risk_per_trade: float = 0.01
     single_symbol_margin_limit: float = 0.10
-    total_margin_limit: float = 0.35
+    total_margin_limit: float = 0.95
     total_open_risk_limit: float = 0.04
     max_open_positions: int = 5
     daily_loss_limit: float = 0.02

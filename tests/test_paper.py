@@ -30,7 +30,6 @@ from ai_trading.paper import (
     _auto_signal_allowed,
     _candidate_prefilter_allowed,
     _confirmed_structure_exit_reason,
-    _daily_bias_margin_factor,
     _daily_pnl_payload,
     _entry_quality_grade,
     _distribution_short_stage,
@@ -42,6 +41,7 @@ from ai_trading.paper import (
     _entry_stop_error,
     _exit_plan_error,
     _four_hour_oi_valley,
+    _fixed_margin_for_quality,
     _high_distribution_handoff,
     _high_distribution_handoff_exit_reason,
     _leverage_for_signal,
@@ -445,7 +445,7 @@ def test_open_position_strategy_signal_only_shows_already_open_veto() -> None:
         "entry_timing_reason": "high area without pullback confirmation",
         "vetoes": (
             "high area without pullback confirmation; wait for 1h/4h pullback before long",
-            "final score 70 below auto-entry minimum 82",
+            "final score 70 below auto-entry minimum 85",
             "current entry position is not excellent",
         ),
     }
@@ -1198,7 +1198,7 @@ def test_pyramid_requires_profit_strong_trend_and_pullback_to_ema20() -> None:
     position.stop_price = 97.0
     position.metadata["initial_stop_distance"] = 3.0
     signal = {
-        "score": 88,
+        "score": 100,
         "trend_state": "ONE_WAY_UP",
         "risk_state": "NORMAL",
         "h1_pullback": {"direction": "LONG", "state": "HEALTHY_PULLBACK"},
@@ -1210,7 +1210,7 @@ def test_pyramid_requires_profit_strong_trend_and_pullback_to_ema20() -> None:
     assert not _pyramid_allowed(position, 101.0, signal, indicator)
     assert not _pyramid_allowed(position, 103.0, {**signal, "risk_state": "LONG_CROWD"}, indicator)
     assert not _pyramid_allowed(position, 106.0, signal, indicator)
-    assert not _pyramid_allowed(position, 103.0, {"score": 88, "trend_state": "ONE_WAY_UP", "risk_state": "NORMAL"}, indicator)
+    assert not _pyramid_allowed(position, 103.0, {"score": 99, "trend_state": "ONE_WAY_UP", "risk_state": "NORMAL"}, indicator)
 
 
 def test_pyramid_allows_resistance_grind_breakout_confirmation() -> None:
@@ -1219,7 +1219,7 @@ def test_pyramid_allows_resistance_grind_breakout_confirmation() -> None:
     position.stop_price = 97.0
     position.metadata["initial_stop_distance"] = 3.0
     signal = {
-        "score": 90,
+        "score": 100,
         "trend_state": "ONE_WAY_UP",
         "risk_state": "NORMAL",
         "h1_trigger": {"direction": "LONG", "state": "BREAKOUT"},
@@ -1642,7 +1642,9 @@ def test_auto_main_pool_uses_score_65_regardless_of_signal_action() -> None:
         (64, SignalAction.NO_TRADE.value),
         (65, SignalAction.WATCH.value),
         (81, SignalAction.WATCH.value),
-        (82, SignalAction.ENTRY_LONG.value),
+        (82, SignalAction.WATCH.value),
+        (84, SignalAction.WATCH.value),
+        (85, SignalAction.ENTRY_LONG.value),
     ],
 )
 def test_final_score_band_normalizes_signal_action(
@@ -1921,16 +1923,16 @@ def test_auto_signal_score_tiers_and_margins() -> None:
         "risk_state": "LONG_CROWD",
         "vetoes": ("long side overcrowded",),
     })
-    assert _auto_signal_allowed({**base_signal, "score": 82, "risk_state": "NORMAL"})
+    assert _auto_signal_allowed({**base_signal, "score": 85, "risk_state": "NORMAL"})
     assert not _auto_signal_allowed({**base_signal, "score": 78, "risk_state": "FUNDING_HOT"})
     assert not _auto_signal_allowed({**base_signal, "score": 81, "risk_state": "NORMAL"})
     assert not _auto_signal_allowed({**base_signal, "score": 74, "risk_state": "NORMAL"})
     assert not _auto_signal_allowed({**base_signal, "score": 90, "risk_state": "NORMAL", "vetoes": ("1h trigger opposes long entry",)})
     assert not _auto_signal_allowed({"score": 90, "risk_state": "NORMAL"})
 
-def test_entry_quality_drives_leverage_safety() -> None:
+def test_entry_quality_uses_only_a_and_s_score_bands() -> None:
     assert _entry_quality_grade(
-        score=96,
+        score=100,
         reward_r=1.6,
         stop_pct=0.025,
         setup_type=SETUP_H1_PULLBACK_LONG,
@@ -1952,14 +1954,33 @@ def test_entry_quality_drives_leverage_safety() -> None:
         reward_r=1.25,
         stop_pct=0.08,
         setup_type=SETUP_H1_PULLBACK_LONG,
-    ) == "B"
+    ) is None
 
     assert _leverage_for_entry_quality("S", stop_pct=0.03, leverage_max=10) == 10
     assert _leverage_for_entry_quality("A", stop_pct=0.04, leverage_max=10) == 10
     assert _leverage_for_entry_quality("A", stop_pct=0.05, leverage_max=10) == 7
-    assert _leverage_for_entry_quality("B", stop_pct=0.06, leverage_max=10) == 7
-    assert _leverage_for_entry_quality("B", stop_pct=0.08, leverage_max=10) == 5
-    assert _leverage_for_entry_quality("B", stop_pct=0.081, leverage_max=10) == 0
+    assert _leverage_for_entry_quality(None, stop_pct=0.06, leverage_max=10) == 0
+
+
+def test_s_quality_uses_only_the_one_remaining_capital_unit() -> None:
+    assert _fixed_margin_for_quality(
+        "A",
+        equity=1200.0,
+        used_margin=0.0,
+        available_balance=1200.0,
+    ) == pytest.approx(228.0)
+    assert _fixed_margin_for_quality(
+        "S",
+        equity=1200.0,
+        used_margin=0.0,
+        available_balance=1200.0,
+    ) == pytest.approx(456.0)
+    assert _fixed_margin_for_quality(
+        "S",
+        equity=1000.0,
+        used_margin=760.0,
+        available_balance=240.0,
+    ) == pytest.approx(190.0)
 
 def test_auto_entry_prerequisites_explain_score_direction_and_timing_blocks() -> None:
     wait_signal = {
@@ -1972,12 +1993,12 @@ def test_auto_entry_prerequisites_explain_score_direction_and_timing_blocks() ->
 
     blocks = _auto_entry_prerequisite_blocks(wait_signal)
 
-    assert "final score 81 below auto-entry minimum 82" in blocks
+    assert "final score 81 below auto-entry minimum 85" in blocks
     assert "等待 1H支撑回踩区" in blocks
     assert _auto_entry_prerequisite_blocks(
         wait_signal,
         include_entry_position=False,
-    ) == ("final score 81 below auto-entry minimum 82",)
+    ) == ("final score 81 below auto-entry minimum 85",)
     assert _auto_entry_prerequisite_blocks({"action": SignalAction.WATCH.value, "score": 90}) == (
         "directional entry signal not established",
     )
@@ -3876,7 +3897,7 @@ def test_auto_trade_uses_15m_only_for_short_squeeze_long() -> None:
     assert position.stop_price == 98.5
 
 
-def test_multi_timeframe_context_adjusts_score_veto_and_margin() -> None:
+def test_multi_timeframe_context_adjusts_score_and_veto() -> None:
     signal = {
         "action": "ENTRY_LONG",
         "score": 80,
@@ -3896,7 +3917,6 @@ def test_multi_timeframe_context_adjusts_score_veto_and_margin() -> None:
     assert adjusted["score"] == 64
     assert "1h trigger opposes long entry" in adjusted["vetoes"]
     assert "high area without pullback confirmation; wait for 1h/4h pullback before long" in adjusted["vetoes"]
-    assert _daily_bias_margin_factor("LONG", adjusted) == 0.5
 
 
 def test_large_timeframe_wick_rejections_use_close_ratio() -> None:
@@ -4023,7 +4043,7 @@ def test_high_score_without_core_entry_structure_is_capped_below_auto_entry() ->
 
     adjusted = _apply_multi_timeframe_context(signal, context)
 
-    assert adjusted["score"] == 81
+    assert adjusted["score"] == 84
     assert adjusted["action"] == SignalAction.WATCH.value
     assert adjusted["entry_levels"] == {}
     assert (
@@ -4657,7 +4677,7 @@ def test_preferred_exit_indicator_ignores_15m_stop_timeframe_for_short() -> None
 def test_rotation_candidate_requires_one_way_volatility_and_clean_risk() -> None:
     good = {
         "action": "ENTRY_LONG",
-        "score": 92,
+        "score": 100,
         "trend_state": "ONE_WAY_UP",
         "risk_state": "NORMAL",
         "price": 100.0,
@@ -4665,7 +4685,7 @@ def test_rotation_candidate_requires_one_way_volatility_and_clean_risk() -> None
     }
 
     assert _rotation_candidate_allowed(good, indicator_snapshot(close=100.0, atr=1.0, volume_ratio=1.5))
-    assert _rotation_candidate_allowed({**good, "score": 89}, indicator_snapshot())
+    assert not _rotation_candidate_allowed({**good, "score": 99}, indicator_snapshot())
     assert not _rotation_candidate_allowed({**good, "trend_state": "TREND_LONG"}, indicator_snapshot())
     assert not _rotation_candidate_allowed({**good, "risk_state": "LONG_CROWD"}, indicator_snapshot())
     assert not _rotation_candidate_allowed(good, indicator_snapshot(close=100.0, atr=0.5, volume_ratio=1.5))
@@ -4681,7 +4701,7 @@ def test_rotation_candidate_requires_one_way_volatility_and_clean_risk() -> None
 def test_auto_trade_caps_positions_and_prefers_highest_scores() -> None:
     engine = PaperTradingEngine(AppSettings(), starting_balance=1000, market_data=FakeMarketData())
     engine.latest_prices = {f"TEST{idx}USDT": 100.0 for idx in range(6)}
-    for idx, score in enumerate([81, 92, 82, 88, 83, 95]):
+    for idx, score in enumerate([84, 92, 85, 88, 86, 105]):
         engine.latest_signals[f"TEST{idx}USDT"] = {
             "action": "ENTRY_LONG",
             "score": score,
@@ -4695,11 +4715,10 @@ def test_auto_trade_caps_positions_and_prefers_highest_scores() -> None:
 
     asyncio.run(engine._auto_trade_once())
 
-    assert len(engine.account.positions) == 5
+    assert len(engine.account.positions) == 4
     assert "TEST0USDT" not in engine.account.positions
     assert set(engine.account.positions) == {
         "TEST1USDT",
-        "TEST2USDT",
         "TEST3USDT",
         "TEST4USDT",
         "TEST5USDT",
@@ -4708,11 +4727,13 @@ def test_auto_trade_caps_positions_and_prefers_highest_scores() -> None:
         float(position.metadata["margin_usdt"])
         for position in engine.account.positions.values()
     )
-    assert used_margin <= 1000 * engine.settings.risk.total_margin_limit
-    assert sum(
-        float(position.metadata["entry_context"]["planned_risk_usdt"])
+    assert used_margin == pytest.approx(950.0, rel=0.01)
+    assert float(engine.account.positions["TEST5USDT"].metadata["margin_usdt"]) == pytest.approx(380.0)
+    assert {
+        str(position.metadata["entry_context"]["entry_quality"])
         for position in engine.account.positions.values()
-    ) <= 1000 * engine.settings.risk.total_open_risk_limit
+    } <= {"A", "S"}
+    assert used_margin <= 1000 * engine.settings.risk.total_margin_limit
 
 
 def test_auto_trade_turns_near_structure_target_into_partial_runner_plan() -> None:
@@ -4890,7 +4911,7 @@ def test_auto_trade_pauses_altcoin_entries_when_btc_4h_is_extreme() -> None:
     assert "BTC 4h extreme volatility; pause new altcoin entries" in engine.latest_signals["TESTUSDT"]["vetoes"]
 
 
-def test_auto_trade_rotates_weak_position_for_much_stronger_candidate() -> None:
+def test_auto_trade_rotates_by_efficiency_instead_of_grade_hierarchy() -> None:
     engine = PaperTradingEngine(AppSettings(), starting_balance=1000, market_data=FakeMarketData())
     engine.latest_prices = {f"TEST{idx}USDT": 100.0 for idx in range(6)}
 
@@ -4906,15 +4927,15 @@ def test_auto_trade_rotates_weak_position_for_much_stronger_candidate() -> None:
         ))
         engine.account.positions[f"TEST{idx}USDT"].opened_at = datetime.now(UTC) - timedelta(hours=1)
         engine.latest_signals[f"TEST{idx}USDT"] = {
-            "score": 75 + idx,
-            "action": "ENTRY_SHORT" if idx == 0 else "WATCH",
-            "trend_state": "ONE_WAY_DOWN" if idx == 0 else "TREND_LONG",
+            "score": 105 if idx == 0 else 85 + idx,
+            "action": "WATCH",
+            "trend_state": "CHOP" if idx == 0 else "TREND_LONG",
             "risk_state": "NORMAL",
         }
         engine.latest_indicators[f"TEST{idx}USDT"] = [indicator_snapshot(close=100.0, atr=0.6, volume_ratio=1.0, oi_change=0.0)]
     engine.latest_signals["TEST5USDT"] = {
         "action": "ENTRY_LONG",
-        "score": 95,
+        "score": 100,
         "trend_state": "ONE_WAY_UP",
         "risk_state": "NORMAL",
         "price": 100.0,
@@ -4928,7 +4949,7 @@ def test_auto_trade_rotates_weak_position_for_much_stronger_candidate() -> None:
     assert "TEST0USDT" not in engine.account.positions
     assert "TEST5USDT" in engine.account.positions
     assert len(engine.account.positions) == 5
-    assert engine.account.fills[-2].reason == "rotation exit: trend invalidated; symbol=TEST5USDT score=95 current_score=75"
+    assert engine.account.fills[-2].reason == "rotation exit: efficiency rotation; symbol=TEST5USDT score=100 current_score=105"
 
 
 def test_auto_trade_does_not_rotate_for_ordinary_high_score_candidate() -> None:

@@ -7,7 +7,7 @@ timeframes:
   - 1d
 
 strategy:
-  score_threshold: 82
+  score_threshold: 85
   watch_threshold: 65
   strict_trend_entry: false
   volume_window: 20
@@ -62,7 +62,7 @@ risk:
   leverage_max: 10
   risk_per_trade: 0.01
   single_symbol_margin_limit: 0.10
-  total_margin_limit: 0.35
+  total_margin_limit: 0.95
   total_open_risk_limit: 0.04
   max_open_positions: 5
   daily_loss_limit: 0.02

@@ -35,16 +35,19 @@ notional = risk_amount / stop_distance_percent
 margin_required = notional / leverage
 ```
 
-Default risk settings:
+Automatic trading capital allocation:
 
-- Default leverage: `5x`.
-- Max leverage: `10x`.
-- Per-trade risk: `0.5%`.
-- Max single-symbol margin: `10%`.
-- Max total margin: `35%`.
-- Max open positions: `3`.
-- Daily loss limit: `2%`.
-- Consecutive loss cooldown: `3` losses.
+- Deployable margin: `95%` of current equity, split into five units.
+- `A` entry: score `85-99`, at most one unit.
+- `S` entry: score `100+`, at most two units; it uses one unit when only one remains.
+- Scores below `85` do not open automatically.
+- Default leverage: `5x`; maximum leverage: `10x`, further capped by stop distance.
+- Maximum open positions: `5`.
+- Account loss limits, drawdown circuit breaker and loss cooldown remain hard entry gates.
+
+The risk-per-trade sizing branch remains available only for legacy/manual
+`RiskManager` callers. Production automatic trading and historical replay use
+the fixed A/S capital-unit allocation above.
 
 ## Project Layout
 

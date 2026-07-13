@@ -44,7 +44,6 @@ from ai_trading.risk import (
     PortfolioRiskGate,
     TradePlan,
     current_open_risk_usdt,
-    risk_factor_for_quality,
 )
 
 
@@ -58,18 +57,18 @@ AUTO_MAIN_POOL_MIN_SCORE = 65
 AUTO_POOL_REBALANCE_TIMEFRAME = "15m"
 CANDIDATE_MIN_QUOTE_VOLUME = 50_000_000
 BTC_EXTREME_4H_AMPLITUDE = 0.08
-ROTATION_MIN_SCORE_GAP = 20
 ROTATION_MIN_ATR_PCT = 0.008
 ROTATION_MIN_VOLUME_RATIO = 1.2
-PYRAMID_MIN_SCORE = 85
 PYRAMID_MAX_ADDS = 1
 PAPER_DEFAULT_BALANCE = 1200.0
+CAPITAL_DEPLOYMENT_FRACTION = 0.95
+CAPITAL_UNIT_COUNT = 5
+ENTRY_QUALITY_A_MIN_SCORE = 85
+ENTRY_QUALITY_S_MIN_SCORE = 100
 ENTRY_ADVANTAGE_ZONE_FRACTION = 0.60
 H4_SHORT_ENTRY_ADVANTAGE_ZONE_FRACTION = 0.50
 ENTRY_QUALITY_S = "S"
 ENTRY_QUALITY_A = "A"
-ENTRY_QUALITY_B = "B"
-ENTRY_QUALITY_STOP_MAX_S = 0.025
 ENTRY_QUALITY_STOP_MAX_10X = 0.04
 ENTRY_QUALITY_STOP_MAX_7X = 0.065
 ENTRY_QUALITY_STOP_MAX_5X = 0.08
@@ -91,7 +90,7 @@ TREND_STAGE_NEUTRAL = "NEUTRAL"
 DISTRIBUTION_STAGE_RANGE = "HIGH_DISTRIBUTION_RANGE"
 DISTRIBUTION_STAGE_DESCENDING = "DESCENDING_DISTRIBUTION"
 DISTRIBUTION_STAGE_MARKDOWN = "MARKDOWN_ACCELERATION"
-AUTO_ENTRY_MIN_SCORE = 82
+AUTO_ENTRY_MIN_SCORE = ENTRY_QUALITY_A_MIN_SCORE
 CORE_STRUCTURE_SCORE_CAP = AUTO_ENTRY_MIN_SCORE - 1
 MIN_ENTRY_REWARD_R = 1.2
 FIRST_TAKE_PROFIT_R = 0.8
@@ -913,6 +912,9 @@ class PaperTradingEngine:
             take_profit_2 = take_profit_2 or _default_take_profit(side_enum, price, stop_loss, 2)
             normalized_entry_context = _normalize_entry_context(entry_context)
             if normalized_entry_context.get("risk_gate_status") == "ALLOWED":
+                requested_margin = normalized_entry_context.get(
+                    "requested_margin_usdt"
+                )
                 final_decision = self.portfolio_risk.evaluate(
                     TradePlan(
                         symbol=symbol,
@@ -927,6 +929,11 @@ class PaperTradingEngine:
                                 "entry_risk_factor",
                                 1.0,
                             )
+                        ),
+                        requested_margin_usdt=(
+                            float(requested_margin)
+                            if requested_margin is not None
+                            else None
                         ),
                     ),
                     self._account_risk_snapshot(self.status()),
@@ -2215,12 +2222,37 @@ class PaperTradingEngine:
                 continue
             candidates.append((symbol, signal))
         candidates.sort(key=lambda item: int(item[1].get("score") or 0), reverse=True)
-        if len(self.account.positions) >= max_positions:
+        status = self.status()
+        margin_capacity_full = (
+            _fixed_margin_for_quality(
+                ENTRY_QUALITY_A,
+                equity=float(status["equity"]),
+                used_margin=float(status["used_margin"]),
+                available_balance=float(status["available_balance"]),
+            )
+            <= 0
+        )
+        if len(self.account.positions) >= max_positions or margin_capacity_full:
             await self._rebalance_for_better_candidate(candidates)
         slots = max_positions - len(self.account.positions)
-        if slots <= 0:
+        status = self.status()
+        margin_capacity_full = (
+            _fixed_margin_for_quality(
+                ENTRY_QUALITY_A,
+                equity=float(status["equity"]),
+                used_margin=float(status["used_margin"]),
+                available_balance=float(status["available_balance"]),
+            )
+            <= 0
+        )
+        if slots <= 0 or margin_capacity_full:
+            capacity_reason = (
+                f"position capacity full: {max_positions} open positions"
+                if slots <= 0
+                else "capital unit capacity full: 95% allocation is deployed"
+            )
             for _, signal in candidates:
-                _record_auto_entry_block(signal, f"position capacity full: {max_positions} open positions")
+                _record_auto_entry_block(signal, capacity_reason)
             self._commit_auto_entry_signal_snapshot(
                 baseline_signals,
                 evaluated_signals,
@@ -2404,17 +2436,15 @@ class PaperTradingEngine:
                     signal["reasons"] = tuple(signal_reasons)
                 signal["exit_plan_status"] = "NORMAL"
                 stop_pct = _entry_stop_pct(entry_price, stop_loss)
-                quality_reward_r = (
-                    min(reward_r, structure_reward_r)
-                    if structure_reward_r is not None
-                    else min(reward_r, MIN_ENTRY_REWARD_R)
-                )
                 entry_quality = _entry_quality_grade(
                     score=score,
-                    reward_r=quality_reward_r,
-                    stop_pct=stop_pct,
-                    setup_type=str(signal.get("setup_type") or ""),
                 )
+                if entry_quality is None:
+                    _record_auto_entry_block(
+                        signal,
+                        f"final score {score} below auto-entry minimum {AUTO_ENTRY_MIN_SCORE}",
+                    )
+                    continue
                 leverage_cap = int(
                     signal.get("leverage_cap")
                     or self.settings.risk.leverage_max
@@ -2436,7 +2466,21 @@ class PaperTradingEngine:
                         "entry stop distance too wide for minimum 5x leverage safety",
                     )
                     continue
-                margin_factor = _daily_bias_margin_factor(side, signal)
+                status = self.status()
+                equity = float(status["equity"])
+                capital_unit_margin = _capital_unit_margin(equity)
+                margin = _fixed_margin_for_quality(
+                    entry_quality,
+                    equity=equity,
+                    used_margin=float(status["used_margin"]),
+                    available_balance=float(status["available_balance"]),
+                )
+                if margin <= 0:
+                    _record_auto_entry_block(
+                        signal,
+                        "capital unit capacity full: less than one 95% allocation unit remains",
+                    )
+                    continue
                 risk_decision = self.portfolio_risk.evaluate(
                     TradePlan(
                         symbol=symbol,
@@ -2446,10 +2490,7 @@ class PaperTradingEngine:
                         take_profit_1=take_profit_1,
                         take_profit_2=take_profit_2,
                         leverage=leverage,
-                        risk_factor=(
-                            risk_factor_for_quality(entry_quality)
-                            * margin_factor
-                        ),
+                        requested_margin_usdt=margin,
                     ),
                     self._account_risk_snapshot(status),
                 )
@@ -2462,14 +2503,7 @@ class PaperTradingEngine:
                         else risk_decision.blocked_code,
                     )
                     continue
-                margin = risk_decision.margin_required
                 planned_risk_usdt = risk_decision.planned_risk_usdt
-                if margin < 5:
-                    _record_auto_entry_block(
-                        signal,
-                        f"available entry margin {margin:.2f} USDT below minimum 5.00 USDT",
-                    )
-                    continue
                 entry_context = _entry_context_from_signal(signal)
                 entry_context["stop_basis"] = stop_basis
                 entry_context["stop_timeframe"] = entry_timeframe
@@ -2485,11 +2519,11 @@ class PaperTradingEngine:
                 entry_context["open_risk_after_usdt"] = risk_decision.open_risk_after_usdt
                 entry_context["risk_gate_status"] = "ALLOWED"
                 entry_context["entry_quality"] = entry_quality
-                entry_context["entry_risk_factor"] = (
-                    risk_factor_for_quality(entry_quality) * margin_factor
-                )
+                entry_context["entry_risk_factor"] = 1.0
                 entry_context["entry_stop_pct"] = stop_pct
-                entry_context["entry_margin_factor"] = margin_factor
+                entry_context["requested_margin_usdt"] = margin
+                entry_context["capital_unit_margin"] = capital_unit_margin
+                entry_context["capital_units"] = margin / capital_unit_margin
                 await self.open_position(
                     symbol,
                     side,
@@ -2530,11 +2564,16 @@ class PaperTradingEngine:
     async def _rebalance_for_better_candidate(self, candidates: list[tuple[str, dict[str, object]]]) -> None:
         if not candidates or not self.account.positions:
             return
-        best_symbol, best_signal = candidates[0]
-        best_indicators = self.latest_indicators.get(best_symbol, [])
-        best_indicator = best_indicators[-1] if best_indicators else None
-        if not _rotation_candidate_allowed(best_signal, best_indicator):
+        selected: tuple[str, dict[str, object], IndicatorSnapshot] | None = None
+        for symbol, signal in candidates:
+            indicators = self.latest_indicators.get(symbol, [])
+            indicator = indicators[-1] if indicators else None
+            if indicator is not None and _rotation_candidate_allowed(signal, indicator):
+                selected = (symbol, signal, indicator)
+                break
+        if selected is None:
             return
+        best_symbol, best_signal, best_indicator = selected
         replace_target = self._rotation_replace_target(best_signal, best_indicator)
         if replace_target is None:
             return
@@ -2565,7 +2604,7 @@ class PaperTradingEngine:
         candidate_indicator: IndicatorSnapshot | None,
     ) -> tuple[Position, int, str] | None:
         best_target: tuple[Position, int, str] | None = None
-        candidate_score = int(candidate_signal.get("score") or 0)
+        worst_progress_r: float | None = None
         candidate_is_strong = _rotation_candidate_strong(candidate_signal)
         for symbol, position in self.account.positions.items():
             signal = self.latest_signals.get(symbol, {})
@@ -2573,17 +2612,9 @@ class PaperTradingEngine:
             price = self.latest_prices.get(symbol)
             current_indicators = self.latest_indicators.get(symbol, [])
             current_indicator = current_indicators[-1] if current_indicators else None
-            if candidate_score - current_score < ROTATION_MIN_SCORE_GAP:
-                continue
-            trend_failed = (
-                _confirmed_structure_exit_reason(position, price, signal)
-                is not None
-                or _position_has_explicit_opposite_trend(position, signal)
-            )
             efficiency_stalled = (
                 candidate_is_strong
                 and price is not None
-                and _position_reached_initial_r(position, price)
                 and _position_h4_allows_efficiency_rotation(position, signal)
                 and _position_efficiency_stalled(
                     position,
@@ -2593,14 +2624,23 @@ class PaperTradingEngine:
                     now=self._now(),
                 )
             )
-            if not trend_failed and not efficiency_stalled:
+            if not efficiency_stalled:
                 continue
             if not _rotation_efficiency_better(candidate_indicator, current_indicator):
                 continue
-            rotation_type = "trend invalidated" if trend_failed else "efficiency rotation"
-            target = (position, current_score, rotation_type)
-            if best_target is None or current_score < best_target[1]:
+            stop_distance = float(
+                position.metadata.get("initial_stop_distance")
+                or abs(position.entry_price - position.stop_price)
+            )
+            progress_r = (
+                _position_current_profit_distance(position, price) / stop_distance
+                if stop_distance > 0
+                else 0.0
+            )
+            target = (position, current_score, "efficiency rotation")
+            if worst_progress_r is None or progress_r < worst_progress_r:
                 best_target = target
+                worst_progress_r = progress_r
         return best_target
 
     async def _btc_4h_extreme_volatility(self) -> bool:
@@ -2813,8 +2853,14 @@ class PaperTradingEngine:
 
     def _add_to_strong_positions(self) -> None:
         status = self.status()
-        available = float(status["available_balance"])
-        if available < 20:
+        capital_unit_margin = _capital_unit_margin(float(status["equity"]))
+        add_margin = _fixed_margin_for_quality(
+            ENTRY_QUALITY_A,
+            equity=float(status["equity"]),
+            used_margin=float(status["used_margin"]),
+            available_balance=float(status["available_balance"]),
+        )
+        if capital_unit_margin <= 0 or add_margin <= 0:
             return
         ranked = sorted(
             self.account.positions.values(),
@@ -2829,6 +2875,8 @@ class PaperTradingEngine:
             if price is None or indicator is None or not _pyramid_allowed(position, price, signal, indicator):
                 continue
             current_margin = float(position.metadata.get("margin_usdt", 0.0))
+            if current_margin + add_margin > capital_unit_margin * 2 + 1e-9:
+                continue
             leverage = int(position.metadata.get("leverage", self.settings.risk.leverage_default))
             trend_state = str(signal.get("trend_state") or "CHOP")
             candidate_stop, candidate_tp1, candidate_tp2 = _adaptive_exits(
@@ -2862,20 +2910,13 @@ class PaperTradingEngine:
                     take_profit_1=final_tp1,
                     take_profit_2=final_tp2,
                     leverage=leverage,
-                    risk_factor=risk_factor_for_quality(
-                        str(position.metadata.get("entry_context", {}).get("entry_quality", "A"))
-                        if isinstance(position.metadata.get("entry_context"), dict)
-                        else "A"
-                    ),
                     is_addition=True,
+                    requested_margin_usdt=add_margin,
                 ),
                 self._account_risk_snapshot(status),
             )
             self._remember_risk_decision(signal, decision)
             if not decision.allowed:
-                continue
-            add_margin = decision.margin_required
-            if add_margin < 20:
                 continue
             fill_price = self._execution_price(
                 price,
@@ -2895,7 +2936,14 @@ class PaperTradingEngine:
             position.stop_price = final_stop
             position.take_profit_1 = final_tp1
             position.take_profit_2 = final_tp2
-            position.metadata["planned_risk_usdt"] = decision.open_risk_after_usdt
+            position.metadata["planned_risk_usdt"] = decision.planned_risk_usdt
+            entry_context = position.metadata.get("entry_context")
+            if isinstance(entry_context, dict):
+                entry_context["entry_quality"] = ENTRY_QUALITY_S
+                entry_context["capital_unit_margin"] = capital_unit_margin
+                entry_context["capital_units"] = (
+                    float(position.metadata["margin_usdt"]) / capital_unit_margin
+                )
             self.account.fills.append(
                 PaperFill(
                     timestamp=self._now(),
@@ -4141,7 +4189,7 @@ def _pyramid_allowed(
         return False
     if int(position.metadata.get("adds", 0)) >= PYRAMID_MAX_ADDS:
         return False
-    if int(signal.get("score") or 0) < PYRAMID_MIN_SCORE:
+    if int(signal.get("score") or 0) < ENTRY_QUALITY_S_MIN_SCORE:
         return False
     if str(signal.get("risk_state") or "NORMAL") != "NORMAL":
         return False
@@ -4698,6 +4746,7 @@ _TRANSIENT_AUTO_ENTRY_BLOCK_PREFIXES = (
     "symbol excluded from automatic universe",
     "auto strategy disabled",
     "position capacity full",
+    "capital unit capacity full",
     "available entry margin ",
     "15m tactical entry lacks ",
     "invalid entry stop",
@@ -4719,6 +4768,7 @@ _TRANSIENT_AUTO_ENTRY_BLOCK_PREFIXES = (
 
 _AUTO_ENTRY_EVALUATION_RESULT_PREFIXES = (
     "position capacity full",
+    "capital unit capacity full",
     "available entry margin ",
     "15m tactical entry lacks ",
     "invalid entry stop",
@@ -4810,6 +4860,8 @@ def _assert_valid_exit_plan(
 
 
 def _rotation_candidate_allowed(signal: dict[str, object], indicator: IndicatorSnapshot | None) -> bool:
+    if int(signal.get("score") or 0) < ENTRY_QUALITY_S_MIN_SCORE:
+        return False
     if str(signal.get("risk_state") or "NORMAL") != "NORMAL":
         return False
     if _trend_stage_from_signal(signal, indicator) == TREND_STAGE_LATE:
@@ -5745,7 +5797,7 @@ def _rotation_candidate_strong(signal: dict[str, object]) -> bool:
     return (
         action in {SignalAction.ENTRY_LONG.value, SignalAction.ENTRY_SHORT.value}
         and trend in {"ONE_WAY_UP", "ONE_WAY_DOWN"}
-        and int(signal.get("score") or 0) >= 95
+        and int(signal.get("score") or 0) >= ENTRY_QUALITY_S_MIN_SCORE
         and risk_state == "NORMAL"
         and entry_timing == ENTRY_TIMING_GOOD
         and not signal.get("vetoes")
@@ -5756,16 +5808,15 @@ def _position_h4_allows_efficiency_rotation(position: Position, signal: dict[str
     h4 = signal.get("h4_structure") if isinstance(signal.get("h4_structure"), dict) else {}
     h4_state = str(h4.get("state") or "UNKNOWN")
     trend = str(signal.get("trend_state") or signal.get("regime") or "CHOP")
-    score = int(signal.get("score") or 0)
     if position.side == PositionSide.LONG:
         if h4_state == "BREAKOUT_UP" or trend == "ONE_WAY_UP":
             return False
-        if trend == "TREND_LONG" and score >= 75 and h4_state in {"BOX_UPPER_HALF", "BOX_LOWER_HALF"}:
+        if trend == "TREND_LONG" and h4_state in {"BOX_UPPER_HALF", "BOX_LOWER_HALF"}:
             return False
         return h4_state in {"UNKNOWN", "BREAKDOWN_DOWN", "RANGE_MID"} or trend not in {"TREND_LONG", "ONE_WAY_UP"}
     if h4_state == "BREAKDOWN_DOWN" or trend == "ONE_WAY_DOWN":
         return False
-    if trend == "TREND_SHORT" and score >= 75 and h4_state in {"BOX_UPPER_HALF", "BOX_LOWER_HALF"}:
+    if trend == "TREND_SHORT" and h4_state in {"BOX_UPPER_HALF", "BOX_LOWER_HALF"}:
         return False
     return h4_state in {"UNKNOWN", "BREAKOUT_UP", "RANGE_MID"} or trend not in {"TREND_SHORT", "ONE_WAY_DOWN"}
 
@@ -5792,15 +5843,14 @@ def _position_efficiency_stalled(
     if current_profit >= stop_distance * 0.8:
         return False
     trend = str(signal.get("trend_state") or signal.get("regime") or "CHOP")
-    score = int(signal.get("score") or 0)
     risk_state = str(signal.get("risk_state") or "NORMAL")
-    if trend in {"ONE_WAY_UP", "ONE_WAY_DOWN"} and score >= 95 and risk_state == "NORMAL":
+    if trend in {"ONE_WAY_UP", "ONE_WAY_DOWN"} and risk_state == "NORMAL":
         return False
     if indicator is None:
         return True
     weak_volume = (indicator.volume_ratio or 0.0) < 1.05
     weak_oi = (indicator.oi_change or 0.0) <= 0.0
-    return trend not in {"ONE_WAY_UP", "ONE_WAY_DOWN"} or score < 85 or weak_volume or weak_oi
+    return trend not in {"ONE_WAY_UP", "ONE_WAY_DOWN"} or weak_volume or weak_oi
 
 
 def _rotation_efficiency_better(candidate: IndicatorSnapshot | None, current: IndicatorSnapshot | None) -> bool:
@@ -7729,16 +7779,6 @@ def _precision_stop_allowed(
     )
 
 
-def _daily_bias_margin_factor(side: str, signal: dict[str, object]) -> float:
-    daily_bias = str(signal.get("daily_bias") or "NEUTRAL")
-    factor = float(signal.get("margin_factor") or 1.0)
-    if side == "LONG" and daily_bias == "BEAR":
-        factor = min(factor, 0.5)
-    if side == "SHORT" and daily_bias == "BULL":
-        factor = min(factor, 0.5)
-    return factor
-
-
 def _preferred_exit_indicator(
     timeframe_indicators: dict[str, list[IndicatorSnapshot]],
     fallback: list[IndicatorSnapshot],
@@ -8233,26 +8273,61 @@ def _entry_stop_pct(entry_price: float, stop_price: float) -> float:
 def _entry_quality_grade(
     *,
     score: int,
-    reward_r: float,
-    stop_pct: float,
-    setup_type: str,
-) -> str:
-    setup_is_core = bool(setup_type) and setup_type != SETUP_DISTRIBUTION_STAGE1_SHORT
-    if (
-        setup_is_core
-        and score >= 95
-        and reward_r >= 1.5
-        and stop_pct <= ENTRY_QUALITY_STOP_MAX_S
-    ):
+    reward_r: float | None = None,
+    stop_pct: float | None = None,
+    setup_type: str = "",
+) -> str | None:
+    """Classify deployable capital only; entry-plan checks stay independent."""
+
+    del reward_r, stop_pct, setup_type
+    if score >= ENTRY_QUALITY_S_MIN_SCORE:
         return ENTRY_QUALITY_S
-    if (
-        setup_is_core
-        and score >= 88
-        and reward_r >= MIN_ENTRY_REWARD_R
-        and stop_pct <= ENTRY_QUALITY_STOP_MAX_10X
-    ):
+    if score >= ENTRY_QUALITY_A_MIN_SCORE:
         return ENTRY_QUALITY_A
-    return ENTRY_QUALITY_B
+    return None
+
+
+def _capital_unit_margin(equity: float) -> float:
+    return max(float(equity), 0.0) * CAPITAL_DEPLOYMENT_FRACTION / CAPITAL_UNIT_COUNT
+
+
+def _capital_units_for_quality(quality: str | None) -> int:
+    if quality == ENTRY_QUALITY_S:
+        return 2
+    if quality == ENTRY_QUALITY_A:
+        return 1
+    return 0
+
+
+def _fixed_margin_for_quality(
+    quality: str | None,
+    *,
+    equity: float,
+    used_margin: float,
+    available_balance: float,
+) -> float:
+    """Return one or two capital units without creating tiny positions.
+
+    Entry fees reduce equity between consecutive opens.  Allow the final unit to
+    absorb that small fee drift, otherwise a five-unit allocation would stop at
+    four units even though the configured 95% margin target still has room.
+    """
+
+    unit = _capital_unit_margin(equity)
+    max_units = _capital_units_for_quality(quality)
+    if unit <= 0 or max_units <= 0:
+        return 0.0
+    remaining_target = max(
+        equity * CAPITAL_DEPLOYMENT_FRACTION - used_margin,
+        0.0,
+    )
+    spendable = min(remaining_target, max(available_balance, 0.0))
+    if spendable < unit * 0.9:
+        return 0.0
+    whole_units = min(max_units, int((spendable + unit * 0.1) // unit))
+    if whole_units <= 0:
+        return 0.0
+    return min(unit * whole_units, spendable)
 
 
 def _max_safe_leverage_for_stop(
@@ -8271,7 +8346,7 @@ def _max_safe_leverage_for_stop(
 
 
 def _leverage_for_entry_quality(
-    quality: str,
+    quality: str | None,
     *,
     stop_pct: float,
     leverage_max: int,
@@ -8283,9 +8358,9 @@ def _leverage_for_entry_quality(
     safe_leverage = _max_safe_leverage_for_stop(stop_pct, capped_max)
     if safe_leverage <= 0:
         return 0
-    if quality in {ENTRY_QUALITY_S, ENTRY_QUALITY_A}:
-        return min(10, safe_leverage)
-    return safe_leverage
+    if quality not in {ENTRY_QUALITY_S, ENTRY_QUALITY_A}:
+        return 0
+    return min(10, safe_leverage)
 
 
 def _default_stop(side: PositionSide, price: float, leverage: int) -> float:
