@@ -53,7 +53,7 @@ config/strategy.yaml        Strategy, risk, and execution defaults
 src/ai_trading/indicators.py EMA/MA/BOLL/RSI/ATR/VOL calculations
 src/ai_trading/strategy.py   Composite scoring and hard vetoes
 src/ai_trading/risk.py       Position sizing, stop loss, take profit planning
-src/ai_trading/backtest.py   Production-parity replay and frozen legacy baseline
+src/ai_trading/historical.py Current-Top50 production-state-machine historical replay
 src/ai_trading/binance.py    Read-only Binance USDT-M market discovery
 src/ai_trading/universe.py   Top20 + data quality filtering
 src/ai_trading/api.py        FastAPI service skeleton
@@ -68,29 +68,22 @@ python -m venv .venv
 python -m pip install -e ".[dev]"
 ```
 
-## Run Demo CLI
+## Run Demo Signal CLI
 
 ```bash
 ai-trading --demo
 ```
 
-The default backtest replays the same multi-timeframe paper-trading decision
-path on a point-in-time clock. Signals can fill no earlier than the next market
-event, OHLC ambiguity is adverse-first, and portfolio runs share one account.
-Use `--legacy-backtest` only to compare against the frozen single-timeframe
-research baseline.
+This runs the strategy on synthetic 15m-style data and prints the latest signal.
 
-This runs the strategy on synthetic 15m-style data and prints the latest signal
-plus a basic backtest summary.
-
-## Run CSV Backtest
+## Inspect a CSV Signal
 
 ```bash
-ai-trading --symbol BTCUSDT --candles-csv data/BTCUSDT-15m.csv --derivatives-csv data/BTCUSDT-derivatives-15m.csv --equity 10000
+ai-trading --symbol BTCUSDT --candles-csv data/BTCUSDT-15m.csv --derivatives-csv data/BTCUSDT-derivatives-15m.csv
 ```
 
-The CLI prints final equity, return, max drawdown, win rate, and the latest
-closed trades.
+The CLI prints the latest signal. Historical replay is intentionally exposed
+only through the dashboard so it always uses the live system defaults.
 
 ## Run API
 
@@ -110,11 +103,9 @@ Endpoints:
 - `GET /api/config`
 - `GET /api/markets/top20`
 - `GET /api/signals/demo`
-- `POST /api/backtests/run`
 - `POST /api/backtests/jobs`
 - `GET /api/backtests/jobs/{job_id}`
 - `POST /api/backtests/jobs/{job_id}/cancel`
-- `GET /api/review/summary`
 
 OpenAPI docs are available at:
 
@@ -128,13 +119,18 @@ The paper trading dashboard is available at:
 http://127.0.0.1:8000/
 ```
 
-The same top navigation opens the production-parity historical replay and the
-read-only trade-lifecycle review pages:
+The same top navigation opens the production-parity historical replay:
 
 ```text
 http://127.0.0.1:8000/backtest
-http://127.0.0.1:8000/review
 ```
+
+The replay fixes the current eligible Top50 at the first run, downloads Binance
+K-lines/OI/long-short ratio/funding history, and drives the same
+`PaperTradingEngine` used by real-time paper trading. Only the most recent
+successful market dataset is cached; rerunning the same dates reuses market data
+but executes the current strategy code again. Historical Top50 rankings are not
+available, so reports explicitly disclose current-universe survivorship bias.
 
 It starts with a local 1200 USDT paper account. You can:
 

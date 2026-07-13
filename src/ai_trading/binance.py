@@ -136,24 +136,70 @@ class BinanceFuturesMarketData:
             for row in rows
         ]
 
-    async def open_interest_history(self, symbol: str, period: str = "15m", *, limit: int = 500) -> dict[datetime, float]:
+    async def open_interest_history(
+        self,
+        symbol: str,
+        period: str = "15m",
+        *,
+        limit: int = 500,
+        start_time_ms: int | None = None,
+        end_time_ms: int | None = None,
+    ) -> dict[datetime, float]:
+        params: dict[str, object] = {
+            "symbol": symbol.upper(),
+            "period": period,
+            "limit": limit,
+        }
+        if start_time_ms is not None:
+            params["startTime"] = start_time_ms
+        if end_time_ms is not None:
+            params["endTime"] = end_time_ms
         rows = await self._get_json(
             "/futures/data/openInterestHist",
-            params={"symbol": symbol.upper(), "period": period, "limit": limit},
+            params=params,
         )
         return {_from_ms(row["timestamp"]): float(row["sumOpenInterest"]) for row in rows}
 
-    async def global_long_short_ratio(self, symbol: str, period: str = "15m", *, limit: int = 500) -> dict[datetime, float]:
+    async def global_long_short_ratio(
+        self,
+        symbol: str,
+        period: str = "15m",
+        *,
+        limit: int = 500,
+        start_time_ms: int | None = None,
+        end_time_ms: int | None = None,
+    ) -> dict[datetime, float]:
+        params: dict[str, object] = {
+            "symbol": symbol.upper(),
+            "period": period,
+            "limit": limit,
+        }
+        if start_time_ms is not None:
+            params["startTime"] = start_time_ms
+        if end_time_ms is not None:
+            params["endTime"] = end_time_ms
         rows = await self._get_json(
             "/futures/data/globalLongShortAccountRatio",
-            params={"symbol": symbol.upper(), "period": period, "limit": limit},
+            params=params,
         )
         return {_from_ms(row["timestamp"]): float(row["longShortRatio"]) for row in rows}
 
-    async def funding_rates(self, symbol: str, *, limit: int = 100) -> dict[datetime, float]:
+    async def funding_rates(
+        self,
+        symbol: str,
+        *,
+        limit: int = 100,
+        start_time_ms: int | None = None,
+        end_time_ms: int | None = None,
+    ) -> dict[datetime, float]:
+        params: dict[str, object] = {"symbol": symbol.upper(), "limit": limit}
+        if start_time_ms is not None:
+            params["startTime"] = start_time_ms
+        if end_time_ms is not None:
+            params["endTime"] = end_time_ms
         rows = await self._get_json(
             "/fapi/v1/fundingRate",
-            params={"symbol": symbol.upper(), "limit": limit},
+            params=params,
         )
         return {_from_ms(row["fundingTime"]): float(row["fundingRate"]) for row in rows}
 

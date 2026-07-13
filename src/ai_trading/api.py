@@ -5,41 +5,27 @@ from contextlib import asynccontextmanager
 from dataclasses import asdict
 import os
 from pathlib import Path
+from typing import Callable
 
 import uvicorn
 from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 
-from ai_trading.analytics import analyze_trade_lifecycles
-from ai_trading.backtest import BacktestEngine
-from ai_trading.backtest_jobs import BacktestJobManager
 from ai_trading.binance import BinanceFuturesMarketData
 from ai_trading.cli import _synthetic_market
 from ai_trading.config import AppSettings, load_settings
+from ai_trading.historical import HistoricalReplayManager
 from ai_trading.indicators import build_indicators
 from ai_trading.models import SignalAction
 from ai_trading.paper import PAPER_DEFAULT_BALANCE, PaperTradingEngine
 from ai_trading.strategy import CompositeStrategy
-from ai_trading.web_pages import backtest_page, review_page
-
-
-class BacktestRequest(BaseModel):
-    symbol: str = "DEMOUSDT"
-    starting_equity: float = Field(default=10_000.0, gt=0)
-    use_demo_data: bool = True
-    mode: str = Field(default="production", pattern="^(production|legacy)$")
+from ai_trading.web_pages import backtest_page
 
 
 class BacktestJobRequest(BaseModel):
-    data_source: str = Field(default="demo", pattern="^(demo|binance|local)$")
-    dataset: str = ""
-    symbol: str = Field(default="DEMOUSDT", min_length=3, max_length=24)
-    start_date: str = ""
-    end_date: str = ""
-    starting_equity: float = Field(default=10_000.0, gt=0)
-    mode: str = Field(default="production", pattern="^(production|legacy)$")
-    base_timeframe: str = Field(default="15m", pattern="^(15m|1h)$")
+    start_date: str = Field(min_length=10, max_length=10)
+    end_date: str = Field(min_length=10, max_length=10)
 
 
 class PaperStartRequest(BaseModel):
@@ -65,7 +51,13 @@ class PaperCloseRequest(BaseModel):
     symbol: str = "BTCUSDT"
 
 
-def create_app(settings_path: str | Path = "config/strategy.yaml", state_path: str | Path | None = None) -> FastAPI:
+def create_app(
+    settings_path: str | Path = "config/strategy.yaml",
+    state_path: str | Path | None = None,
+    *,
+    historical_cache_root: str | Path = "data/historical_cache",
+    historical_market_data_factory: Callable[[], BinanceFuturesMarketData] | None = None,
+) -> FastAPI:
     settings = load_settings(settings_path)
 
     @asynccontextmanager
@@ -75,7 +67,7 @@ def create_app(settings_path: str | Path = "config/strategy.yaml", state_path: s
             yield
         finally:
             await app.state.paper_engine.close()
-            app.state.backtest_jobs.close()
+            app.state.historical_replays.close()
 
     app = FastAPI(
         title="AI Trading Strategy API",
@@ -90,7 +82,11 @@ def create_app(settings_path: str | Path = "config/strategy.yaml", state_path: s
         starting_balance=PAPER_DEFAULT_BALANCE,
         state_path=resolved_state_path,
     )
-    app.state.backtest_jobs = BacktestJobManager(settings)
+    app.state.historical_replays = HistoricalReplayManager(
+        settings,
+        cache_root=historical_cache_root,
+        market_data_factory=historical_market_data_factory or BinanceFuturesMarketData,
+    )
 
     @app.get("/", response_class=HTMLResponse)
     def paper_dashboard() -> str:
@@ -99,10 +95,6 @@ def create_app(settings_path: str | Path = "config/strategy.yaml", state_path: s
     @app.get("/backtest", response_class=HTMLResponse)
     def backtest_dashboard() -> str:
         return backtest_page()
-
-    @app.get("/review", response_class=HTMLResponse)
-    def review_dashboard() -> str:
-        return review_page()
 
     @app.get("/api/health")
     def health() -> dict[str, object]:
@@ -139,75 +131,27 @@ def create_app(settings_path: str | Path = "config/strategy.yaml", state_path: s
         signal = CompositeStrategy(settings.strategy).generate_signal("DEMOUSDT", candles, indicators)
         return _signal_payload(signal)
 
-    @app.post("/api/backtests/run", dependencies=[Depends(_require_api_token)])
-    def run_backtest(request: BacktestRequest) -> dict[str, object]:
-        if not request.use_demo_data:
-            raise HTTPException(
-                status_code=400,
-                detail="Only demo data is wired in this MVP. Add a data adapter before using live historical data.",
-            )
-        candles, derivatives = _synthetic_market()
-        result = BacktestEngine(
-            symbol=request.symbol,
-            starting_equity=request.starting_equity,
-            strategy_settings=settings.strategy,
-            risk_settings=settings.risk,
-            execution_settings=settings.execution,
-            mode=request.mode,
-        ).run(candles, derivatives)
-        return {
-            "symbol": request.symbol,
-            "starting_equity": result.starting_equity,
-            "ending_equity": result.ending_equity,
-            "total_return": result.total_return,
-            "max_drawdown": result.max_drawdown,
-            "win_rate": result.win_rate,
-            "trade_count": len(result.trades),
-            "trades": [asdict(trade) for trade in result.trades],
-            "notes": result.notes,
-            "mode": request.mode,
-        }
-
-    @app.get("/api/backtests/datasets", dependencies=[Depends(_require_api_token)])
-    def backtest_datasets() -> dict[str, object]:
-        return {"datasets": app.state.backtest_jobs.datasets()}
-
-    @app.get("/api/backtests/jobs", dependencies=[Depends(_require_api_token)])
-    def list_backtest_jobs(limit: int = 20) -> dict[str, object]:
-        bounded_limit = max(1, min(limit, 100))
-        return {
-            "jobs": [
-                job.payload(include_result=False)
-                for job in app.state.backtest_jobs.list(bounded_limit)
-            ]
-        }
-
     @app.post("/api/backtests/jobs", dependencies=[Depends(_require_api_token)])
     def create_backtest_job(request: BacktestJobRequest) -> dict[str, object]:
-        job = app.state.backtest_jobs.submit(request.model_dump())
+        try:
+            job = app.state.historical_replays.submit(request.model_dump())
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
         return job.payload(include_result=False)
 
     @app.get("/api/backtests/jobs/{job_id}", dependencies=[Depends(_require_api_token)])
     def get_backtest_job(job_id: str, include_result: bool = True) -> dict[str, object]:
-        job = app.state.backtest_jobs.get(job_id)
+        job = app.state.historical_replays.get(job_id)
         if job is None:
             raise HTTPException(status_code=404, detail="backtest job not found")
         return job.payload(include_result=include_result)
 
     @app.post("/api/backtests/jobs/{job_id}/cancel", dependencies=[Depends(_require_api_token)])
     def cancel_backtest_job(job_id: str) -> dict[str, object]:
-        job = app.state.backtest_jobs.cancel(job_id)
+        job = app.state.historical_replays.cancel(job_id)
         if job is None:
             raise HTTPException(status_code=404, detail="backtest job not found")
         return job.payload(include_result=False)
-
-    @app.get("/api/review/summary", dependencies=[Depends(_require_api_token)])
-    def review_summary() -> dict[str, object]:
-        account = app.state.paper_engine.account
-        return analyze_trade_lifecycles(
-            account.fills,
-            starting_equity=account.starting_balance,
-        )
 
     @app.get("/api/paper/status")
     async def paper_status() -> dict[str, object]:
@@ -530,7 +474,6 @@ PAPER_DASHBOARD_HTML = """
   <nav class="top-nav" aria-label="主要功能">
     <a class="active" href="/">实时交易</a>
     <a href="/backtest">历史回测</a>
-    <a href="/review">交易复盘</a>
   </nav>
   <div class="error-ticker" id="errorTicker" aria-live="polite">
     <span class="error-ticker-text" id="errorTickerText"></span>

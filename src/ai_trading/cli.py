@@ -4,7 +4,6 @@ import argparse
 import math
 from datetime import UTC, datetime, timedelta
 
-from ai_trading.backtest import BacktestEngine
 from ai_trading.config import load_settings
 from ai_trading.data import load_candles_csv, load_derivatives_csv
 from ai_trading.indicators import build_indicators
@@ -15,35 +14,31 @@ from ai_trading.strategy import CompositeStrategy
 def main() -> None:
     parser = argparse.ArgumentParser(description="AI trading strategy research CLI")
     parser.add_argument("--config", default="config/strategy.yaml", help="Path to strategy YAML")
-    parser.add_argument("--demo", action="store_true", help="Run synthetic demo backtest")
+    parser.add_argument("--demo", action="store_true", help="Generate one synthetic strategy signal")
     parser.add_argument("--symbol", default="DEMOUSDT", help="Symbol name for reports")
     parser.add_argument("--candles-csv", help="CSV with timestamp,open,high,low,close,volume")
     parser.add_argument("--derivatives-csv", help="CSV with timestamp,open_interest,long_short_ratio,funding_rate")
-    parser.add_argument("--equity", type=float, default=10_000.0, help="Starting equity")
-    parser.add_argument(
-        "--legacy-backtest",
-        action="store_true",
-        help="Use the frozen single-timeframe legacy backtest baseline",
-    )
     args = parser.parse_args()
 
     settings = load_settings(args.config)
     if args.candles_csv:
         candles = load_candles_csv(args.candles_csv)
         derivatives = load_derivatives_csv(args.derivatives_csv) if args.derivatives_csv else None
-        result = BacktestEngine(
-            symbol=args.symbol,
-            starting_equity=args.equity,
-            strategy_settings=settings.strategy,
-            risk_settings=settings.risk,
-            execution_settings=settings.execution,
-            mode="legacy" if args.legacy_backtest else "production",
-        ).run(candles, derivatives)
-        print(f"symbol={args.symbol}")
-        print(f"ending_equity={result.ending_equity:.2f} return={result.total_return:.2%} trades={len(result.trades)}")
-        print(f"max_drawdown={result.max_drawdown:.2%} win_rate={result.win_rate:.2%}")
-        for trade in result.trades[-10:]:
-            print(f"trade side={trade.side.value} entry={trade.entry_price:.4f} exit={trade.exit_price:.4f} pnl={trade.pnl:.2f} reason={trade.reason}")
+        indicators = build_indicators(
+            candles,
+            derivatives,
+            ema_fast=settings.strategy.ema_fast,
+            ema_slow=settings.strategy.ema_slow,
+            ma_trend=settings.strategy.ma_trend,
+            bollinger_window=settings.strategy.bollinger_window,
+            bollinger_stddev=settings.strategy.bollinger_stddev,
+            rsi_window=settings.strategy.rsi_window,
+            atr_window=settings.strategy.atr_window,
+            volume_window=settings.strategy.volume_window,
+        )
+        signal = CompositeStrategy(settings.strategy).generate_signal(args.symbol, candles, indicators)
+        print(f"latest_signal={signal.action.value} score={signal.score} regime={signal.regime.value}")
+        print(f"reasons={'; '.join(signal.reasons)}")
         return
 
     if args.demo:
@@ -61,18 +56,8 @@ def main() -> None:
             volume_window=settings.strategy.volume_window,
         )
         signal = CompositeStrategy(settings.strategy).generate_signal("DEMOUSDT", candles, indicators)
-        result = BacktestEngine(
-            symbol=args.symbol,
-            starting_equity=args.equity,
-            strategy_settings=settings.strategy,
-            risk_settings=settings.risk,
-            execution_settings=settings.execution,
-            mode="legacy" if args.legacy_backtest else "production",
-        ).run(candles, derivatives)
         print(f"latest_signal={signal.action.value} score={signal.score} regime={signal.regime.value}")
         print(f"reasons={'; '.join(signal.reasons)}")
-        print(f"ending_equity={result.ending_equity:.2f} return={result.total_return:.2%} trades={len(result.trades)}")
-        print(f"max_drawdown={result.max_drawdown:.2%} win_rate={result.win_rate:.2%}")
         return
 
     parser.print_help()
