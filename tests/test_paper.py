@@ -122,6 +122,61 @@ def test_account_risk_snapshot_latches_daily_loss_and_drawdown() -> None:
     assert snapshot.drawdown_locked
 
 
+def test_disabled_paper_loss_breakers_ignore_and_clear_persisted_locks() -> None:
+    settings = AppSettings()
+    assert settings.risk.max_drawdown_circuit_breaker == 0.0
+    engine = PaperTradingEngine(
+        settings,
+        starting_balance=1000,
+        market_data=FakeMarketData(),
+    )
+    engine.running = True
+    engine.auto_trade = True
+    engine.account.wallet_balance = 700.0
+    engine.account.daily_loss_locked = True
+    engine.account.weekly_loss_locked = True
+    engine.account.risk_peak_equity = 1000.0
+    engine.account.drawdown_locked = True
+    engine.account.consecutive_losses = 3
+    engine.account.cooldown_until = datetime.now(UTC) + timedelta(hours=6)
+
+    status = engine.status()
+
+    assert status["new_entries_allowed"]
+    assert not status["risk"]["daily_loss_locked"]
+    assert not status["risk"]["weekly_loss_locked"]
+    assert not status["risk"]["drawdown_enabled"]
+    assert not status["risk"]["drawdown_locked"]
+    snapshot = engine._account_risk_snapshot(status)
+    assert not snapshot.daily_loss_locked
+    assert not snapshot.weekly_loss_locked
+    assert not snapshot.drawdown_locked
+    assert snapshot.consecutive_losses == 0
+    assert snapshot.cooldown_until is None
+    assert not engine.account.daily_loss_locked
+    assert not engine.account.weekly_loss_locked
+    assert not engine.account.drawdown_locked
+
+
+def test_status_marks_new_entries_blocked_by_active_weekly_lock() -> None:
+    settings = AppSettings()
+    settings.risk.weekly_loss_limit = 0.15
+    engine = PaperTradingEngine(
+        settings,
+        starting_balance=1000,
+        market_data=FakeMarketData(),
+    )
+    engine.running = True
+    engine.auto_trade = True
+    engine._account_risk_snapshot(engine.status())
+    engine.account.weekly_loss_locked = True
+
+    status = engine.status()
+
+    assert not status["new_entries_allowed"]
+    assert "WEEKLY_LOSS_LIMIT" in status["new_entry_block_codes"]
+
+
 def test_manual_risk_entry_rejects_margin_above_single_symbol_limit() -> None:
     engine = PaperTradingEngine(
         AppSettings(),
@@ -141,8 +196,11 @@ def test_manual_risk_entry_rejects_margin_above_single_symbol_limit() -> None:
 
 
 def test_three_losing_position_lifecycles_start_cooldown() -> None:
+    settings = AppSettings()
+    settings.risk.max_consecutive_losses = 3
+    settings.risk.cooldown_hours = 6
     engine = PaperTradingEngine(
-        AppSettings(),
+        settings,
         starting_balance=1000,
         market_data=FakeMarketData(),
     )

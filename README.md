@@ -43,7 +43,7 @@ Automatic trading capital allocation:
 - Scores below `85` do not open automatically.
 - Default leverage: `5x`; maximum leverage: `10x`, further capped by stop distance.
 - Maximum open positions: `5`.
-- Account loss limits, drawdown circuit breaker and loss cooldown remain hard entry gates.
+- Daily/weekly loss limits, maximum drawdown and consecutive-loss cooldown are disabled by default during paper-strategy testing. Setting their limits above zero restores the corresponding hard entry gates.
 
 The risk-per-trade sizing branch remains available only for legacy/manual
 `RiskManager` callers. Production automatic trading and historical replay use

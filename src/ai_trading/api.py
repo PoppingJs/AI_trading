@@ -1632,7 +1632,21 @@ PAPER_DASHBOARD_HTML = """
     function render(data) {
       const marketAge = data.market_updated_at ? (Date.now() - new Date(data.market_updated_at).getTime()) / 1000 : Infinity;
       const marketState = marketAge > 60 ? '行情延迟' : '行情正常';
-      document.getElementById('updated').textContent = `${data.running ? '行情与持仓管理运行中' : '后台服务已停止'} | 新开仓 ${data.auto_trade ? '允许' : '禁止'} | ${marketState} | ${timeText(data.market_updated_at || data.updated_at)}`;
+      const entryBlockText = {
+        SERVICE_STOPPED: '后台服务停止',
+        AUTO_TRADE_DISABLED: '策略关闭',
+        DAILY_LOSS_LIMIT: '日亏损锁定',
+        WEEKLY_LOSS_LIMIT: '周亏损锁定',
+        MAX_DRAWDOWN: '最大回撤锁定',
+        LOSS_COOLDOWN: '连败冷静期',
+        CONSECUTIVE_LOSSES: '连续亏损锁定'
+      };
+      const newEntriesAllowed = data.new_entries_allowed ?? data.auto_trade;
+      const entryBlockCodes = Array.isArray(data.new_entry_block_codes) ? data.new_entry_block_codes : [];
+      const entryState = newEntriesAllowed
+        ? '允许'
+        : `禁止${entryBlockCodes.length ? `（${entryBlockCodes.map(code => entryBlockText[code] || code).join('、')}）` : ''}`;
+      document.getElementById('updated').textContent = `${data.running ? '行情与持仓管理运行中' : '后台服务已停止'} | 新开仓 ${entryState} | ${marketState} | ${timeText(data.market_updated_at || data.updated_at)}`;
       const metrics = [
         ['资金', money(data.equity) + ' U'],
         ['可用', money(data.available_balance) + ' U'],

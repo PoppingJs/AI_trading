@@ -1079,6 +1079,85 @@ class PaperTradingEngine:
             "last_error": self.last_error,
         }
 
+    def _new_entry_gate_status(
+        self,
+        equity: float,
+        *,
+        now: datetime,
+    ) -> dict[str, object]:
+        blocked_codes: list[str] = []
+        if not self.running:
+            blocked_codes.append("SERVICE_STOPPED")
+        if not self.auto_trade:
+            blocked_codes.append("AUTO_TRADE_DISABLED")
+
+        day_is_current = self.account.risk_day_key == _trading_day_key(now)
+        daily_enabled = self.settings.risk.daily_loss_limit > 0
+        daily_locked = daily_enabled and day_is_current and (
+            self.account.daily_loss_locked
+            or _equity_loss_limit_hit(
+                equity,
+                self.account.risk_day_start_equity,
+                self.settings.risk.daily_loss_limit,
+            )
+        )
+        week_is_current = self.account.risk_week_key == _trading_week_key(now)
+        weekly_enabled = self.settings.risk.weekly_loss_limit > 0
+        weekly_locked = weekly_enabled and week_is_current and (
+            self.account.weekly_loss_locked
+            or _equity_loss_limit_hit(
+                equity,
+                self.account.risk_week_start_equity,
+                self.settings.risk.weekly_loss_limit,
+            )
+        )
+        drawdown_enabled = self.settings.risk.max_drawdown_circuit_breaker > 0
+        drawdown_locked = drawdown_enabled and (
+            self.account.drawdown_locked
+            or _equity_loss_limit_hit(
+                equity,
+                self.account.risk_peak_equity,
+                self.settings.risk.max_drawdown_circuit_breaker,
+            )
+        )
+        consecutive_loss_enabled = self.settings.risk.max_consecutive_losses > 0
+        cooldown_active = consecutive_loss_enabled and (
+            self.account.cooldown_until is not None
+            and now < self.account.cooldown_until
+        )
+        consecutive_loss_locked = consecutive_loss_enabled and (
+            self.account.consecutive_losses
+            >= self.settings.risk.max_consecutive_losses
+            and (
+                self.account.cooldown_until is None
+                or cooldown_active
+            )
+        )
+        if daily_locked:
+            blocked_codes.append("DAILY_LOSS_LIMIT")
+        if weekly_locked:
+            blocked_codes.append("WEEKLY_LOSS_LIMIT")
+        if drawdown_locked:
+            blocked_codes.append("MAX_DRAWDOWN")
+        if cooldown_active:
+            blocked_codes.append("LOSS_COOLDOWN")
+        elif consecutive_loss_locked:
+            blocked_codes.append("CONSECUTIVE_LOSSES")
+        return {
+            "allowed": not blocked_codes,
+            "blocked_codes": blocked_codes,
+            "daily_loss_locked": daily_locked,
+            "weekly_loss_locked": weekly_locked,
+            "drawdown_enabled": drawdown_enabled,
+            "drawdown_locked": drawdown_locked,
+            "consecutive_losses": self.account.consecutive_losses,
+            "cooldown_until": (
+                self.account.cooldown_until.isoformat()
+                if cooldown_active and self.account.cooldown_until is not None
+                else None
+            ),
+        }
+
     def _status_unlocked(self) -> dict[str, object]:
         positions = []
         unrealized = 0.0
@@ -1192,10 +1271,13 @@ class PaperTradingEngine:
             + self.account.fees_paid
         )
         now = self._now()
+        entry_gate = self._new_entry_gate_status(equity, now=now)
         pnl_history = _pnl_history_payload(self.account.pnl_history, total_pnl, now=now)
         return {
             "running": self.running,
             "auto_trade": self.auto_trade,
+            "new_entries_allowed": entry_gate["allowed"],
+            "new_entry_block_codes": entry_gate["blocked_codes"],
             "symbols": self.symbols,
             "candidate_symbols": self._candidate_symbols,
             "universe_symbols": self._universe_symbols,
@@ -1225,9 +1307,10 @@ class PaperTradingEngine:
             "risk": {
                 "open_risk_usdt": current_open_risk_usdt(positions_snapshot),
                 "open_risk_limit_usdt": equity * self.settings.risk.total_open_risk_limit,
-                "daily_loss_locked": self.account.daily_loss_locked,
-                "weekly_loss_locked": self.account.weekly_loss_locked,
-                "drawdown_locked": self.account.drawdown_locked,
+                "daily_loss_locked": entry_gate["daily_loss_locked"],
+                "weekly_loss_locked": entry_gate["weekly_loss_locked"],
+                "drawdown_enabled": entry_gate["drawdown_enabled"],
+                "drawdown_locked": entry_gate["drawdown_locked"],
                 "consecutive_losses": self.account.consecutive_losses,
                 "cooldown_until": self.account.cooldown_until.isoformat() if self.account.cooldown_until else None,
             },
@@ -1273,22 +1356,31 @@ class PaperTradingEngine:
                 self.account.risk_peak_equity,
                 equity,
             )
-        if (
+        if self.settings.risk.daily_loss_limit <= 0:
+            self.account.daily_loss_locked = False
+        elif (
             self.account.risk_day_start_equity > 0
             and equity <= self.account.risk_day_start_equity * (1 - self.settings.risk.daily_loss_limit)
         ):
             self.account.daily_loss_locked = True
-        if (
+        if self.settings.risk.weekly_loss_limit <= 0:
+            self.account.weekly_loss_locked = False
+        elif (
             self.account.risk_week_start_equity > 0
             and equity <= self.account.risk_week_start_equity * (1 - self.settings.risk.weekly_loss_limit)
         ):
             self.account.weekly_loss_locked = True
-        if (
+        if self.settings.risk.max_drawdown_circuit_breaker <= 0:
+            self.account.drawdown_locked = False
+        elif (
             self.account.risk_peak_equity > 0
             and equity <= self.account.risk_peak_equity * (1 - self.settings.risk.max_drawdown_circuit_breaker)
         ):
             self.account.drawdown_locked = True
-        if self.account.cooldown_until is not None and now >= self.account.cooldown_until:
+        if self.settings.risk.max_consecutive_losses <= 0:
+            self.account.cooldown_until = None
+            self.account.consecutive_losses = 0
+        elif self.account.cooldown_until is not None and now >= self.account.cooldown_until:
             self.account.cooldown_until = None
             self.account.consecutive_losses = 0
         snapshot = AccountRiskSnapshot(
@@ -2997,7 +3089,10 @@ class PaperTradingEngine:
         lifecycle_pnl = float(
             position.metadata.get("lifecycle_realized_pnl", 0.0)
         ) + realized
-        if lifecycle_pnl < 0:
+        if (
+            lifecycle_pnl < 0
+            and self.settings.risk.max_consecutive_losses > 0
+        ):
             self.account.consecutive_losses += 1
             if (
                 self.account.consecutive_losses
@@ -8477,6 +8572,18 @@ def _trading_week_key(timestamp: datetime) -> str:
     trading_day = datetime.fromisoformat(_trading_day_key(timestamp)).date()
     iso_year, iso_week, _ = trading_day.isocalendar()
     return f"{iso_year}-W{iso_week:02d}"
+
+
+def _equity_loss_limit_hit(
+    equity: float,
+    reference_equity: float,
+    limit: float,
+) -> bool:
+    return (
+        reference_equity > 0
+        and limit > 0
+        and equity <= reference_equity * (1 - limit)
+    )
 
 
 def _next_trading_day_key(day: str) -> str:

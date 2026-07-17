@@ -77,28 +77,38 @@ class PortfolioRiskGate:
         invalid = _trade_plan_error(plan)
         if invalid:
             return _portfolio_blocked("INVALID_TRADE_PLAN", invalid, open_risk)
-        if account.daily_loss_locked or _loss_limit_hit(
-            account.equity,
-            account.day_start_equity,
-            self.settings.daily_loss_limit,
+        if self.settings.daily_loss_limit > 0 and (
+            account.daily_loss_locked
+            or _loss_limit_hit(
+                account.equity,
+                account.day_start_equity,
+                self.settings.daily_loss_limit,
+            )
         ):
             return _portfolio_blocked("DAILY_LOSS_LIMIT", "daily loss limit reached", open_risk)
-        if account.weekly_loss_locked or _loss_limit_hit(
-            account.equity,
-            account.week_start_equity,
-            self.settings.weekly_loss_limit,
+        if self.settings.weekly_loss_limit > 0 and (
+            account.weekly_loss_locked
+            or _loss_limit_hit(
+                account.equity,
+                account.week_start_equity,
+                self.settings.weekly_loss_limit,
+            )
         ):
             return _portfolio_blocked("WEEKLY_LOSS_LIMIT", "weekly loss limit reached", open_risk)
-        if account.drawdown_locked or _loss_limit_hit(
-            account.equity,
-            account.peak_equity,
-            self.settings.max_drawdown_circuit_breaker,
+        if self.settings.max_drawdown_circuit_breaker > 0 and (
+            account.drawdown_locked
+            or _loss_limit_hit(
+                account.equity,
+                account.peak_equity,
+                self.settings.max_drawdown_circuit_breaker,
+            )
         ):
             return _portfolio_blocked("MAX_DRAWDOWN", "maximum drawdown circuit breaker active", open_risk)
-        if account.cooldown_until is not None and now < account.cooldown_until:
-            return _portfolio_blocked("LOSS_COOLDOWN", "consecutive-loss cooldown active", open_risk)
-        if account.consecutive_losses >= self.settings.max_consecutive_losses:
-            return _portfolio_blocked("CONSECUTIVE_LOSSES", "consecutive loss limit reached", open_risk)
+        if self.settings.max_consecutive_losses > 0:
+            if account.cooldown_until is not None and now < account.cooldown_until:
+                return _portfolio_blocked("LOSS_COOLDOWN", "consecutive-loss cooldown active", open_risk)
+            if account.consecutive_losses >= self.settings.max_consecutive_losses:
+                return _portfolio_blocked("CONSECUTIVE_LOSSES", "consecutive loss limit reached", open_risk)
 
         symbol_positions = [
             position for position in account.open_positions

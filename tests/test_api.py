@@ -77,6 +77,8 @@ def test_realtime_dashboard_reserves_height_for_pnl_time_axis(tmp_path: Path) ->
     assert "main { height: calc(100vh - 98px); padding: 6px 16px;" in page
     assert "#pnlChart { width: 100%; height: auto; min-height: 0; flex: 1 1 auto;" in page
     assert "const timeLabelY = plotBottom + 8 * dpr;" in page
+    assert "data.new_entries_allowed ?? data.auto_trade" in page
+    assert "MAX_DRAWDOWN: '最大回撤锁定'" in page
 
 
 def test_historical_job_replays_current_engine_and_reuses_latest_market_cache(

@@ -72,11 +72,11 @@ class RiskSettings:
     total_margin_limit: float = 0.95
     total_open_risk_limit: float = 0.04
     max_open_positions: int = 5
-    daily_loss_limit: float = 0.02
-    weekly_loss_limit: float = 0.15
-    max_drawdown_circuit_breaker: float = 0.20
-    max_consecutive_losses: int = 3
-    cooldown_hours: int = 6
+    daily_loss_limit: float = 0.0
+    weekly_loss_limit: float = 0.0
+    max_drawdown_circuit_breaker: float = 0.0
+    max_consecutive_losses: int = 0
+    cooldown_hours: int = 0
     atr_stop_buffer: float = 0.5
     time_stop_bars: int = 5
     first_take_profit_r: float = 1.0

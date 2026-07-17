@@ -65,11 +65,11 @@ risk:
   total_margin_limit: 0.95
   total_open_risk_limit: 0.04
   max_open_positions: 5
-  daily_loss_limit: 0.02
-  weekly_loss_limit: 0.15
-  max_drawdown_circuit_breaker: 0.20
-  max_consecutive_losses: 3
-  cooldown_hours: 6
+  daily_loss_limit: 0.0
+  weekly_loss_limit: 0.0
+  max_drawdown_circuit_breaker: 0.0
+  max_consecutive_losses: 0
+  cooldown_hours: 0
   atr_stop_buffer: 0.5
   time_stop_bars: 5
   first_take_profit_r: 1.0
