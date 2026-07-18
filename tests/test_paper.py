@@ -41,6 +41,7 @@ from ai_trading.paper import (
     _entry_stop_error,
     _exit_plan_error,
     _four_hour_oi_valley,
+    _four_hour_oi_valley_long_setup,
     _fixed_margin_for_quality,
     _high_distribution_handoff,
     _high_distribution_handoff_exit_reason,
@@ -52,6 +53,7 @@ from ai_trading.paper import (
     _one_hour_ema_reliability,
     _paper_account_from_payload,
     _oi_valley_short_exit_reason,
+    _oi_valley_long_invalidation_reason,
     _pnl_history_payload,
     _profit_drawdown_exit_reason,
     _required_entry_timeframes,
@@ -63,6 +65,7 @@ from ai_trading.paper import (
     _refine_stop_with_ma_cluster,
     _refine_stop_with_precision,
     _refine_stop_with_distribution_stage,
+    _refine_stop_with_entry_zone,
     _refine_stop_with_setup_structure,
     _refine_stop_with_retest_structure,
     _refine_take_profit_with_ma_cluster,
@@ -430,9 +433,21 @@ def test_planned_point_eight_r_partial_profit_does_not_wait_for_one_r() -> None:
     assert position.stop_price > position.entry_price
     assert engine.account.fills[-1].action == "PARTIAL_CLOSE"
     assert engine.account.fills[-1].reason == "take profit: target 1 reached"
+    assert engine._reentry_block_reason(position.symbol) is None
 
 
-def test_stop_loss_requires_new_entry_timeframe_candle_before_reentry() -> None:
+@pytest.mark.parametrize(
+    "exit_reason",
+    (
+        "stop loss: test",
+        "take profit: profit drawdown after long crowd risk",
+        "take profit: target 2 reached",
+        "rotation: stronger setup",
+    ),
+)
+def test_full_exit_requires_new_entry_timeframe_candle_before_reentry(
+    exit_reason: str,
+) -> None:
     engine = PaperTradingEngine(AppSettings(), starting_balance=1000, market_data=FakeMarketData())
     candle_time = datetime(2026, 7, 1, 0, 0, tzinfo=UTC)
     engine._timeframe_candles["TESTUSDT"] = {
@@ -461,9 +476,12 @@ def test_stop_loss_requires_new_entry_timeframe_candle_before_reentry() -> None:
     )
     position = engine.account.positions["TESTUSDT"]
 
-    engine._close_position_unlocked(position, 98.0, "stop loss: test")
+    engine._close_position_unlocked(position, 98.0, exit_reason)
 
-    assert engine._reentry_block_reason("TESTUSDT") == "waiting for new 1h closed candle after stop loss"
+    assert (
+        engine._reentry_block_reason("TESTUSDT")
+        == "waiting for new 1h closed candle after full exit"
+    )
     engine._timeframe_candles["TESTUSDT"]["1h"].append(
         Candle(
             timestamp=candle_time + timedelta(hours=1),
@@ -2180,6 +2198,7 @@ def test_four_hour_short_entry_requires_upper_half_of_retest_zone() -> None:
         "trend_state": "TREND_SHORT",
         "risk_state": "NORMAL",
         "entry_timeframe_override": "4h",
+        "h1_trigger": {"direction": "SHORT", "state": "FAKE_BREAKOUT"},
         "price": 7.75032,
         "entry_levels": {
             "short": {
@@ -2364,7 +2383,7 @@ def test_correlated_indicator_zones_need_scored_pullback_confirmation() -> None:
     assert signal["entry_timing"] == "GOOD"
 
 
-def test_four_hour_override_allows_scored_h4_indicator_zone() -> None:
+def test_four_hour_override_requires_price_rejection_confirmation() -> None:
     signal = {
         "action": SignalAction.ENTRY_SHORT.value,
         "score": 96,
@@ -2385,7 +2404,13 @@ def test_four_hour_override_allows_scored_h4_indicator_zone() -> None:
     }
 
     _update_entry_position_fields(signal)
+    assert signal["entry_timing"] == "WAIT"
 
+    signal["h1_trigger"] = {
+        "direction": "SHORT",
+        "state": "FAKE_BREAKOUT",
+    }
+    _update_entry_position_fields(signal)
     assert signal["entry_timing"] == "GOOD"
 
 
@@ -2840,8 +2865,208 @@ def test_four_hour_oi_valley_requires_retail_carry_capitulation_and_rebuild() ->
         oi_did_not_decline,
         AppSettings(),
     )
-    assert no_retail_carry["state"] == "WATCH"
+    assert no_retail_carry["state"] == "EXHAUSTION"
     assert not no_retail_carry["retail_long_carry"]
+
+
+def test_gradual_four_hour_oi_valley_blocks_short_without_single_bar_flush() -> None:
+    start = datetime(2026, 7, 10, tzinfo=UTC)
+    closes = [100.0, 98.0, 96.0, 94.0, 92.0, 90.0, 89.0, 88.0, 88.5, 90.0]
+    oi_values = [1000.0, 988.0, 976.0, 964.0, 952.0, 940.0, 928.0, 916.0, 920.0, 930.0]
+    ratios = [1.0, 1.04, 1.08, 1.12, 1.18, 1.24, 1.30, 1.34, 1.36, 1.38]
+    candles = [
+        Candle(
+            timestamp=start + timedelta(hours=4 * index),
+            open=close + 0.5,
+            high=close + 1.0,
+            low=close - 1.0,
+            close=close,
+            volume=1000.0,
+        )
+        for index, close in enumerate(closes)
+    ]
+    indicators = [
+        indicator_snapshot(
+            close=close,
+            open_interest=oi,
+            long_short_ratio=ratio,
+        )
+        for close, oi, ratio in zip(closes, oi_values, ratios)
+    ]
+
+    valley = _four_hour_oi_valley(candles, indicators, AppSettings())
+
+    assert valley["flush_pct"] < AppSettings().strategy.smart_money_oi_flush
+    assert valley["cumulative_flush_pct"] > AppSettings().strategy.smart_money_oi_flush
+    assert valley["state"] == "CONFIRMED"
+    adjusted = _apply_multi_timeframe_context(
+        {
+            "action": SignalAction.ENTRY_SHORT.value,
+            "score": 110,
+            "trend_state": "TREND_SHORT",
+            "risk_state": "NORMAL",
+            "reasons": (),
+            "vetoes": (),
+            "price": 90.0,
+        },
+        {
+            "daily_bias": "BEAR",
+            "h4_structure": {"state": "BOX_LOWER_HALF"},
+            "h4_oi_valley": valley,
+            "h1_trigger": {"direction": "SHORT", "state": "RETEST"},
+            "h1_pullback": {"direction": "SHORT", "state": "HEALTHY_PULLBACK"},
+                "entry_levels": {
+                    "short": {
+                        "h1_ema20_ema60": {"low": 89.5, "high": 90.5, "price": 90.0},
+                    }
+                },
+            "summary": "test",
+        },
+    )
+    assert (
+        "4h OI valley confirmed; low-area short chasing is blocked"
+        in adjusted["vetoes"]
+    )
+
+
+def test_four_hour_oi_valley_absorption_builds_ema55_reversal_long() -> None:
+    start = datetime(2026, 7, 4, tzinfo=UTC)
+    closes = [100.0] * 48 + [98.0, 96.0, 94.0, 92.0, 90.0, 88.0, 87.0, 88.0, 89.0, 91.0, 98.0, 100.0]
+    lows = [close - 0.8 for close in closes]
+    lows[54] = 84.0
+    lows[56] = 85.0
+    lows[59] = 96.0
+    candles = [
+        Candle(
+            timestamp=start + timedelta(hours=4 * index),
+            open=close + (1.0 if index in {54, 56} else 0.2),
+            high=close + 2.0,
+            low=lows[index],
+            close=close,
+            volume=1000.0,
+        )
+        for index, close in enumerate(closes)
+    ]
+    oi_values = [1000.0] * 54 + [900.0, 902.0, 906.0, 910.0, 918.0, 930.0]
+    indicators = [
+        indicator_snapshot(
+            close=close,
+            atr=2.0,
+            open_interest=oi,
+            long_short_ratio=1.5,
+        )
+        for close, oi in zip(closes, oi_values)
+    ]
+    valley = {
+        "state": "EXHAUSTION",
+        "flush_timestamp": candles[54].timestamp.isoformat(),
+        "rebuild_pct": (930.0 - 900.0) / 900.0,
+        "price_recovered_after_valley": True,
+    }
+
+    setup = _four_hour_oi_valley_long_setup(
+        candles,
+        indicators,
+        valley,
+        AppSettings(),
+    )
+
+    assert setup["state"] == "CONFIRMED"
+    assert setup["lower_wick_count"] >= 2
+    assert setup["oi_rebuilding"]
+    assert setup["long_short_ratio_stable"]
+    assert setup["ema55_reclaimed"]
+    assert setup["stop_anchor"] < setup["floor_price"]
+
+
+def test_ema55_oi_valley_reversal_overrides_short_as_a_quality_long() -> None:
+    adjusted = _apply_multi_timeframe_context(
+        {
+            "action": SignalAction.ENTRY_SHORT.value,
+            "candidate_action": SignalAction.ENTRY_SHORT.value,
+            "score": 120,
+            "trend_state": "TREND_SHORT",
+            "risk_state": "NORMAL",
+            "price": 100.0,
+            "rsi14": 55.0,
+            "reasons": ("base short direction",),
+            "vetoes": (),
+        },
+        {
+            "daily_bias": "NEUTRAL",
+            "h4_structure": {"state": "BOX_LOWER_HALF"},
+            "h4_oi_valley": {"state": "EXHAUSTION"},
+            "h4_oi_valley_long": {
+                "state": "CONFIRMED",
+                "long_short_ratio": 1.5,
+            },
+            "h1_trigger": {"direction": "SHORT", "state": "RETEST"},
+            "h1_pullback": {"direction": "NONE", "state": "WAIT"},
+            "entry_levels": {
+                "long": {
+                    "h4_ema55_reclaim": {
+                        "low": 99.0,
+                        "high": 101.0,
+                        "price": 100.0,
+                    }
+                }
+            },
+            "summary": "test",
+        },
+    )
+
+    assert adjusted["action"] == SignalAction.ENTRY_LONG.value
+    assert adjusted["setup_type"] == SETUP_OI_VALLEY_REVERSAL_LONG
+    assert 85 <= adjusted["score"] < 100
+    assert set(adjusted["entry_levels"]["long"]) == {"h4_ema55_reclaim"}
+    assert not adjusted["vetoes"]
+
+
+def test_oi_valley_reversal_stop_and_early_invalidation_use_4h_structure() -> None:
+    signal = {
+        "setup_type": SETUP_OI_VALLEY_REVERSAL_LONG,
+        "h4_oi_valley_long": {"stop_anchor": 94.0},
+    }
+    stop, basis = _refine_stop_with_setup_structure(
+        PositionSide.LONG,
+        98.0,
+        100.0,
+        signal,
+        {},
+        indicator_snapshot(close=100.0, atr=2.0),
+        timeframe="4h",
+    )
+    assert stop == 94.0
+    assert basis == "4h_oi_valley_floor_structure"
+
+    position = Position(
+        symbol="TESTUSDT",
+        side=PositionSide.LONG,
+        entry_price=100.0,
+        quantity=1.0,
+        opened_at=datetime(2026, 7, 14, tzinfo=UTC),
+        stop_price=94.0,
+        take_profit_1=106.0,
+        take_profit_2=112.0,
+        metadata={
+            "entry_context": {
+                "setup_type": SETUP_OI_VALLEY_REVERSAL_LONG,
+            }
+        },
+    )
+    reason = _oi_valley_long_invalidation_reason(
+        position,
+        {
+            "h4_oi_valley_long": {
+                "current_close": 97.0,
+                "floor_price": 94.5,
+                "ema55": 99.0,
+                "ema55_buffer": 1.0,
+                "current_oi_change_pct": 0.02,
+            }
+        },
+    )
+    assert reason == "stop loss: 4h closed below EMA55 while OI increased; new shorts likely"
 
 
 def test_confirmed_four_hour_oi_valley_exits_short_and_needs_wick_for_long() -> None:
@@ -2931,8 +3156,91 @@ def test_confirmed_four_hour_oi_valley_exits_short_and_needs_wick_for_long() -> 
         context,
     )
     assert (
-        "4h OI valley confirmed; downside trend exhaustion blocks new short"
+        "4h OI valley confirmed; low-area short chasing is blocked"
         in adjusted_short["vetoes"]
+    )
+
+
+def test_oi_valley_does_not_block_confirmed_short_at_structural_resistance() -> None:
+    adjusted = _apply_multi_timeframe_context(
+        {
+            "action": SignalAction.ENTRY_SHORT.value,
+            "score": 110,
+            "trend_state": "TREND_SHORT",
+            "risk_state": "NORMAL",
+            "reasons": (),
+            "vetoes": (),
+            "price": 102.8,
+        },
+        {
+            "daily_bias": "BEAR",
+            "h4_structure": {"state": "BOX_LOWER_HALF"},
+            "h4_oi_valley": {"state": "CONFIRMED"},
+            "h1_trigger": {"direction": "SHORT", "state": "FAKE_BREAKOUT"},
+            "h1_pullback": {"direction": "NONE", "state": "WAIT"},
+            "distribution_short": {
+                "active": True,
+                "descending_trendline_zone": {
+                    "low": 102.0,
+                    "high": 103.0,
+                    "price": 102.5,
+                },
+            },
+            "entry_levels": {
+                "short": {
+                    "descending_high_trendline": {
+                        "low": 102.0,
+                        "high": 103.0,
+                        "price": 102.5,
+                    }
+                }
+            },
+            "summary": "test",
+        },
+    )
+
+    assert not any(
+        "low-area short chasing" in reason
+        for reason in adjusted["vetoes"]
+    )
+    assert adjusted["entry_timing"] == "GOOD"
+
+
+def test_oi_valley_short_block_releases_after_fresh_oi_backed_breakdown() -> None:
+    adjusted = _apply_multi_timeframe_context(
+        {
+            "action": SignalAction.ENTRY_SHORT.value,
+            "score": 105,
+            "trend_state": "ONE_WAY_DOWN",
+            "risk_state": "NORMAL",
+            "oi_change": 0.02,
+            "reasons": ("market structure confirms short",),
+            "vetoes": (),
+            "price": 98.8,
+        },
+        {
+            "daily_bias": "BEAR",
+            "h4_structure": {"state": "BREAKDOWN_DOWN"},
+            "h4_oi_valley": {"state": "EXHAUSTION"},
+            "h1_trigger": {"direction": "SHORT", "state": "BREAKDOWN"},
+            "h1_pullback": {"direction": "NONE", "state": "WAIT"},
+            "distribution_short": {"active": False},
+            "entry_levels": {
+                "short": {
+                    "breakdown_retest": {
+                        "low": 98.5,
+                        "high": 99.2,
+                        "price": 98.85,
+                    }
+                }
+            },
+            "summary": "test",
+        },
+    )
+
+    assert not any(
+        "low-area short chasing" in reason
+        for reason in adjusted["vetoes"]
     )
 
 
@@ -3094,6 +3402,72 @@ def test_distribution_stages_switch_the_only_eligible_short_entry_zone() -> None
         "h1_boll_mid",
         "h1_ema20_ema60",
     }
+
+
+def test_distribution_stage_two_cannot_be_overridden_by_generic_four_hour_ema() -> None:
+    selected = _scored_entry_levels(
+        {
+            "action": SignalAction.ENTRY_SHORT.value,
+            "trend_state": "ONE_WAY_DOWN",
+            "entry_timeframe_override": "4h",
+            "distribution_short_stage": DISTRIBUTION_STAGE_DESCENDING,
+            "setup_type": SETUP_H4_PULLBACK_SHORT,
+        },
+        {
+            "short": {
+                "descending_high_trendline": {
+                    "low": 102.0,
+                    "high": 103.0,
+                    "price": 102.5,
+                },
+                "h4_ema20_ema60": {
+                    "low": 99.0,
+                    "high": 100.0,
+                    "price": 99.5,
+                },
+            }
+        },
+    )
+
+    assert selected == {
+        "short": {
+            "descending_high_trendline": {
+                "low": 102.0,
+                "high": 103.0,
+                "price": 102.5,
+            }
+        }
+    }
+
+
+def test_distribution_stage_two_waits_for_rejection_at_descending_high() -> None:
+    signal = {
+        "action": SignalAction.ENTRY_SHORT.value,
+        "score": 110,
+        "trend_state": "ONE_WAY_DOWN",
+        "risk_state": "NORMAL",
+        "price": 102.8,
+        "distribution_short_stage": DISTRIBUTION_STAGE_DESCENDING,
+        "entry_levels": {
+            "short": {
+                "descending_high_trendline": {
+                    "low": 102.0,
+                    "high": 103.0,
+                    "price": 102.5,
+                }
+            }
+        },
+    }
+
+    _update_entry_position_fields(signal)
+    assert signal["entry_timing"] == "WAIT"
+
+    signal["h1_trigger"] = {
+        "direction": "SHORT",
+        "state": "FAKE_BREAKOUT",
+    }
+    _update_entry_position_fields(signal)
+    assert signal["entry_timing"] == "GOOD"
 
 
 def test_stage_one_distribution_short_is_penalized_and_tiny() -> None:
@@ -4664,6 +5038,37 @@ def test_setup_structure_stop_falls_back_when_structure_is_missing() -> None:
 
     assert stop == 98.0
     assert basis == "volatility_fallback"
+
+
+def test_confirmed_entry_zone_provides_structure_stop_when_swing_is_missing() -> None:
+    signal = {
+        "action": SignalAction.ENTRY_SHORT.value,
+        "score": 105,
+        "trend_state": "TREND_SHORT",
+        "risk_state": "NORMAL",
+        "price": 100.0,
+        "h1_trigger": {"direction": "SHORT", "state": "FAKE_BREAKOUT"},
+        "entry_levels": {
+            "short": {
+                "h4_ema20_ema60": {
+                    "low": 99.5,
+                    "high": 100.5,
+                    "price": 100.0,
+                }
+            }
+        },
+    }
+
+    stop, basis = _refine_stop_with_entry_zone(
+        PositionSide.SHORT,
+        106.0,
+        100.0,
+        signal,
+        indicator_snapshot(close=100.0, atr=1.0),
+    )
+
+    assert 100.5 < stop < 106.0
+    assert basis == "entry_zone_structure"
 
 
 def test_retest_structure_refines_long_stop_outside_support_and_ema60() -> None:

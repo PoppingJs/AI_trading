@@ -750,6 +750,10 @@ PAPER_DASHBOARD_HTML = """
       '4h OI sharp drop is an event, not a confirmed OI valley; wait for OI rebuilding and downside-wick reclaim': '4H OI骤减只是事件，尚未形成洼地；等待OI从冰点回升并出现下插针收回',
       '4h OI valley formed after retail capitulation; downside wick reclaimed support': '4H散户集中割肉后OI从冰点回升形成洼地，下插针已收回支撑',
       '4h OI valley formed; wait for a downside-wick support reclaim before long': '4H OI洼地已经形成，等待下插针收回支撑后再做多',
+      '4h OI-valley absorption overrides the lagging lower-timeframe short bias': '4H OI洼地吸筹确认，覆盖滞后的低周期空头方向',
+      '1h direction still lags the confirmed 4h reversal; retain A-size only': '1H方向仍滞后于已确认的4H反转，仅按A级仓位',
+      '4h bottom absorbed repeated downside wicks; OI rebuilt with a stable long/short ratio and EMA55 was reclaimed': '4H底部多次下插针均被吸收，OI回升且多空比稳定，价格已收回EMA55',
+      'absolute long/short ratio remains crowded; reversal quality capped at A': '多空比绝对值仍拥挤，反转机会最高按A级',
       '4h OI sharp drop is not an OI valley and does not confirm a short entry': '4H OI骤减不等于OI洼地，也不用于确认做空',
       '4h OI deleverage with price breakdown; avoid long entry': '4小时 OI 大幅去杠杆且价格破位，禁止做多',
       '4h OI deleveraged but 1h BOLL/EMA held; allow small long only': '4小时 OI 大幅去杠杆但1小时中轨/EMA守住，只允许小仓多',
@@ -795,6 +799,8 @@ PAPER_DASHBOARD_HTML = """
       'stop loss: signal direction or structure failed': '止损：信号方向或结构失效',
       'stop loss: ATR volatility hard stop': '止损：ATR波动硬止损',
       'stop loss: 15m entry structure stop': '止损：15分钟入场结构失效',
+      'stop loss: 4h OI-valley absorption floor failed by close': '止损：4H实体收盘跌破OI洼地吸筹底部',
+      'stop loss: 4h closed below EMA55 while OI increased; new shorts likely': '止损：4H收盘跌破EMA55且OI继续增加，疑似新增空头',
       'take profit: 1h/4h body closed below support or EMA/BOLL zone': '止盈：1小时/4小时实体跌破支撑或EMA/BOLL区域，保护利润',
       'stop loss: 1h/4h body closed below support or EMA/BOLL zone': '止损：1小时/4小时实体跌破支撑或EMA/BOLL区域',
       'take profit: 1h/4h body closed above resistance or EMA/BOLL zone': '止盈：1小时/4小时实体突破压力或EMA/BOLL区域，保护利润',
@@ -843,6 +849,7 @@ PAPER_DASHBOARD_HTML = """
       'high distribution handoff complete; avoid new long': '高位换手完成，禁止新开多单',
       '4h OI dropped while long/short ratio rose; retail longs are carrying the decline': '价格阴跌、OI下降且多空比上升，散户多头仍在扛单',
       '4h OI valley confirmed; downside trend exhaustion blocks new short': '4H OI洼地形成，下跌行情衰竭，禁止新开空单',
+      '4h OI valley confirmed; low-area short chasing is blocked': '4H OI洼地形成，禁止在支撑或低位追空',
       '15m tactical entry lacks a valid 15m structure stop or 1h/4h entry zone': '缺少有效止损或入场区',
       'BTC 4h extreme volatility; pause new altcoin entries': 'BTC极端波动',
       'market warm-up is still running': '行情预热中',
@@ -1096,8 +1103,9 @@ PAPER_DASHBOARD_HTML = """
       }
       if (reason.startsWith('available entry margin ')) return '可用保证金不足';
       if (reason.startsWith('position capacity full:')) return '持仓已满';
-      const reentryWait = reason.match(/^waiting for new (15m|1h|4h) closed candle after stop loss$/);
-      if (reentryWait) return `止损后等待新的${reentryWait[1]}收盘K线`;
+      if (reason === 'entry lacks a valid structure stop') return '缺少可验证的结构止损';
+      const reentryWait = reason.match(/^waiting for new (15m|1h|4h|1d) closed candle after (?:full exit|stop loss)$/);
+      if (reentryWait) return `完整平仓后等待新的${reentryWait[1]}收盘K线`;
       if (reason.startsWith('auto entry execution failed:')) return '自动开仓执行失败';
       if (
         reason.startsWith('MA cluster dense; wait for breakout or MA20 retest')

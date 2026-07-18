@@ -10,6 +10,13 @@ The default mode is research and paper trading. It does not place real orders.
 
 ## Strategy
 
+Strategy changes must stay on one core path: universe selection, direction and
+score, structural entry zone, price confirmation and vetoes, entry, structural
+stop/targets, adding or rotation, then exit. Prefer correcting these shared
+decisions over adding standalone parameters or alternate execution branches;
+real-time paper trading and historical replay must continue to use the same
+path.
+
 The strategy avoids single-indicator prediction. It scores market state instead:
 
 - Trend filter: `EMA20`, `EMA50`, `MA100`.
