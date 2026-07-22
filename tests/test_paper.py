@@ -34,6 +34,7 @@ from ai_trading.paper import (
     _entry_quality_grade,
     _distribution_short_stage,
     _distribution_short_structure,
+    _distribution_projection_supported,
     _entry_reward_r,
     _ema20_ema60_band,
     _entry_signal_timeframe,
@@ -2904,6 +2905,7 @@ def test_gradual_four_hour_oi_valley_blocks_short_without_single_bar_flush() -> 
             "action": SignalAction.ENTRY_SHORT.value,
             "score": 110,
             "trend_state": "TREND_SHORT",
+            "trend_stage_phase": "LATE",
             "risk_state": "NORMAL",
             "reasons": (),
             "vetoes": (),
@@ -3148,6 +3150,7 @@ def test_confirmed_four_hour_oi_valley_exits_short_and_needs_wick_for_long() -> 
             "action": SignalAction.ENTRY_SHORT.value,
             "score": 96,
             "trend_state": "TREND_SHORT",
+            "trend_stage_phase": "LATE",
             "risk_state": "NORMAL",
             "reasons": (),
             "vetoes": (),
@@ -3176,7 +3179,11 @@ def test_oi_valley_does_not_block_confirmed_short_at_structural_resistance() -> 
             "daily_bias": "BEAR",
             "h4_structure": {"state": "BOX_LOWER_HALF"},
             "h4_oi_valley": {"state": "CONFIRMED"},
-            "h1_trigger": {"direction": "SHORT", "state": "FAKE_BREAKOUT"},
+            "h1_trigger": {
+                "direction": "SHORT",
+                "state": "FAKE_BREAKOUT",
+                "rejection_high": 103.2,
+            },
             "h1_pullback": {"direction": "NONE", "state": "WAIT"},
             "distribution_short": {
                 "active": True,
@@ -3184,6 +3191,7 @@ def test_oi_valley_does_not_block_confirmed_short_at_structural_resistance() -> 
                     "low": 102.0,
                     "high": 103.0,
                     "price": 102.5,
+                    "anchor_count": 3,
                 },
             },
             "entry_levels": {
@@ -3335,9 +3343,46 @@ def test_distribution_structure_projects_the_latest_lower_high_line() -> None:
 
     assert structure["active"]
     line = structure["descending_trendline_zone"]
-    assert line["price"] == pytest.approx(100.6)
-    assert line["low"] == pytest.approx(100.2)
-    assert line["high"] == pytest.approx(101.0)
+    assert line["price"] == pytest.approx(100.2)
+    assert line["low"] == pytest.approx(99.8)
+    assert line["high"] == pytest.approx(100.6)
+    assert line["anchor_count"] == 3
+
+
+def test_two_anchor_distribution_projection_needs_resistance_confluence() -> None:
+    distribution = {
+        "descending_trendline_zone": {
+            "low": 102.0,
+            "high": 103.0,
+            "price": 102.5,
+            "anchor_count": 2,
+        }
+    }
+
+    assert not _distribution_projection_supported(
+        distribution,
+        {
+            "short": {
+                "h1_resistance": {
+                    "low": 104.0,
+                    "high": 105.0,
+                    "price": 104.5,
+                }
+            }
+        },
+    )
+    assert _distribution_projection_supported(
+        distribution,
+        {
+            "short": {
+                "h1_resistance": {
+                    "low": 102.7,
+                    "high": 103.4,
+                    "price": 103.0,
+                }
+            }
+        },
+    )
 
 
 def test_distribution_stages_switch_the_only_eligible_short_entry_zone() -> None:
@@ -3462,9 +3507,56 @@ def test_distribution_stage_two_waits_for_rejection_at_descending_high() -> None
     _update_entry_position_fields(signal)
     assert signal["entry_timing"] == "WAIT"
 
+    signal["h1_pullback"] = {
+        "direction": "SHORT",
+        "state": "HEALTHY_PULLBACK",
+    }
+    _update_entry_position_fields(signal)
+    assert signal["entry_timing"] == "WAIT"
+
     signal["h1_trigger"] = {
         "direction": "SHORT",
         "state": "FAKE_BREAKOUT",
+        "rejection_high": 103.2,
+    }
+    _update_entry_position_fields(signal)
+    assert signal["entry_timing"] == "GOOD"
+
+
+def test_distribution_stage_two_wick_must_touch_and_close_below_projection() -> None:
+    signal = {
+        "action": SignalAction.ENTRY_SHORT.value,
+        "score": 110,
+        "trend_state": "TREND_SHORT",
+        "risk_state": "NORMAL",
+        "price": 102.4,
+        "distribution_short_stage": DISTRIBUTION_STAGE_DESCENDING,
+        "distribution_short": {
+            "descending_trendline_zone": {
+                "low": 102.0,
+                "high": 103.0,
+                "price": 102.5,
+            }
+        },
+        "entry_levels": {
+            "short": {
+                "descending_high_trendline": {
+                    "low": 102.0,
+                    "high": 103.0,
+                    "price": 102.5,
+                }
+            }
+        },
+        "large_wick_rejections": {
+            "upper": {"high": 101.8, "close": 101.2},
+        },
+    }
+
+    _update_entry_position_fields(signal)
+    assert signal["entry_timing"] == "WAIT"
+
+    signal["large_wick_rejections"] = {
+        "upper": {"high": 103.2, "close": 102.4},
     }
     _update_entry_position_fields(signal)
     assert signal["entry_timing"] == "GOOD"
@@ -3535,6 +3627,11 @@ def test_stage_one_distribution_short_is_penalized_and_tiny() -> None:
 def test_distribution_stage_stop_sits_above_the_active_price_structure() -> None:
     signal = {
         "distribution_short_stage": DISTRIBUTION_STAGE_DESCENDING,
+        "h1_trigger": {
+            "direction": "SHORT",
+            "state": "RETEST",
+            "rejection_high": 93.4,
+        },
         "entry_levels": {
             "short": {
                 "descending_high_trendline": {
@@ -3554,7 +3651,8 @@ def test_distribution_stage_stop_sits_above_the_active_price_structure() -> None
         indicator_snapshot(close=92.8, atr=1.0),
     )
 
-    assert refined == 93.2
+    assert refined == pytest.approx(93.9136)
+    assert refined > 93.4
 
 
 def test_new_signal_version_does_not_reset_entry_position_inside_zone() -> None:
@@ -5233,6 +5331,46 @@ def test_auto_trade_turns_near_structure_target_into_partial_runner_plan() -> No
     assert position.metadata["leverage"] <= 7
     assert position.metadata["entry_context"]["entry_reward_r"] == pytest.approx(1.2)
     assert position.metadata["entry_context"]["entry_structure_reward_r"] < 1.2
+
+
+def test_auto_trade_waits_when_late_stage_structure_reward_is_too_low() -> None:
+    settings = AppSettings()
+    settings.risk.max_open_positions = 1
+    engine = PaperTradingEngine(
+        settings,
+        starting_balance=1000,
+        market_data=FakeMarketData(),
+    )
+    engine.latest_prices["LATEUSDT"] = 100.0
+    engine.latest_signals["LATEUSDT"] = {
+        "action": "ENTRY_LONG",
+        "score": 95,
+        "trend_state": "TREND_LONG",
+        "trend_stage_phase": "LATE",
+        "risk_state": "NORMAL",
+        "price": 100.0,
+        "entry_levels": {
+            "long": {
+                "h1_support": {
+                    "low": 99.0,
+                    "high": 101.0,
+                    "price": 100.0,
+                }
+            }
+        },
+        "h1_structure": {
+            "resistance_zone_low": 100.5,
+            "resistance": 100.6,
+        },
+    }
+
+    asyncio.run(engine._auto_trade_once())
+
+    assert not engine.account.positions
+    assert (
+        "trend late stage and structure reward below minimum; wait for a new pullback"
+        in engine.latest_signals["LATEUSDT"]["vetoes"]
+    )
 
 
 def test_auto_trade_uses_generated_take_profit_when_structure_target_is_unavailable() -> None:

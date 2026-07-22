@@ -2540,6 +2540,15 @@ class PaperTradingEngine:
                     if structure_note not in signal_reasons:
                         signal_reasons.append(structure_note)
                     signal["reasons"] = tuple(signal_reasons)
+                    if _trend_stage_from_signal(
+                        signal,
+                        preferred_indicator,
+                    ) == TREND_STAGE_LATE:
+                        _record_auto_entry_block(
+                            signal,
+                            "trend late stage and structure reward below minimum; wait for a new pullback",
+                        )
+                        continue
                 signal["exit_plan_status"] = "NORMAL"
                 stop_pct = _entry_stop_pct(entry_price, stop_loss)
                 entry_quality = _entry_quality_grade(
@@ -5361,14 +5370,16 @@ def _entry_zone_bounds(
 def _distribution_short_entry_confirmation_present(
     signal: dict[str, object],
 ) -> bool:
+    return _distribution_short_rejection_high(signal) is not None
+
+
+def _distribution_short_rejection_high(
+    signal: dict[str, object],
+) -> float | None:
+    """Return the actual rejection high; projections are never stop anchors."""
     h1_trigger = (
         signal.get("h1_trigger")
         if isinstance(signal.get("h1_trigger"), dict)
-        else {}
-    )
-    h1_pullback = (
-        signal.get("h1_pullback")
-        if isinstance(signal.get("h1_pullback"), dict)
         else {}
     )
     trigger_confirmed = (
@@ -5376,35 +5387,53 @@ def _distribution_short_entry_confirmation_present(
         and str(h1_trigger.get("state") or "UNKNOWN")
         in {"RETEST", "FAKE_BREAKOUT"}
     )
-    pullback_rejected = (
-        str(h1_pullback.get("direction") or "NONE") == "SHORT"
-        and str(h1_pullback.get("state") or "UNKNOWN")
-        == "HEALTHY_PULLBACK"
-    )
+    candidates: list[float] = []
+    trigger_high = _float_or_none(h1_trigger.get("rejection_high"))
+    if trigger_confirmed and trigger_high is not None:
+        candidates.append(trigger_high)
     wick_rejections = (
         signal.get("large_wick_rejections")
         if isinstance(signal.get("large_wick_rejections"), dict)
         else {}
     )
-    upper_wick_rejected = isinstance(wick_rejections.get("upper"), dict)
-    reasons = " | ".join(
-        str(reason).lower()
-        for reason in signal.get("reasons") or ()
+    upper_wick = (
+        wick_rejections.get("upper")
+        if isinstance(wick_rejections.get("upper"), dict)
+        else {}
     )
-    explicit_rejection = any(
-        token in reasons
-        for token in (
-            "upside wick swept resistance",
-            "upside sweep rejected resistance",
-            "1h boll/ema pullback rejected",
+    distribution = (
+        signal.get("distribution_short")
+        if isinstance(signal.get("distribution_short"), dict)
+        else {}
+    )
+    zone = distribution.get("descending_trendline_zone")
+    if not isinstance(zone, dict):
+        levels = (
+            signal.get("entry_levels")
+            if isinstance(signal.get("entry_levels"), dict)
+            else {}
         )
-    )
-    return (
-        trigger_confirmed
-        or pullback_rejected
-        or upper_wick_rejected
-        or explicit_rejection
-    )
+        short_levels = (
+            levels.get("short")
+            if isinstance(levels.get("short"), dict)
+            else {}
+        )
+        zone = short_levels.get("descending_high_trendline")
+    if isinstance(zone, dict) and upper_wick:
+        zone_low = _float_or_none(zone.get("low"))
+        trendline = _float_or_none(zone.get("price"))
+        wick_high = _float_or_none(upper_wick.get("high"))
+        wick_close = _float_or_none(upper_wick.get("close"))
+        if (
+            zone_low is not None
+            and trendline is not None
+            and wick_high is not None
+            and wick_close is not None
+            and wick_high >= zone_low
+            and wick_close < trendline
+        ):
+            candidates.append(wick_high)
+    return max(candidates) if candidates else None
 
 
 def _entry_advantage_zone_fraction(
@@ -5857,7 +5886,8 @@ def _distribution_stage_entry_levels(
         if explicit_rejection:
             add("distribution_range_high")
     elif stage == DISTRIBUTION_STAGE_DESCENDING:
-        add("descending_high_trendline")
+        if bool(signal.get("distribution_projection_supported", True)):
+            add("descending_high_trendline")
     elif stage == DISTRIBUTION_STAGE_MARKDOWN:
         add(
             "h1_boll_mid",
@@ -6385,6 +6415,7 @@ def _large_timeframe_wick_rejections(
                 "upper",
                 timeframe,
                 upper_ratio,
+                candle,
             )
         if lower_ratio >= LARGE_TIMEFRAME_WICK_REJECTION_PCT:
             _remember_largest_wick_rejection(
@@ -6392,6 +6423,7 @@ def _large_timeframe_wick_rejections(
                 "lower",
                 timeframe,
                 lower_ratio,
+                candle,
             )
     return rejections
 
@@ -6401,6 +6433,7 @@ def _remember_largest_wick_rejection(
     key: str,
     timeframe: str,
     ratio: float,
+    candle: Candle,
 ) -> None:
     current = rejections.get(key)
     if current is not None and float(current.get("ratio") or 0.0) >= ratio:
@@ -6408,6 +6441,10 @@ def _remember_largest_wick_rejection(
     rejections[key] = {
         "timeframe": timeframe,
         "ratio": ratio,
+        "high": candle.high,
+        "low": candle.low,
+        "close": candle.close,
+        "timestamp": candle.timestamp.isoformat(),
     }
 
 
@@ -6518,6 +6555,7 @@ def _one_hour_trigger(
         resistance_zone_high = resistance_zone_high if resistance_zone_high is not None else resistance + buffer
     direction = "NONE"
     state = "WAIT"
+    rejection_high: float | None = None
     if resistance is not None and resistance_zone_low is not None and resistance_zone_high is not None:
         breakout = current.close > resistance_zone_high
         retest = previous.close > resistance_zone_high and current.low <= resistance_zone_high and current.close > resistance_zone_low
@@ -6526,12 +6564,15 @@ def _one_hour_trigger(
             direction, state = "LONG", "BREAKOUT" if breakout else "RETEST"
         elif fake_breakout:
             direction, state = "SHORT", "FAKE_BREAKOUT"
+            rejection_high = max(previous.high, current.high)
     if support is not None and support_zone_low is not None and support_zone_high is not None:
         breakdown = current.close < support_zone_low
         retest = previous.close < support_zone_low and current.high >= support_zone_low and current.close < support_zone_high
         fake_breakdown = previous.low < support_zone_low and current.close > support_zone_high
         if breakdown or retest:
             direction, state = "SHORT", "BREAKDOWN" if breakdown else "RETEST"
+            if retest:
+                rejection_high = current.high
         elif fake_breakdown:
             direction, state = "LONG", "FAKE_BREAKDOWN"
     return {
@@ -6543,6 +6584,8 @@ def _one_hour_trigger(
         "support_zone_high": support_zone_high,
         "resistance_zone_low": resistance_zone_low,
         "resistance_zone_high": resistance_zone_high,
+        "rejection_high": rejection_high,
+        "confirmation_close": current.close,
     }
 
 
@@ -7002,9 +7045,34 @@ def _distribution_short_structure(
         "high": latest_high + buffer,
         "price": latest_high,
     }
-    descending_zone: dict[str, float] | None = None
-    descending_anchors: tuple[tuple[int, float], tuple[int, float]] | None = None
+    descending_zone: dict[str, object] | None = None
+    descending_anchors: tuple[tuple[int, float], ...] | None = None
+    # Three confirmed lower highs make the projection structurally credible.
+    # A two-anchor line remains a candidate and needs resistance confluence.
+    for first, middle, last in zip(
+        reversed(swing_highs[:-2]),
+        reversed(swing_highs[1:-1]),
+        reversed(swing_highs[2:]),
+    ):
+        if not (first[0] < middle[0] < last[0]):
+            continue
+        if not (first[1] > middle[1] > last[1]):
+            continue
+        slope = (last[1] - first[1]) / (last[0] - first[0])
+        projected = last[1] + slope * ((len(candles) - 1) - last[0])
+        if projected <= 0:
+            continue
+        descending_zone = {
+            "low": projected - buffer,
+            "high": projected + buffer,
+            "price": projected,
+            "anchor_count": 3,
+        }
+        descending_anchors = (first, middle, last)
+        break
     for earlier, later in zip(reversed(swing_highs[:-1]), reversed(swing_highs[1:])):
+        if descending_zone is not None:
+            break
         if later[0] <= earlier[0] or later[1] >= earlier[1]:
             continue
         slope = (later[1] - earlier[1]) / (later[0] - earlier[0])
@@ -7015,6 +7083,7 @@ def _distribution_short_structure(
             "low": projected - buffer,
             "high": projected + buffer,
             "price": projected,
+            "anchor_count": 2,
         }
         descending_anchors = (earlier, later)
         break
@@ -7028,6 +7097,63 @@ def _distribution_short_structure(
         "descending_anchors": descending_anchors,
         "latest_swing_high_index": latest_idx,
     }
+
+
+def _distribution_projection_supported(
+    distribution_short: dict[str, object],
+    entry_levels: dict[str, object],
+) -> bool:
+    """Validate a stage-two candidate without another tuned threshold."""
+    zone = distribution_short.get("descending_trendline_zone")
+    if not isinstance(zone, dict):
+        return False
+    if int(zone.get("anchor_count") or 0) >= 3:
+        return True
+    short_levels = (
+        entry_levels.get("short")
+        if isinstance(entry_levels.get("short"), dict)
+        else {}
+    )
+    return any(
+        _entry_zones_overlap(zone, short_levels.get(key))
+        for key in (
+            "h1_resistance",
+            "h4_resistance",
+            "h1_ema20_ema60",
+            "h4_ema20_ema60",
+            "h1_boll_mid",
+            "h4_boll_mid",
+        )
+    )
+
+
+def _entry_zones_overlap(first: object, second: object) -> bool:
+    if not isinstance(first, dict) or not isinstance(second, dict):
+        return False
+    first_values = [
+        value
+        for value in (
+            _float_or_none(first.get("low")),
+            _float_or_none(first.get("high")),
+            _float_or_none(first.get("price")),
+        )
+        if value is not None
+    ]
+    second_values = [
+        value
+        for value in (
+            _float_or_none(second.get("low")),
+            _float_or_none(second.get("high")),
+            _float_or_none(second.get("price")),
+        )
+        if value is not None
+    ]
+    if not first_values or not second_values:
+        return False
+    return max(min(first_values), min(second_values)) <= min(
+        max(first_values),
+        max(second_values),
+    )
 
 
 def _distribution_short_stage(
@@ -7981,7 +8107,7 @@ def _apply_multi_timeframe_context(signal: dict[str, object], context: dict[str,
                 SETUP_DISTRIBUTION_STAGE2_SHORT,
             )
             reasons.append(
-                "stage 2 descending distribution: short only at the projected lower-high trendline"
+                "stage 2 descending distribution: projected lower-high area requires a real rejection"
             )
         elif distribution_short_stage == DISTRIBUTION_STAGE_MARKDOWN:
             setup_type = _prefer_setup_type(
@@ -7997,9 +8123,13 @@ def _apply_multi_timeframe_context(signal: dict[str, object], context: dict[str,
         elif daily_bias == "BEAR":
             score += 5
             reasons.append("1d bearish bias supports short")
-        if h4_state in {"BREAKDOWN_DOWN", "BOX_LOWER_HALF"}:
+        if h4_state == "BREAKDOWN_DOWN":
             score += 6
             reasons.append("4h structure supports downside")
+        elif h4_state == "BOX_LOWER_HALF":
+            reasons.append(
+                "4h direction remains bearish, but price is in the lower half; wait for a bounce"
+            )
         ma_score, ma_reasons, ma_vetoes = _ma_cluster_signal_adjustment(PositionSide.SHORT, h4_ma_cluster, h1_ma_cluster)
         score += ma_score
         reasons.extend(ma_reasons)
@@ -8094,12 +8224,17 @@ def _apply_multi_timeframe_context(signal: dict[str, object], context: dict[str,
         "h4_ma_cluster": h4_ma_cluster,
         "m15_precision": m15_precision,
         "entry_guardrails": entry_guardrails,
+        "distribution_projection_supported": _distribution_projection_supported(
+            distribution_short,
+            entry_levels,
+        ),
     }
     if setup_type:
         stage_probe["setup_type"] = setup_type
     selected_entry_levels = _scored_entry_levels(stage_probe, entry_levels)
     if (
         action == SignalAction.ENTRY_SHORT.value
+        and _trend_stage_from_signal(stage_probe) == TREND_STAGE_LATE
         and _oi_valley_blocks_low_short_entry(
             stage_probe,
             selected_entry_levels,
@@ -8169,6 +8304,9 @@ def _apply_multi_timeframe_context(signal: dict[str, object], context: dict[str,
         out.pop("entry_timeframe_override", None)
     out["distribution_short"] = distribution_short
     out["distribution_short_stage"] = distribution_short_stage
+    out["distribution_projection_supported"] = bool(
+        stage_probe.get("distribution_projection_supported")
+    )
     out["m15_precision"] = m15_precision
     out["large_wick_rejections"] = large_wick_rejections
     out["entry_guardrails"] = entry_guardrails
@@ -8610,6 +8748,17 @@ def _refine_stop_with_distribution_stage(
     )
     if not key:
         return stop
+    if stage == DISTRIBUTION_STAGE_DESCENDING:
+        rejection_high = _distribution_short_rejection_high(signal)
+        if rejection_high is None:
+            return stop
+        return max(
+            rejection_high + _structure_stop_buffer(entry_price, indicator),
+            entry_price + _minimum_precision_stop_distance(
+                entry_price,
+                indicator,
+            ),
+        )
     levels = (
         signal.get("entry_levels")
         if isinstance(signal.get("entry_levels"), dict)

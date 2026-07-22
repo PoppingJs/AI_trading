@@ -92,6 +92,7 @@ class HistoricalReplayJob:
     finished_at: datetime | None = None
     error: str | None = None
     result: dict[str, Any] | None = None
+    snapshot: dict[str, Any] | None = None
     cancel_requested: bool = False
 
     def payload(self, *, include_result: bool = False) -> dict[str, Any]:
@@ -108,6 +109,7 @@ class HistoricalReplayJob:
             "finished_at": self.finished_at.isoformat() if self.finished_at else None,
             "error": self.error,
             "cancel_requested": self.cancel_requested,
+            "snapshot": self.snapshot,
             "result": self.result if include_result else None,
         }
 
@@ -202,7 +204,12 @@ class HistoricalReplayManager:
                 starting_equity=PAPER_DEFAULT_BALANCE,
             ).run(
                 dataset,
-                progress=lambda timestamp, ratio: self._replay_progress(job.id, timestamp, ratio),
+                progress=lambda timestamp, ratio, snapshot: self._replay_progress(
+                    job.id,
+                    timestamp,
+                    ratio,
+                    snapshot,
+                ),
                 cancelled=lambda: job.cancel_requested,
             )
             if job.cancel_requested:
@@ -247,14 +254,20 @@ class HistoricalReplayManager:
                 job.virtual_time = virtual_time
             return job
 
-    def _replay_progress(self, job_id: str, timestamp: datetime, ratio: float) -> None:
+    def _replay_progress(
+        self,
+        job_id: str,
+        timestamp: datetime,
+        ratio: float,
+        snapshot: dict[str, Any],
+    ) -> None:
         progress = 32 + int(max(0.0, min(ratio, 1.0)) * 60)
-        self._update(
-            job_id,
-            progress=progress,
-            stage=f"历史时间 {timestamp.astimezone(UTC).strftime('%Y-%m-%d %H:%M')}",
-            virtual_time=timestamp,
-        )
+        with self._lock:
+            job = self._jobs[job_id]
+            job.progress = progress
+            job.stage = f"历史时间 {timestamp.astimezone(SHANGHAI).strftime('%Y-%m-%d %H:%M')}"
+            job.virtual_time = timestamp
+            job.snapshot = snapshot
 
     def _finish_cancelled(self, job: HistoricalReplayJob) -> None:
         with self._lock:
@@ -383,7 +396,7 @@ class HistoricalReplayEngine:
         self,
         dataset: HistoricalDataset,
         *,
-        progress: Callable[[datetime, float], None] | None = None,
+        progress: Callable[[datetime, float, dict[str, Any]], None] | None = None,
         cancelled: Callable[[], bool] | None = None,
     ) -> HistoricalReplayResult:
         return asyncio.run(self._run_async(dataset, progress=progress, cancelled=cancelled))
@@ -392,7 +405,7 @@ class HistoricalReplayEngine:
         self,
         dataset: HistoricalDataset,
         *,
-        progress: Callable[[datetime, float], None] | None,
+        progress: Callable[[datetime, float, dict[str, Any]], None] | None,
         cancelled: Callable[[], bool] | None,
     ) -> HistoricalReplayResult:
         timeline = sorted(
@@ -514,7 +527,17 @@ class HistoricalReplayEngine:
             _append_equity_point(paper, close_time, curve)
 
             if progress and (index % 4 == 0 or index == len(timeline) - 1):
-                progress(close_time, (index + 1) / len(timeline))
+                status = paper.status()
+                progress(
+                    close_time,
+                    (index + 1) / len(timeline),
+                    _progress_snapshot(
+                        status,
+                        paper.account.fills,
+                        curve,
+                        self.starting_equity,
+                    ),
+                )
 
         final_time = min(dataset.end, timeline[-1] + timedelta(seconds=_TIMEFRAME_SECONDS[BASE_TIMEFRAME]))
         clock.value = final_time
@@ -1119,6 +1142,69 @@ def _append_equity_point(
         curve[-1] = point
     else:
         curve.append(point)
+
+
+def _progress_snapshot(
+    status: dict[str, object],
+    fills: Iterable[PaperFill],
+    curve: list[tuple[datetime, float]],
+    starting_equity: float,
+) -> dict[str, Any]:
+    """Return the small, strategy-signal-free snapshot used while replaying."""
+    status_fills = status.get("fills")
+    completed_fills = [
+        row
+        for row in (status_fills if isinstance(status_fills, list) else [])
+        if isinstance(row, dict) and row.get("action") == "CLOSE"
+    ]
+    account_keys = (
+        "equity",
+        "available_balance",
+        "used_margin",
+        "realized_pnl",
+        "unrealized_pnl",
+        "total_pnl",
+        "total_pnl_pct",
+        "fees_paid",
+        "positions",
+    )
+    account = {key: status.get(key) for key in account_keys}
+    account["fills"] = completed_fills
+
+    groups: dict[tuple[str, datetime], list[PaperFill]] = {}
+    for fill in fills:
+        groups.setdefault((fill.symbol, fill.opened_at), []).append(fill)
+    completed_pnl = []
+    for items in groups.values():
+        if not any(fill.action == "CLOSE" for fill in items):
+            continue
+        realized = sum(
+            fill.realized_pnl
+            for fill in items
+            if fill.action in {"PARTIAL_CLOSE", "CLOSE", "FUNDING"}
+        )
+        entry_fees = sum(fill.fee for fill in items if fill.action in {"OPEN", "ADD"})
+        completed_pnl.append(realized - entry_fees)
+
+    equity_value = status.get("equity")
+    equity = float(equity_value if equity_value is not None else starting_equity)
+    total_pnl = equity - starting_equity
+    return _json_safe(
+        {
+            "summary": {
+                "win_rate": (
+                    sum(value > 0 for value in completed_pnl) / len(completed_pnl)
+                    if completed_pnl
+                    else 0.0
+                ),
+                "trade_count": len(completed_pnl),
+                "max_drawdown": _max_drawdown(curve, starting_equity),
+                "total_pnl": total_pnl,
+                "total_return": total_pnl / starting_equity if starting_equity else 0.0,
+            },
+            "account": account,
+        }
+    )
 
 
 def _paper_equity(paper: PaperTradingEngine) -> float:
