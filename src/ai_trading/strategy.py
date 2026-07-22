@@ -19,6 +19,27 @@ from ai_trading.models import (
 
 
 DIRECTION_SCORE_GAP_FOR_DIRECT_ENTRY = 8
+SCORE_FAMILY_MA_POSITION = "MA_POSITION"
+SCORE_FAMILY_DERIVATIVES = "DERIVATIVES"
+SCORE_FAMILY_DIRECTION = "DIRECTION"
+SCORE_FAMILY_TRIGGER = "TRIGGER"
+
+
+def apply_positive_evidence_family(
+    score: int,
+    evidence_families: dict[str, int],
+    family: str,
+    points: int,
+) -> int:
+    """Apply only the strongest positive contribution in an evidence family."""
+
+    if points <= 0:
+        return score
+    current = max(0, int(evidence_families.get(family, 0)))
+    if points <= current:
+        return score
+    evidence_families[family] = points
+    return score + points - current
 
 
 class CompositeStrategy:
@@ -26,6 +47,8 @@ class CompositeStrategy:
 
     def __init__(self, settings: StrategySettings | None = None) -> None:
         self.settings = settings or StrategySettings()
+        self._last_long_evidence_families: dict[str, int] = {}
+        self._last_short_evidence_families: dict[str, int] = {}
 
     def generate_signal(
         self,
@@ -63,6 +86,12 @@ class CompositeStrategy:
         best_reasons = long_reasons if best_is_long else short_reasons
         best_vetoes = long_vetoes if best_is_long else short_vetoes
         best_setup_type = long_setup_type if best_is_long else short_setup_type
+        best_evidence_families = (
+            self._last_long_evidence_families
+            if best_is_long
+            else self._last_short_evidence_families
+        )
+        frozen_evidence_families = tuple(sorted(best_evidence_families.items()))
         direction = PositionSide.LONG if best_is_long else PositionSide.SHORT
         opposite_score = short_score if best_is_long else long_score
         direction_score_gap = best_score - opposite_score
@@ -90,6 +119,7 @@ class CompositeStrategy:
                     ),
                     indicators=current,
                     setup_type=best_setup_type,
+                    score_evidence_families=frozen_evidence_families,
                 )
             return StrategySignal(
                 symbol=symbol,
@@ -106,6 +136,7 @@ class CompositeStrategy:
                 reasons=tuple(best_reasons),
                 indicators=current,
                 setup_type=best_setup_type,
+                score_evidence_families=frozen_evidence_families,
             )
 
         if best_score >= self.settings.watch_threshold:
@@ -120,6 +151,7 @@ class CompositeStrategy:
                 reasons=tuple(best_reasons),
                 indicators=current,
                 setup_type=best_setup_type,
+                score_evidence_families=frozen_evidence_families,
             )
 
         return StrategySignal(
@@ -133,6 +165,7 @@ class CompositeStrategy:
             reasons=("score below trading threshold",),
             indicators=current,
             setup_type=best_setup_type,
+            score_evidence_families=frozen_evidence_families,
         )
 
     def exit_signal(self, position_side: str, indicators: IndicatorSnapshot) -> StrategySignal | None:
@@ -297,6 +330,7 @@ class CompositeStrategy:
         structure = _market_structure(candles, indicators, self.settings)
         strict_vetoes = self._strict_long_vetoes(candles, indicators) if self.settings.strict_trend_entry else []
         score = 0
+        evidence_families: dict[str, int] = {}
         reasons: list[str] = []
         vetoes = self._common_long_vetoes(current) + strict_vetoes
         setup_type = ""
@@ -307,7 +341,12 @@ class CompositeStrategy:
 
         if current.ema20 and current.ema50 and current.ma100:
             if current.close > current.ema50 and current.ema20 > current.ema50 and (current.ema50_slope or 0) > 0:
-                score += 20
+                score = apply_positive_evidence_family(
+                    score,
+                    evidence_families,
+                    SCORE_FAMILY_MA_POSITION,
+                    20,
+                )
                 reasons.append("EMA20 above EMA50 and EMA50 rising")
             if current.close > current.ma100:
                 score += 5
@@ -318,7 +357,12 @@ class CompositeStrategy:
             near_pullback_zone = min(abs(current.close - current.ema20), abs(current.close - current.boll_mid)) <= current.atr14 * self.settings.pullback_tolerance_atr
             not_extended = (current.close - current.ema20) <= current.atr14 * self.settings.max_extension_atr
             if (reclaimed_mid or near_pullback_zone) and not_extended:
-                score += 15
+                score = apply_positive_evidence_family(
+                    score,
+                    evidence_families,
+                    SCORE_FAMILY_MA_POSITION,
+                    15,
+                )
                 setup_type = SETUP_H1_PULLBACK_LONG
                 reasons.append("close confirmed near EMA20/BOLL mid without chasing upper band")
 
@@ -363,7 +407,12 @@ class CompositeStrategy:
             reasons.append(volume_reason)
 
         if _long_washout_confirmed(candles[-1], current, structure, self.settings):
-            score += 14
+            score = apply_positive_evidence_family(
+                score,
+                evidence_families,
+                SCORE_FAMILY_DERIVATIVES,
+                14,
+            )
             setup_type = SETUP_H1_STRUCTURE_LONG
             reasons.append("washout confirmed: downside wick swept support, OI dropped, close reclaimed key level")
 
@@ -385,15 +434,30 @@ class CompositeStrategy:
                 score -= 8
                 reasons.append("open interest spike risk; long quality reduced until structure confirms")
             elif self.settings.oi_mild_change_min <= current.oi_change < self.settings.oi_extreme_change:
-                score += 15
+                score = apply_positive_evidence_family(
+                    score,
+                    evidence_families,
+                    SCORE_FAMILY_DERIVATIVES,
+                    15,
+                )
                 reasons.append("open interest rising mildly with price")
             elif abs(current.oi_change) < self.settings.oi_mild_change_min:
-                score += 6
+                score = apply_positive_evidence_family(
+                    score,
+                    evidence_families,
+                    SCORE_FAMILY_DERIVATIVES,
+                    6,
+                )
                 reasons.append("open interest stable")
 
         if current.long_short_ratio is not None:
             if current.long_short_ratio < self.settings.long_short_overcrowded_long:
-                score += 10
+                score = apply_positive_evidence_family(
+                    score,
+                    evidence_families,
+                    SCORE_FAMILY_DERIVATIVES,
+                    10,
+                )
                 reasons.append("long/short ratio is not overcrowded long")
             else:
                 score -= 10
@@ -408,15 +472,26 @@ class CompositeStrategy:
                 score -= 8
                 reasons.append("funding overheated for longs; quality reduced but not hard blocked")
             else:
-                score += 10
+                score = apply_positive_evidence_family(
+                    score,
+                    evidence_families,
+                    SCORE_FAMILY_DERIVATIVES,
+                    10,
+                )
                 reasons.append("funding rate is not overheated for longs")
 
         if cycle.long_bias > 0:
-            score += cycle.long_bias
+            score = apply_positive_evidence_family(
+                score,
+                evidence_families,
+                SCORE_FAMILY_DERIVATIVES,
+                cycle.long_bias,
+            )
             reasons.append(cycle.reason)
         if cycle.long_veto:
             vetoes.append(cycle.long_veto)
 
+        self._last_long_evidence_families = dict(evidence_families)
         return score, reasons, vetoes, setup_type
 
     def _score_short(self, candles: Sequence[Candle], indicators: Sequence[IndicatorSnapshot]) -> tuple[int, list[str], list[str], str]:
@@ -426,6 +501,7 @@ class CompositeStrategy:
         structure = _market_structure(candles, indicators, self.settings)
         strict_vetoes = self._strict_short_vetoes(candles, indicators) if self.settings.strict_trend_entry else []
         score = 0
+        evidence_families: dict[str, int] = {}
         reasons: list[str] = []
         vetoes = self._common_short_vetoes(current) + strict_vetoes
         setup_type = ""
@@ -436,7 +512,12 @@ class CompositeStrategy:
 
         if current.ema20 and current.ema50 and current.ma100:
             if current.close < current.ema50 and current.ema20 < current.ema50 and (current.ema50_slope or 0) < 0:
-                score += 20
+                score = apply_positive_evidence_family(
+                    score,
+                    evidence_families,
+                    SCORE_FAMILY_MA_POSITION,
+                    20,
+                )
                 reasons.append("EMA20 below EMA50 and EMA50 falling")
             if current.close < current.ma100:
                 score += 5
@@ -447,7 +528,12 @@ class CompositeStrategy:
             near_retest_zone = min(abs(current.close - current.ema20), abs(current.close - current.boll_mid)) <= current.atr14 * self.settings.pullback_tolerance_atr
             not_extended = (current.ema20 - current.close) <= current.atr14 * self.settings.max_extension_atr
             if (failed_mid or near_retest_zone) and not_extended:
-                score += 15
+                score = apply_positive_evidence_family(
+                    score,
+                    evidence_families,
+                    SCORE_FAMILY_MA_POSITION,
+                    15,
+                )
                 setup_type = SETUP_H1_PULLBACK_SHORT
                 reasons.append("close confirmed failed retest near EMA20/BOLL mid")
 
@@ -492,7 +578,12 @@ class CompositeStrategy:
             reasons.append(volume_reason)
 
         if _short_washout_confirmed(candles[-1], current, structure, self.settings):
-            score += 14
+            score = apply_positive_evidence_family(
+                score,
+                evidence_families,
+                SCORE_FAMILY_DERIVATIVES,
+                14,
+            )
             setup_type = SETUP_H1_STRUCTURE_SHORT
             reasons.append("washout confirmed: upside wick swept resistance, OI dropped, close rejected key level")
 
@@ -514,15 +605,30 @@ class CompositeStrategy:
                 score -= 8
                 reasons.append("open interest spike risk; short quality reduced until structure confirms")
             elif self.settings.oi_mild_change_min <= current.oi_change < self.settings.oi_extreme_change:
-                score += 15
+                score = apply_positive_evidence_family(
+                    score,
+                    evidence_families,
+                    SCORE_FAMILY_DERIVATIVES,
+                    15,
+                )
                 reasons.append("open interest rising mildly with falling price")
             elif abs(current.oi_change) < self.settings.oi_mild_change_min:
-                score += 6
+                score = apply_positive_evidence_family(
+                    score,
+                    evidence_families,
+                    SCORE_FAMILY_DERIVATIVES,
+                    6,
+                )
                 reasons.append("open interest stable")
 
         if current.long_short_ratio is not None:
             if current.long_short_ratio > self.settings.long_short_overcrowded_short:
-                score += 10
+                score = apply_positive_evidence_family(
+                    score,
+                    evidence_families,
+                    SCORE_FAMILY_DERIVATIVES,
+                    10,
+                )
                 reasons.append("long/short ratio is not overcrowded short")
             else:
                 score -= 10
@@ -537,15 +643,26 @@ class CompositeStrategy:
                 score -= 8
                 reasons.append("funding overheated for shorts; quality reduced but not hard blocked")
             else:
-                score += 10
+                score = apply_positive_evidence_family(
+                    score,
+                    evidence_families,
+                    SCORE_FAMILY_DERIVATIVES,
+                    10,
+                )
                 reasons.append("funding rate is not overheated for shorts")
 
         if cycle.short_bias > 0:
-            score += cycle.short_bias
+            score = apply_positive_evidence_family(
+                score,
+                evidence_families,
+                SCORE_FAMILY_DERIVATIVES,
+                cycle.short_bias,
+            )
             reasons.append(cycle.reason)
         if cycle.short_veto:
             vetoes.append(cycle.short_veto)
 
+        self._last_short_evidence_families = dict(evidence_families)
         return score, reasons, vetoes, setup_type
 
     def _common_long_vetoes(self, current: IndicatorSnapshot) -> list[str]:

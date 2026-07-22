@@ -13,7 +13,24 @@ from ai_trading.models import (
     PositionSide,
     SignalAction,
 )
-from ai_trading.strategy import CompositeStrategy, MarketStructure, _volume_breakout_retest_confirmation
+from ai_trading.strategy import (
+    SCORE_FAMILY_DERIVATIVES,
+    SCORE_FAMILY_MA_POSITION,
+    CompositeStrategy,
+    MarketStructure,
+    _volume_breakout_retest_confirmation,
+    apply_positive_evidence_family,
+)
+
+
+def test_positive_evidence_family_keeps_only_the_strongest_bonus() -> None:
+    families: dict[str, int] = {}
+    score = apply_positive_evidence_family(0, families, SCORE_FAMILY_DERIVATIVES, 6)
+    score = apply_positive_evidence_family(score, families, SCORE_FAMILY_DERIVATIVES, 15)
+    score = apply_positive_evidence_family(score, families, SCORE_FAMILY_DERIVATIVES, 10)
+
+    assert score == 15
+    assert families == {SCORE_FAMILY_DERIVATIVES: 15}
 
 
 def test_strategy_defers_overheated_rsi_to_multi_timeframe_context() -> None:
@@ -138,10 +155,14 @@ def test_strategy_emits_long_when_score_is_strong() -> None:
         funding_rate=0.0001,
     )
 
-    signal = CompositeStrategy(StrategySettings(score_threshold=70, strict_trend_entry=False)).generate_signal("BTCUSDT", candles, indicators)
+    signal = CompositeStrategy(StrategySettings(score_threshold=65, strict_trend_entry=False)).generate_signal("BTCUSDT", candles, indicators)
 
     assert signal.action == SignalAction.ENTRY_LONG
-    assert signal.score >= 70
+    assert signal.score >= 65
+    assert dict(signal.score_evidence_families) == {
+        SCORE_FAMILY_DERIVATIVES: 15,
+        SCORE_FAMILY_MA_POSITION: 20,
+    }
 
 
 def test_strategy_downgrades_but_does_not_block_after_upper_wick_sweep() -> None:
@@ -167,7 +188,7 @@ def test_strategy_downgrades_but_does_not_block_after_upper_wick_sweep() -> None
         funding_rate=0.0001,
     )
 
-    signal = CompositeStrategy(StrategySettings(score_threshold=70, strict_trend_entry=False)).generate_signal("BTCUSDT", candles, indicators)
+    signal = CompositeStrategy(StrategySettings(score_threshold=60, strict_trend_entry=False)).generate_signal("BTCUSDT", candles, indicators)
 
     assert "upper wick sweep rejected; avoid chasing long" not in signal.vetoes
     assert "upper wick rejected; wait for pullback or reclaim before adding long" in signal.reasons

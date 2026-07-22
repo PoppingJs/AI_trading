@@ -758,9 +758,7 @@ def analyze_replay_failures(
     dataset: HistoricalDataset,
 ) -> dict[str, object]:
     ordered = sorted(fills, key=lambda fill: fill.timestamp)
-    groups: dict[tuple[str, datetime], list[PaperFill]] = {}
-    for fill in ordered:
-        groups.setdefault((fill.symbol, fill.opened_at), []).append(fill)
+    groups = _fill_lifecycle_groups(ordered)
 
     lifecycles: list[dict[str, object]] = []
     for key, items in groups.items():
@@ -800,6 +798,82 @@ def analyze_replay_failures(
         },
         "failure_summary": summary,
         "symbol_summaries": _symbol_analysis_summaries(lifecycles),
+    }
+
+
+def _fill_lifecycle_groups(
+    fills: Iterable[PaperFill],
+) -> dict[tuple[str, datetime], list[PaperFill]]:
+    groups: dict[tuple[str, datetime], list[PaperFill]] = {}
+    for fill in fills:
+        groups.setdefault((fill.symbol, fill.opened_at), []).append(fill)
+    return groups
+
+
+def _completed_trade_payloads(
+    fills: Iterable[PaperFill],
+) -> list[dict[str, object]]:
+    """Aggregate one open-to-final-close lifecycle into one trade record."""
+    ordered = sorted(fills, key=lambda fill: fill.timestamp)
+    rows = [
+        row
+        for key, items in _fill_lifecycle_groups(ordered).items()
+        if (row := _completed_trade_payload(key, items)) is not None
+    ]
+    rows.sort(key=lambda row: str(row["closed_at"]), reverse=True)
+    return rows
+
+
+def _completed_trade_payload(
+    key: tuple[str, datetime],
+    fills: list[PaperFill],
+) -> dict[str, object] | None:
+    entries = [fill for fill in fills if fill.action in {"OPEN", "ADD"}]
+    closes = [fill for fill in fills if fill.action in {"PARTIAL_CLOSE", "CLOSE"}]
+    opens = [fill for fill in entries if fill.action == "OPEN"]
+    if not opens or not any(fill.action == "CLOSE" for fill in closes):
+        return None
+
+    opening = opens[0]
+    closing = next(fill for fill in reversed(closes) if fill.action == "CLOSE")
+    realized = sum(
+        fill.realized_pnl
+        for fill in fills
+        if fill.action in {"PARTIAL_CLOSE", "CLOSE", "FUNDING"}
+    )
+    entry_fees = sum(fill.fee for fill in entries)
+    pnl = realized - entry_fees
+    entry_quantity = sum(fill.quantity for fill in entries)
+    closed_quantity = sum(fill.quantity for fill in closes)
+    entry_notional = sum(fill.price * fill.quantity for fill in entries)
+    exit_notional = sum(fill.price * fill.quantity for fill in closes)
+    committed_margin = sum(fill.margin_usdt for fill in entries)
+    exit_time = closing.closed_at or closing.timestamp
+
+    return {
+        "id": f"{key[0]}-{key[1].isoformat()}",
+        "symbol": opening.symbol,
+        "side": opening.side.value,
+        "action": "CLOSE",
+        "leverage": opening.leverage,
+        "entry_price": (
+            entry_notional / entry_quantity if entry_quantity > 0 else opening.entry_price
+        ),
+        "price": exit_notional / closed_quantity if closed_quantity > 0 else closing.price,
+        "quantity": entry_quantity,
+        "realized_pnl": pnl,
+        "fee": sum(fill.fee for fill in fills),
+        "margin_usdt": committed_margin,
+        "return_pct": pnl / committed_margin if committed_margin > 0 else 0.0,
+        "stop_price": closing.stop_price,
+        "take_profit_1": closing.take_profit_1,
+        "take_profit_2": closing.take_profit_2,
+        "opened_at": opening.opened_at.isoformat(),
+        "closed_at": exit_time.isoformat(),
+        "entry_position": opening.entry_position,
+        "reason": closing.reason,
+        "adds": sum(fill.action == "ADD" for fill in fills),
+        "partials": sum(fill.action == "PARTIAL_CLOSE" for fill in fills),
     }
 
 
@@ -864,17 +938,12 @@ def _lifecycle_payload(
 ) -> dict[str, object] | None:
     opens = [fill for fill in fills if fill.action == "OPEN"]
     closes = [fill for fill in fills if fill.action in {"PARTIAL_CLOSE", "CLOSE"}]
-    if not opens or not any(fill.action == "CLOSE" for fill in closes):
+    completed_trade = _completed_trade_payload(key, fills)
+    if not opens or completed_trade is None:
         return None
     opening = opens[0]
     closing = next(fill for fill in reversed(closes) if fill.action == "CLOSE")
-    realized = sum(
-        fill.realized_pnl
-        for fill in fills
-        if fill.action in {"PARTIAL_CLOSE", "CLOSE", "FUNDING"}
-    )
-    entry_fees = sum(fill.fee for fill in fills if fill.action in {"OPEN", "ADD"})
-    pnl = realized - entry_fees
+    pnl = float(completed_trade["realized_pnl"])
     planned_risk = opening.planned_risk_usdt or abs(opening.entry_price - opening.stop_price) * opening.quantity
     exit_time = closing.closed_at or closing.timestamp
     exit_category = _exit_category(closing.reason)
@@ -894,8 +963,8 @@ def _lifecycle_payload(
         "entry_quality": opening.entry_quality or "-",
         "opened_at": opening.opened_at.isoformat(),
         "closed_at": exit_time.isoformat(),
-        "entry_price": opening.entry_price,
-        "exit_price": closing.price,
+        "entry_price": completed_trade["entry_price"],
+        "exit_price": completed_trade["price"],
         "stop_price": opening.stop_price,
         "take_profit_1": opening.take_profit_1,
         "take_profit_2": opening.take_profit_2,
@@ -970,6 +1039,8 @@ def _result_payload(
     analysis: dict[str, object],
 ) -> dict[str, Any]:
     metrics = analysis["metrics"]
+    account = dict(replay.final_status)
+    account["fills"] = _completed_trade_payloads(replay.fills)
     return _json_safe(
         {
             "summary": {
@@ -992,7 +1063,7 @@ def _result_payload(
             "universe_note": "首次运行时固定的当前Top50，非历史Top50；同日期命中缓存后沿用该名单。",
             "skipped_symbols": list(dataset.skipped),
             "equity_curve": _downsample_curve(replay.equity_curve),
-            "account": replay.final_status,
+            "account": account,
             "analysis": analysis,
             "per_symbol_pnl": replay.per_symbol_pnl,
             "notes": replay.notes,
@@ -1151,12 +1222,7 @@ def _progress_snapshot(
     starting_equity: float,
 ) -> dict[str, Any]:
     """Return the small, strategy-signal-free snapshot used while replaying."""
-    status_fills = status.get("fills")
-    completed_fills = [
-        row
-        for row in (status_fills if isinstance(status_fills, list) else [])
-        if isinstance(row, dict) and row.get("action") == "CLOSE"
-    ]
+    completed_trades = _completed_trade_payloads(fills)
     account_keys = (
         "equity",
         "available_balance",
@@ -1169,22 +1235,8 @@ def _progress_snapshot(
         "positions",
     )
     account = {key: status.get(key) for key in account_keys}
-    account["fills"] = completed_fills
-
-    groups: dict[tuple[str, datetime], list[PaperFill]] = {}
-    for fill in fills:
-        groups.setdefault((fill.symbol, fill.opened_at), []).append(fill)
-    completed_pnl = []
-    for items in groups.values():
-        if not any(fill.action == "CLOSE" for fill in items):
-            continue
-        realized = sum(
-            fill.realized_pnl
-            for fill in items
-            if fill.action in {"PARTIAL_CLOSE", "CLOSE", "FUNDING"}
-        )
-        entry_fees = sum(fill.fee for fill in items if fill.action in {"OPEN", "ADD"})
-        completed_pnl.append(realized - entry_fees)
+    account["fills"] = completed_trades
+    completed_pnl = [float(row["realized_pnl"]) for row in completed_trades]
 
     equity_value = status.get("equity")
     equity = float(equity_value if equity_value is not None else starting_equity)

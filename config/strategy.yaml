@@ -7,7 +7,7 @@ timeframes:
   - 1d
 
 strategy:
-  score_threshold: 85
+  score_threshold: 80
   watch_threshold: 65
   strict_trend_entry: false
   volume_window: 20

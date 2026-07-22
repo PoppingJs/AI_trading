@@ -522,7 +522,7 @@ def test_open_position_strategy_signal_only_shows_already_open_veto() -> None:
         "entry_timing_reason": "high area without pullback confirmation",
         "vetoes": (
             "high area without pullback confirmation; wait for 1h/4h pullback before long",
-            "final score 70 below auto-entry minimum 85",
+            "final score 70 below auto-entry minimum 80",
             "current entry position is not excellent",
         ),
     }
@@ -1718,9 +1718,9 @@ def test_auto_main_pool_uses_score_65_regardless_of_signal_action() -> None:
     [
         (64, SignalAction.NO_TRADE.value),
         (65, SignalAction.WATCH.value),
-        (81, SignalAction.WATCH.value),
-        (82, SignalAction.WATCH.value),
-        (84, SignalAction.WATCH.value),
+        (79, SignalAction.WATCH.value),
+        (80, SignalAction.ENTRY_LONG.value),
+        (84, SignalAction.ENTRY_LONG.value),
         (85, SignalAction.ENTRY_LONG.value),
     ],
 )
@@ -1743,6 +1743,55 @@ def test_final_score_band_normalizes_signal_action(
 
     assert signal["score"] == score
     assert signal["action"] == expected_action
+
+
+def test_multi_timeframe_score_deduplicates_evidence_across_families() -> None:
+    signal = {
+        "action": SignalAction.WATCH.value,
+        "candidate_action": SignalAction.ENTRY_LONG.value,
+        "score": 60,
+        "score_evidence_families": {
+            "MA_POSITION": 20,
+            "DERIVATIVES": 15,
+        },
+        "reasons": (),
+        "vetoes": (),
+        "risk_state": "NORMAL",
+        "trend_state": "TREND_LONG",
+    }
+    context = {
+        "daily_bias": "BULL",
+        "h4_structure": {"state": "BREAKOUT_UP"},
+        "h4_ma_cluster": {"state": "BREAKOUT_UP"},
+        "h1_ma_cluster": {"state": "RETEST_UP"},
+        "h1_trigger": {"direction": "LONG", "state": "RETEST"},
+        "h1_pullback": {"direction": "LONG", "state": "HEALTHY_PULLBACK"},
+        "h4_oi": {"state": "REBUILD_BREAKOUT_LONG"},
+        "summary": "MTF: dedup test",
+    }
+
+    adjusted = _apply_multi_timeframe_context(signal, context)
+
+    assert adjusted["score"] == 76
+    assert adjusted["score_evidence_families"] == {
+        "DERIVATIVES": 15,
+        "DIRECTION": 6,
+        "MA_POSITION": 20,
+        "TRIGGER": 10,
+    }
+
+
+def test_ma_cluster_uses_strongest_location_evidence_only() -> None:
+    score, reasons, vetoes = _ma_cluster_signal_adjustment(
+        PositionSide.LONG,
+        {"state": "BREAKOUT_UP", "price": 1.30},
+        {"state": "RETEST_UP", "price": 1.31},
+    )
+
+    assert score == 14
+    assert "MA cluster breakout up: price=1.31" in reasons
+    assert "MA cluster retest held near MA20: price=1.31" in reasons
+    assert not vetoes
 
 
 def test_auto_main_pool_never_exceeds_50_symbols() -> None:
@@ -2002,7 +2051,8 @@ def test_auto_signal_score_tiers_and_margins() -> None:
     })
     assert _auto_signal_allowed({**base_signal, "score": 85, "risk_state": "NORMAL"})
     assert not _auto_signal_allowed({**base_signal, "score": 78, "risk_state": "FUNDING_HOT"})
-    assert not _auto_signal_allowed({**base_signal, "score": 81, "risk_state": "NORMAL"})
+    assert _auto_signal_allowed({**base_signal, "score": 81, "risk_state": "NORMAL"})
+    assert not _auto_signal_allowed({**base_signal, "score": 79, "risk_state": "NORMAL"})
     assert not _auto_signal_allowed({**base_signal, "score": 74, "risk_state": "NORMAL"})
     assert not _auto_signal_allowed({**base_signal, "score": 90, "risk_state": "NORMAL", "vetoes": ("1h trigger opposes long entry",)})
     assert not _auto_signal_allowed({"score": 90, "risk_state": "NORMAL"})
@@ -2027,7 +2077,7 @@ def test_entry_quality_uses_only_a_and_s_score_bands() -> None:
         setup_type=SETUP_H1_PULLBACK_LONG,
     ) == "A"
     assert _entry_quality_grade(
-        score=84,
+        score=79,
         reward_r=1.25,
         stop_pct=0.08,
         setup_type=SETUP_H1_PULLBACK_LONG,
@@ -2062,7 +2112,7 @@ def test_s_quality_uses_only_the_one_remaining_capital_unit() -> None:
 def test_auto_entry_prerequisites_explain_score_direction_and_timing_blocks() -> None:
     wait_signal = {
         "action": SignalAction.ENTRY_LONG.value,
-        "score": 81,
+        "score": 79,
         "risk_state": "NORMAL",
         "price": 106.0,
         "entry_levels": {"long": {"h1_support": {"low": 99.0, "high": 101.0, "price": 100.0}}},
@@ -2070,12 +2120,12 @@ def test_auto_entry_prerequisites_explain_score_direction_and_timing_blocks() ->
 
     blocks = _auto_entry_prerequisite_blocks(wait_signal)
 
-    assert "final score 81 below auto-entry minimum 85" in blocks
+    assert "final score 79 below auto-entry minimum 80" in blocks
     assert "等待 1H支撑回踩区" in blocks
     assert _auto_entry_prerequisite_blocks(
         wait_signal,
         include_entry_position=False,
-    ) == ("final score 81 below auto-entry minimum 85",)
+    ) == ("final score 79 below auto-entry minimum 80",)
     assert _auto_entry_prerequisite_blocks({"action": SignalAction.WATCH.value, "score": 90}) == (
         "directional entry signal not established",
     )
@@ -4541,7 +4591,7 @@ def test_multi_timeframe_healthy_pullback_adds_score() -> None:
     adjusted = _apply_multi_timeframe_context(signal, context)
     _update_entry_position_fields(adjusted)
 
-    assert adjusted["score"] == 103
+    assert adjusted["score"] == 98
     assert "1h BOLL/EMA pullback held with clean risk" in adjusted["reasons"]
     assert not adjusted["vetoes"]
 
@@ -4573,7 +4623,7 @@ def test_high_score_without_core_entry_structure_is_capped_below_auto_entry() ->
 
     adjusted = _apply_multi_timeframe_context(signal, context)
 
-    assert adjusted["score"] == 84
+    assert adjusted["score"] == 79
     assert adjusted["action"] == SignalAction.WATCH.value
     assert adjusted["entry_levels"] == {}
     assert (

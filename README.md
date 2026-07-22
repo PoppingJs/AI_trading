@@ -26,8 +26,13 @@ The strategy avoids single-indicator prediction. It scores market state instead:
 - Momentum filter: `RSI14`.
 - Stop buffer: structural high/low plus ATR buffer.
 
-Signals below 65 are `NO_TRADE`; scores from 65 to 81 remain under
-observation, and scores of at least 82 establish a directional entry signal.
+Positive scoring evidence is deduplicated by family: EMA/BOLL location,
+derivatives, daily/4h direction, and 15m trigger each contribute only their
+strongest item. All reasons remain visible, while negative penalties and vetoes
+remain independent and are never removed by deduplication.
+
+Signals below 65 are `NO_TRADE`; scores from 65 to 79 remain under
+observation, and scores of at least 80 establish a directional entry signal.
 Hard vetoes remain visible on the signal and are enforced by automatic entry:
 
 - No long chase when RSI is overheated, price closes above upper BOLL, funding is hot, long side is crowded, or OI spikes.
@@ -45,9 +50,9 @@ margin_required = notional / leverage
 Automatic trading capital allocation:
 
 - Deployable margin: `95%` of current equity, split into five units.
-- `A` entry: score `85-99`, at most one unit.
+- `A` entry: score `80-99`, at most one unit.
 - `S` entry: score `100+`, at most two units; it uses one unit when only one remains.
-- Scores below `85` do not open automatically.
+- Scores below `80` do not open automatically.
 - Default leverage: `5x`; maximum leverage: `10x`, further capped by stop distance.
 - Maximum open positions: `5`.
 - Daily/weekly loss limits, maximum drawdown and consecutive-loss cooldown are disabled by default during paper-strategy testing. Setting their limits above zero restores the corresponding hard entry gates.

@@ -35,7 +35,7 @@ def test_new_backtest_page_keeps_only_realtime_and_historical_navigation(tmp_pat
         backtest = client.get("/backtest")
     assert realtime.status_code == backtest.status_code == 200
     assert 'href="/backtest"' in realtime.text
-    assert "\u8bc4\u5206\u4f4e\u4e8e85" in realtime.text
+    assert "\u8bc4\u5206\u4f4e\u4e8e80" in realtime.text
     assert "\u8bc4\u5206\u4f4e\u4e8e82" not in realtime.text
     assert 'href="/review"' not in realtime.text
     assert "历史回测" in backtest.text
@@ -54,7 +54,8 @@ def test_new_backtest_page_keeps_only_realtime_and_historical_navigation(tmp_pat
     assert "symbol_summaries" in backtest.text
     assert 'class="day-tick"' in backtest.text
     assert "成交记录与失败归因" not in backtest.text
-    assert "<h2>已完成成交</h2>" in backtest.text
+    assert "<h2>成交记录</h2>" in backtest.text
+    assert "已完成成交" not in backtest.text
     assert "策略信号" not in backtest.text
     assert "<th>主力周期</th>" not in backtest.text
     assert "<th>失败根因</th>" not in backtest.text
@@ -66,12 +67,16 @@ def test_new_backtest_page_keeps_only_realtime_and_historical_navigation(tmp_pat
     assert "跳过${result.skipped_symbols.length}个数据不完整币种" not in backtest.text
     assert "<tr><th>币种</th><th>方向</th><th>杠杆</th><th>入场</th><th>现价</th><th>数量</th><th>保证金</th><th>浮盈亏</th><th>收益率</th><th>止损</th><th>止盈</th><th>入场原因</th></tr>" in backtest.text
     assert "<tr><th>币种</th><th>方向</th><th>杠杆</th><th>开仓均价</th><th>平仓均价</th><th>数量</th><th>止损</th><th>止盈</th><th>收益率</th><th>实现盈亏</th><th>手续费</th><th>开仓时间</th><th>平仓时间</th><th>入场位置</th><th>出场原因</th></tr>" in backtest.text
-    assert 'id="analysisSection" hidden' in backtest.text
+    assert 'id="analysisSection"' in backtest.text
+    assert 'id="analysisSection" hidden' not in backtest.text
+    assert 'id="failureSummary"></div>' in backtest.text
+    assert 'id="equityChart"></div>' in backtest.text
+    assert "replayState" not in backtest.text
     assert "job.snapshot" in backtest.text
     assert "entryReasonText" in backtest.text
     assert "exitReasonText" in backtest.text
-    assert "document.getElementById('runButton').textContent='回测运行中'" in backtest.text
-    assert "回测中 ${job.progress||0}%" not in backtest.text
+    assert ".filter(row=>row.action==='CLOSE')" not in backtest.text
+    assert "回测中 ${job.progress||0}%" in backtest.text
     assert "本金" not in backtest.text
     assert "标的池" not in backtest.text
     assert "<label>周期</label>" not in backtest.text

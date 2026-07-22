@@ -99,6 +99,7 @@ class StrategySignal:
     reasons: tuple[str, ...] = ()
     indicators: IndicatorSnapshot | None = None
     setup_type: str = ""
+    score_evidence_families: tuple[tuple[str, int], ...] = ()
 
 
 @dataclass

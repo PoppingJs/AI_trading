@@ -37,7 +37,14 @@ from ai_trading.models import (
     SignalAction,
     Trade,
 )
-from ai_trading.strategy import CompositeStrategy
+from ai_trading.strategy import (
+    SCORE_FAMILY_DERIVATIVES,
+    SCORE_FAMILY_DIRECTION,
+    SCORE_FAMILY_MA_POSITION,
+    SCORE_FAMILY_TRIGGER,
+    CompositeStrategy,
+    apply_positive_evidence_family,
+)
 from ai_trading.risk import (
     AccountRiskSnapshot,
     PortfolioRiskDecision,
@@ -63,7 +70,7 @@ PYRAMID_MAX_ADDS = 1
 PAPER_DEFAULT_BALANCE = 1200.0
 CAPITAL_DEPLOYMENT_FRACTION = 0.95
 CAPITAL_UNIT_COUNT = 5
-ENTRY_QUALITY_A_MIN_SCORE = 85
+ENTRY_QUALITY_A_MIN_SCORE = 80
 ENTRY_QUALITY_S_MIN_SCORE = 100
 ENTRY_ADVANTAGE_ZONE_FRACTION = 0.60
 H4_SHORT_ENTRY_ADVANTAGE_ZONE_FRACTION = 0.50
@@ -2183,6 +2190,7 @@ class PaperTradingEngine:
             "vetoes": signal.vetoes,
             "smart_money_phase": cycle.phase,
             "setup_type": signal.setup_type,
+            "score_evidence_families": dict(signal.score_evidence_families),
         }
         self.latest_signals[symbol] = _apply_multi_timeframe_context(payload, mtf_context)
         self.account.latest_signals[symbol] = dict(self.latest_signals[symbol])
@@ -7786,6 +7794,24 @@ def _apply_multi_timeframe_context(signal: dict[str, object], context: dict[str,
     reasons = list(out.get("reasons") or [])
     vetoes = list(out.get("vetoes") or [])
     score = int(out.get("score") or 0)
+    raw_evidence_families = out.get("score_evidence_families")
+    if isinstance(raw_evidence_families, dict):
+        evidence_families = {
+            str(family): int(points)
+            for family, points in raw_evidence_families.items()
+            if isinstance(points, (int, float)) and int(points) > 0
+        }
+    else:
+        evidence_families = {}
+
+    def add_family_score(family: str, points: int) -> None:
+        nonlocal score
+        score = apply_positive_evidence_family(
+            score,
+            evidence_families,
+            family,
+            points,
+        )
     action = str(out.get("candidate_action") or out.get("action") or "")
     daily_bias = str(context.get("daily_bias") or "NEUTRAL")
     h4 = context.get("h4_structure") if isinstance(context.get("h4_structure"), dict) else {}
@@ -7844,6 +7870,7 @@ def _apply_multi_timeframe_context(signal: dict[str, object], context: dict[str,
         out["trend_state"] = "CHOP"
         trend_state = "CHOP"
         score = AUTO_ENTRY_MIN_SCORE
+        evidence_families = {}
         reasons = [
             "4h OI-valley absorption overrides the lagging lower-timeframe short bias"
         ]
@@ -7945,13 +7972,13 @@ def _apply_multi_timeframe_context(signal: dict[str, object], context: dict[str,
             score -= 10
             reasons.append("1d bearish bias; long position size reduced")
         elif daily_bias == "BULL":
-            score += 5
+            add_family_score(SCORE_FAMILY_DIRECTION, 5)
             reasons.append("1d bullish bias supports long")
         if h4_state in {"BREAKOUT_UP", "BOX_UPPER_HALF"}:
-            score += 6
+            add_family_score(SCORE_FAMILY_DIRECTION, 6)
             reasons.append("4h structure supports upside")
         ma_score, ma_reasons, ma_vetoes = _ma_cluster_signal_adjustment(PositionSide.LONG, h4_ma_cluster, h1_ma_cluster)
-        score += ma_score
+        add_family_score(SCORE_FAMILY_MA_POSITION, ma_score)
         reasons.extend(ma_reasons)
         vetoes.extend(ma_vetoes)
         setup_type = _prefer_setup_type(
@@ -7963,7 +7990,7 @@ def _apply_multi_timeframe_context(signal: dict[str, object], context: dict[str,
             ),
         )
         if h1_direction == "LONG":
-            score += 10
+            add_family_score(SCORE_FAMILY_TRIGGER, 10)
             setup_type = _prefer_setup_type(
                 setup_type,
                 SETUP_H1_STRUCTURE_LONG,
@@ -7983,7 +8010,7 @@ def _apply_multi_timeframe_context(signal: dict[str, object], context: dict[str,
                 out["margin_factor"] = min(float(out.get("margin_factor") or 1.0), 0.3)
                 vetoes.append("4h OI drained and volume is weak; EMA/BOLL bounce is not a clean long pullback")
             elif pullback_state == "HEALTHY_PULLBACK" and risk_state == "NORMAL":
-                score += 12
+                add_family_score(SCORE_FAMILY_MA_POSITION, 12)
                 setup_type = _prefer_setup_type(
                     setup_type,
                     SETUP_H1_PULLBACK_LONG,
@@ -8011,7 +8038,7 @@ def _apply_multi_timeframe_context(signal: dict[str, object], context: dict[str,
                 m15_precision,
                 smart_money_phase,
             ):
-                score += 6
+                add_family_score(SCORE_FAMILY_TRIGGER, 6)
                 setup_type = _prefer_setup_type(
                     setup_type,
                     SETUP_M15_SQUEEZE_TACTICAL_LONG,
@@ -8041,10 +8068,10 @@ def _apply_multi_timeframe_context(signal: dict[str, object], context: dict[str,
                 "4h OI sharp drop is an event, not a confirmed OI valley; wait for OI rebuilding and downside-wick reclaim"
             )
         elif h4_oi_state == "REBUILD_BREAKOUT_LONG":
-            score += 12
+            add_family_score(SCORE_FAMILY_DERIVATIVES, 12)
             reasons.append("4h OI rebounds after deleverage and price breaks out; strong long restored")
         if oi_valley_long_reversal:
-            score += 12
+            add_family_score(SCORE_FAMILY_DERIVATIVES, 12)
             setup_type = _prefer_setup_type(
                 setup_type,
                 SETUP_OI_VALLEY_REVERSAL_LONG,
@@ -8121,17 +8148,17 @@ def _apply_multi_timeframe_context(signal: dict[str, object], context: dict[str,
             score -= 10
             reasons.append("1d bullish bias; short position size reduced")
         elif daily_bias == "BEAR":
-            score += 5
+            add_family_score(SCORE_FAMILY_DIRECTION, 5)
             reasons.append("1d bearish bias supports short")
         if h4_state == "BREAKDOWN_DOWN":
-            score += 6
+            add_family_score(SCORE_FAMILY_DIRECTION, 6)
             reasons.append("4h structure supports downside")
         elif h4_state == "BOX_LOWER_HALF":
             reasons.append(
                 "4h direction remains bearish, but price is in the lower half; wait for a bounce"
             )
         ma_score, ma_reasons, ma_vetoes = _ma_cluster_signal_adjustment(PositionSide.SHORT, h4_ma_cluster, h1_ma_cluster)
-        score += ma_score
+        add_family_score(SCORE_FAMILY_MA_POSITION, ma_score)
         reasons.extend(ma_reasons)
         vetoes.extend(ma_vetoes)
         setup_type = _prefer_setup_type(
@@ -8143,7 +8170,7 @@ def _apply_multi_timeframe_context(signal: dict[str, object], context: dict[str,
             ),
         )
         if h1_direction == "SHORT":
-            score += 10
+            add_family_score(SCORE_FAMILY_TRIGGER, 10)
             setup_type = _prefer_setup_type(
                 setup_type,
                 SETUP_H1_STRUCTURE_SHORT,
@@ -8153,7 +8180,7 @@ def _apply_multi_timeframe_context(signal: dict[str, object], context: dict[str,
             vetoes.append("1h trigger opposes short entry")
         if pullback_direction == "SHORT":
             if pullback_state == "HEALTHY_PULLBACK" and risk_state == "NORMAL":
-                score += 12
+                add_family_score(SCORE_FAMILY_MA_POSITION, 12)
                 setup_type = _prefer_setup_type(
                     setup_type,
                     SETUP_H1_PULLBACK_SHORT,
@@ -8273,6 +8300,7 @@ def _apply_multi_timeframe_context(signal: dict[str, object], context: dict[str,
             )
     final_score = max(0, score)
     out["score"] = final_score
+    out["score_evidence_families"] = dict(sorted(evidence_families.items()))
     if final_score < AUTO_MAIN_POOL_MIN_SCORE:
         out["action"] = SignalAction.NO_TRADE.value
     elif final_score < AUTO_ENTRY_MIN_SCORE:
@@ -8431,19 +8459,19 @@ def _ma_cluster_signal_adjustment(
     h1_price = _float_or_none(h1_cluster.get("price"))
     if side == PositionSide.LONG:
         if h4_state == "BREAKOUT_UP" or h1_state == "BREAKOUT_UP":
-            score += 12
+            score = max(score, 12)
             reasons.append(_ma_cluster_reason("MA cluster breakout up", h1_price or h4_price))
         if h1_state == "RETEST_UP":
-            score += 14
+            score = max(score, 14)
             reasons.append(_ma_cluster_reason("MA cluster retest held near MA20", h1_price or h4_price))
         if h4_state == "DENSE" and h1_state not in {"BREAKOUT_UP", "RETEST_UP"}:
             reasons.append(_ma_cluster_reason("MA cluster dense; wait for breakout or MA20 retest", h1_price or h4_price))
     else:
         if h4_state == "BREAKDOWN_DOWN" or h1_state == "BREAKDOWN_DOWN":
-            score += 12
+            score = max(score, 12)
             reasons.append(_ma_cluster_reason("MA cluster breakdown down", h1_price or h4_price))
         if h1_state == "RETEST_DOWN":
-            score += 14
+            score = max(score, 14)
             reasons.append(_ma_cluster_reason("MA cluster retest rejected near MA20", h1_price or h4_price))
         if h4_state == "DENSE" and h1_state not in {"BREAKDOWN_DOWN", "RETEST_DOWN"}:
             reasons.append(_ma_cluster_reason("MA cluster dense; wait for breakdown or MA20 retest", h1_price or h4_price))
