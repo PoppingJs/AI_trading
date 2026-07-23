@@ -751,6 +751,7 @@ PAPER_DASHBOARD_HTML = """
       '4h OI sharp drop is an event, not a confirmed OI valley; wait for OI rebuilding and downside-wick reclaim': '4H OI骤减只是事件，尚未形成洼地；等待OI从冰点回升并出现下插针收回',
       '4h OI valley formed after retail capitulation; downside wick reclaimed support': '4H散户集中割肉后OI从冰点回升形成洼地，下插针已收回支撑',
       '4h OI valley formed; wait for a downside-wick support reclaim before long': '4H OI洼地已经形成，等待下插针收回支撑后再做多',
+      '4h direction is not long; OI valley remains observation-only': '4H方向尚未看多，OI洼地仅保留为观察证据，不支持做多',
       '4h OI-valley absorption overrides the lagging lower-timeframe short bias': '4H OI洼地吸筹确认，覆盖滞后的低周期空头方向',
       '1h direction still lags the confirmed 4h reversal; retain A-size only': '1H方向仍滞后于已确认的4H反转，仅按A级仓位',
       '4h bottom absorbed repeated downside wicks; OI rebuilt with a stable long/short ratio and EMA55 was reclaimed': '4H底部多次下插针均被吸收，OI回升且多空比稳定，价格已收回EMA55',

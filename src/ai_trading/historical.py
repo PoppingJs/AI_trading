@@ -803,10 +803,11 @@ def analyze_replay_failures(
 
 def _fill_lifecycle_groups(
     fills: Iterable[PaperFill],
-) -> dict[tuple[str, datetime], list[PaperFill]]:
-    groups: dict[tuple[str, datetime], list[PaperFill]] = {}
+) -> dict[str, list[PaperFill]]:
+    groups: dict[str, list[PaperFill]] = {}
     for fill in fills:
-        groups.setdefault((fill.symbol, fill.opened_at), []).append(fill)
+        cycle_id = fill.trade_cycle_id or f"{fill.symbol}:{fill.opened_at.isoformat()}"
+        groups.setdefault(cycle_id, []).append(fill)
     return groups
 
 
@@ -825,7 +826,7 @@ def _completed_trade_payloads(
 
 
 def _completed_trade_payload(
-    key: tuple[str, datetime],
+    key: str,
     fills: list[PaperFill],
 ) -> dict[str, object] | None:
     entries = [fill for fill in fills if fill.action in {"OPEN", "ADD"}]
@@ -851,7 +852,8 @@ def _completed_trade_payload(
     exit_time = closing.closed_at or closing.timestamp
 
     return {
-        "id": f"{key[0]}-{key[1].isoformat()}",
+        "id": key,
+        "trade_cycle_id": key,
         "symbol": opening.symbol,
         "side": opening.side.value,
         "action": "CLOSE",
@@ -872,6 +874,13 @@ def _completed_trade_payload(
         "closed_at": exit_time.isoformat(),
         "entry_position": opening.entry_position,
         "reason": closing.reason,
+        "primary_setup": opening.primary_setup or opening.setup_type,
+        "supporting_evidence": list(opening.supporting_evidence),
+        "entry_trigger": opening.entry_trigger,
+        "validation_state": closing.validation_state or opening.validation_state,
+        "soft_stop_price": opening.soft_stop_price or opening.stop_price,
+        "hard_stop_price": opening.hard_stop_price or opening.stop_price,
+        "exit_category": closing.exit_category or _exit_category(closing.reason),
         "adds": sum(fill.action == "ADD" for fill in fills),
         "partials": sum(fill.action == "PARTIAL_CLOSE" for fill in fills),
     }
@@ -932,7 +941,7 @@ def _recommendation_for_cause(cause: str) -> str:
 
 
 def _lifecycle_payload(
-    key: tuple[str, datetime],
+    key: str,
     fills: list[PaperFill],
     dataset: HistoricalDataset,
 ) -> dict[str, object] | None:
@@ -955,11 +964,18 @@ def _lifecycle_payload(
         dataset,
     )
     return {
-        "id": f"{key[0]}-{key[1].isoformat()}",
+        "id": key,
+        "trade_cycle_id": key,
         "symbol": opening.symbol,
         "side": opening.side.value,
         "leverage": opening.leverage,
         "setup_type": opening.setup_type or "未分类",
+        "primary_setup": opening.primary_setup or opening.setup_type,
+        "supporting_evidence": list(opening.supporting_evidence),
+        "entry_trigger": opening.entry_trigger,
+        "validation_state": closing.validation_state or opening.validation_state,
+        "soft_stop_price": opening.soft_stop_price or opening.stop_price,
+        "hard_stop_price": opening.hard_stop_price or opening.stop_price,
         "entry_quality": opening.entry_quality or "-",
         "opened_at": opening.opened_at.isoformat(),
         "closed_at": exit_time.isoformat(),
@@ -1041,13 +1057,17 @@ def _result_payload(
     metrics = analysis["metrics"]
     account = dict(replay.final_status)
     account["fills"] = _completed_trade_payloads(replay.fills)
+    total_pnl = replay.ending_equity - replay.starting_equity
+    closed_trade_pnl = float(metrics.get("closed_trade_pnl") or 0.0)
     return _json_safe(
         {
             "summary": {
                 "starting_equity": replay.starting_equity,
                 "ending_equity": replay.ending_equity,
                 "total_return": replay.total_return,
-                "total_pnl": replay.ending_equity - replay.starting_equity,
+                "total_pnl": total_pnl,
+                "closed_trade_pnl": closed_trade_pnl,
+                "open_trade_pnl": total_pnl - closed_trade_pnl,
                 "max_drawdown": replay.max_drawdown,
                 "win_rate": metrics["win_rate"],
                 "trade_count": metrics["completed"],
@@ -1241,6 +1261,7 @@ def _progress_snapshot(
     equity_value = status.get("equity")
     equity = float(equity_value if equity_value is not None else starting_equity)
     total_pnl = equity - starting_equity
+    closed_trade_pnl = sum(completed_pnl)
     return _json_safe(
         {
             "summary": {
@@ -1252,6 +1273,8 @@ def _progress_snapshot(
                 "trade_count": len(completed_pnl),
                 "max_drawdown": _max_drawdown(curve, starting_equity),
                 "total_pnl": total_pnl,
+                "closed_trade_pnl": closed_trade_pnl,
+                "open_trade_pnl": total_pnl - closed_trade_pnl,
                 "total_return": total_pnl / starting_equity if starting_equity else 0.0,
             },
             "account": account,

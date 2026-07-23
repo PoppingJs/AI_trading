@@ -27,6 +27,7 @@ from ai_trading.models import (
     SETUP_H1_STRUCTURE_SHORT,
     SETUP_H4_PULLBACK_LONG,
     SETUP_H4_PULLBACK_SHORT,
+    SETUP_H4_DESCENDING_RESISTANCE_SHORT,
     SETUP_M15_SQUEEZE_TACTICAL_LONG,
     SETUP_OI_VALLEY_REVERSAL_LONG,
     Candle,
@@ -101,6 +102,7 @@ AUTO_ENTRY_MIN_SCORE = ENTRY_QUALITY_A_MIN_SCORE
 CORE_STRUCTURE_SCORE_CAP = AUTO_ENTRY_MIN_SCORE - 1
 MIN_ENTRY_REWARD_R = 1.2
 FIRST_TAKE_PROFIT_R = 0.8
+DIRECTION_VALIDATION_R = 0.35
 LARGE_TIMEFRAME_WICK_REJECTION_PCT = 0.02
 PROFIT_LOCK_SLIPPAGE_PCT = 0.0008
 MIN_PRECISION_STOP_PCT = 0.012
@@ -221,6 +223,14 @@ class PaperFill:
     planned_risk_usdt: float = 0.0
     mae_r: float = 0.0
     mfe_r: float = 0.0
+    trade_cycle_id: str = ""
+    primary_setup: str = ""
+    supporting_evidence: tuple[str, ...] = ()
+    entry_trigger: str = ""
+    validation_state: str = ""
+    soft_stop_price: float = 0.0
+    hard_stop_price: float = 0.0
+    exit_category: str = ""
 
 
 @dataclass
@@ -972,13 +982,25 @@ class PaperTradingEngine:
                 take_profit_1,
                 take_profit_2,
             )
+            opened_at = self._now()
+            trade_cycle_id = _trade_cycle_id(symbol, opened_at)
+            normalized_entry_context = _enrich_entry_context(
+                normalized_entry_context,
+                side_enum,
+            )
+            soft_stop_price = _soft_structure_stop_price(
+                side_enum,
+                price,
+                stop_loss,
+                normalized_entry_context,
+            )
             entry_position = _entry_position_text(side_enum, price, normalized_entry_context, reason)
             position = Position(
                 symbol=symbol,
                 side=side_enum,
                 entry_price=price,
                 quantity=quantity,
-                opened_at=self._now(),
+                opened_at=opened_at,
                 stop_price=stop_loss,
                 take_profit_1=take_profit_1,
                 take_profit_2=take_profit_2,
@@ -991,6 +1013,19 @@ class PaperTradingEngine:
                     "entry_reasons": list(entry_reasons or ()),
                     "entry_context": normalized_entry_context,
                     "entry_position": entry_position,
+                    "trade_cycle_id": trade_cycle_id,
+                    "primary_setup": str(
+                        normalized_entry_context.get("primary_setup") or ""
+                    ),
+                    "supporting_evidence": list(
+                        normalized_entry_context.get("supporting_evidence") or ()
+                    ),
+                    "entry_trigger": str(
+                        normalized_entry_context.get("entry_trigger") or ""
+                    ),
+                    "validation_state": "UNVALIDATED",
+                    "soft_stop_price": soft_stop_price,
+                    "hard_stop_price": stop_loss,
                     "adds": 0,
                     "initial_stop_distance": abs(price - stop_loss),
                     "last_mark_price": price,
@@ -2839,6 +2874,7 @@ class PaperTradingEngine:
             signal = self.latest_signals.get(position.symbol, {})
             exit_indicator = _preferred_exit_indicator(tf_indicators, indicators, position)
             _update_position_excursions(position, price)
+            _update_position_validation(position)
             profit_management_enabled = _position_profit_management_enabled(
                 position,
                 price,
@@ -2922,12 +2958,44 @@ class PaperTradingEngine:
                     oi_valley_long_exit_reason,
                 )
                 continue
+            if _stop_hit(position, price):
+                self._close_position_unlocked(
+                    position,
+                    price,
+                    _stop_exit_reason(
+                        position,
+                        signal,
+                        price,
+                        self.settings.execution.taker_fee_rate,
+                    ),
+                )
+                continue
+            soft_stop_exit_reason = _soft_stop_close_exit_reason(
+                position,
+                exit_indicator,
+            )
+            if soft_stop_exit_reason:
+                self._close_position_unlocked(
+                    position,
+                    price,
+                    soft_stop_exit_reason,
+                )
+                continue
+            direction_exit_reason = _direction_validation_exit_reason(
+                position,
+                price,
+                signal,
+            )
+            if direction_exit_reason:
+                self._close_position_unlocked(
+                    position,
+                    price,
+                    direction_exit_reason,
+                )
+                continue
             structure_exit_reason = _confirmed_structure_exit_reason(position, price, signal)
             if structure_exit_reason:
                 self._close_position_unlocked(position, price, structure_exit_reason)
-                continue
-            if _stop_hit(position, price):
-                self._close_position_unlocked(position, price, _stop_exit_reason(position, signal, price, self.settings.execution.taker_fee_rate))
                 continue
             if strong_trend and _strong_trend_invalidated(position, exit_indicator):
                 self._close_position_unlocked(position, price, _outcome_exit_reason(position, price, "strong trend EMA50 structure invalidated", self.settings.execution.taker_fee_rate))
@@ -3078,6 +3146,13 @@ class PaperTradingEngine:
                 entry_context["capital_units"] = (
                     float(position.metadata["margin_usdt"]) / capital_unit_margin
                 )
+                position.metadata["soft_stop_price"] = _soft_structure_stop_price(
+                    position.side,
+                    position.entry_price,
+                    final_stop,
+                    entry_context,
+                )
+            position.metadata["hard_stop_price"] = final_stop
             self.account.fills.append(
                 PaperFill(
                     timestamp=self._now(),
@@ -3186,6 +3261,7 @@ class PaperTradingEngine:
                 ),
                 closed_at=timestamp,
                 return_pct=realized / margin_usdt if margin_usdt else 0.0,
+                exit_category=_exit_category_code(reason),
                 **_position_fill_metadata(position),
             )
         )
@@ -3216,9 +3292,27 @@ class PaperTradingEngine:
             if candles
             else self._now()
         )
+        current_signal = self.latest_signals.get(position.symbol, {})
+        structure_source = (
+            current_signal
+            if current_signal
+            else position.metadata.get("entry_context")
+            if isinstance(position.metadata.get("entry_context"), dict)
+            else {}
+        )
+        entry_trigger = str(position.metadata.get("entry_trigger") or "")
         self.account.reentry_barriers[position.symbol] = {
             "timeframe": timeframe,
             "candle_timestamp": candle_timestamp.isoformat(),
+            "side": position.side.value,
+            "primary_setup": str(
+                position.metadata.get("primary_setup") or ""
+            ),
+            "structure_signature": (
+                _structure_signature(structure_source, position.side)
+                if entry_trigger
+                else ""
+            ),
         }
 
     def _reentry_block_reason(self, symbol: str) -> str | None:
@@ -3234,10 +3328,25 @@ class PaperTradingEngine:
             self.account.reentry_barriers.pop(symbol, None)
             return None
         candles = self._timeframe_candles.get(symbol, {}).get(timeframe, [])
-        if candles and candles[-1].timestamp > blocked_candle:
+        if not candles or candles[-1].timestamp <= blocked_candle:
+            return f"waiting for new {timeframe} closed candle after full exit"
+        blocked_signature = str(barrier.get("structure_signature") or "")
+        if not blocked_signature:
+            # Legacy saved states did not persist structure identity.
             self.account.reentry_barriers.pop(symbol, None)
             return None
-        return f"waiting for new {timeframe} closed candle after full exit"
+        try:
+            side = PositionSide(str(barrier.get("side") or ""))
+        except ValueError:
+            self.account.reentry_barriers.pop(symbol, None)
+            return None
+        signal = self.latest_signals.get(symbol, {})
+        trigger = _entry_trigger_from_context(signal, side)
+        current_signature = _structure_signature(signal, side)
+        if trigger and current_signature and current_signature != blocked_signature:
+            self.account.reentry_barriers.pop(symbol, None)
+            return None
+        return "waiting for a new confirmed structure after full exit"
 
     def _close_position_fraction_unlocked(
         self,
@@ -3328,6 +3437,7 @@ class PaperTradingEngine:
                     if closed_margin
                     else 0.0
                 ),
+                exit_category=_exit_category_code(reason),
                 **_position_fill_metadata(position),
             )
         )
@@ -3402,6 +3512,115 @@ def _normalize_entry_context(entry_context: dict[str, object] | None) -> dict[st
     return context
 
 
+def _enrich_entry_context(
+    entry_context: dict[str, object],
+    side: PositionSide,
+) -> dict[str, object]:
+    """Keep one primary setup and separate its non-duplicated support evidence."""
+    context = dict(entry_context)
+    primary_setup = str(
+        context.get("primary_setup")
+        or context.get("setup_type")
+        or context.get("entry_setup")
+        or _entry_setup_from_context(context)
+    )
+    context["primary_setup"] = primary_setup
+    context["entry_trigger"] = str(
+        context.get("entry_trigger")
+        or _entry_trigger_from_context(context, side)
+    )
+    if not context.get("supporting_evidence"):
+        families = context.get("score_evidence_families")
+        if isinstance(families, dict):
+            context["supporting_evidence"] = tuple(
+                f"{family}:{int(points):+d}"
+                for family, points in sorted(families.items())
+                if int(points) > 0
+            )
+        else:
+            context["supporting_evidence"] = ()
+    return context
+
+
+def _entry_trigger_from_context(
+    context: dict[str, object],
+    side: PositionSide,
+) -> str:
+    direction = "LONG" if side == PositionSide.LONG else "SHORT"
+    h1 = context.get("h1_trigger") if isinstance(context.get("h1_trigger"), dict) else {}
+    h1_direction = str(h1.get("direction") or "NONE")
+    h1_state = str(h1.get("state") or "UNKNOWN")
+    if h1_direction == direction and h1_state in {
+        "BREAKOUT",
+        "BREAKDOWN",
+        "RETEST",
+        "FAKE_BREAKOUT",
+        "FAKE_BREAKDOWN",
+    }:
+        return f"1H_{h1_state}"
+    pullback = context.get("h1_pullback") if isinstance(context.get("h1_pullback"), dict) else {}
+    if (
+        str(pullback.get("direction") or "NONE") == direction
+        and str(pullback.get("state") or "UNKNOWN") == "HEALTHY_PULLBACK"
+    ):
+        return "1H_HEALTHY_PULLBACK"
+    precision = context.get("m15_precision") if isinstance(context.get("m15_precision"), dict) else {}
+    precision_direction = str(
+        precision.get("direction")
+        or precision.get("trend")
+        or "NONE"
+    )
+    precision_pullback = str(precision.get("pullback") or "")
+    precision_matches = (
+        precision_direction in {"LONG", "UP"} or "LONG" in precision_pullback
+        if side == PositionSide.LONG
+        else precision_direction in {"SHORT", "DOWN"} or "SHORT" in precision_pullback
+    )
+    precision_state = str(
+        precision.get("state")
+        or precision.get("pullback")
+        or ""
+    )
+    if precision_matches and precision_state not in {"", "NONE", "UNKNOWN"}:
+        return f"15M_{precision_state.upper()}"
+    return ""
+
+
+def _soft_structure_stop_price(
+    side: PositionSide,
+    entry_price: float,
+    hard_stop_price: float,
+    context: dict[str, object],
+) -> float:
+    """Choose the nearest entered structure boundary; hard stop remains unchanged."""
+    levels = context.get("entry_levels") if isinstance(context.get("entry_levels"), dict) else {}
+    side_key = "long" if side == PositionSide.LONG else "short"
+    side_levels = levels.get(side_key) if isinstance(levels.get(side_key), dict) else {}
+    candidates: list[float] = []
+    for level in side_levels.values():
+        if not isinstance(level, dict) or not _entry_level_hit(entry_price, level):
+            continue
+        values = [
+            value
+            for value in (
+                _float_or_none(level.get("low")),
+                _float_or_none(level.get("high")),
+                _float_or_none(level.get("price")),
+            )
+            if value is not None
+        ]
+        if not values:
+            continue
+        boundary = min(values) if side == PositionSide.LONG else max(values)
+        if side == PositionSide.LONG and hard_stop_price < boundary < entry_price:
+            candidates.append(boundary)
+        if side == PositionSide.SHORT and entry_price < boundary < hard_stop_price:
+            candidates.append(boundary)
+    if not candidates:
+        return hard_stop_price
+    return max(candidates) if side == PositionSide.LONG else min(candidates)
+
+
 def _entry_position_text(
     side: PositionSide,
     entry_price: float,
@@ -3437,6 +3656,7 @@ def _entry_position_text(
         else {
             "distribution_range_high": "高位派发箱体上沿",
             "descending_high_trendline": "下降顶点趋势线",
+            "h4_descending_resistance": "4H下降趋势线压力",
             "h1_resistance": "1H压力反抽",
             "h4_resistance": "4H压力反抽",
             "h1_boll_mid": "1H BOLL中轨反抽",
@@ -3456,8 +3676,43 @@ def _entry_position_text(
     )
     if side == PositionSide.LONG:
         labels["h4_ema55_reclaim"] = "4H EMA55 OI洼地回踩"
+    primary_setup = str(
+        context.get("primary_setup")
+        or context.get("setup_type")
+        or ""
+    )
+    preferred_keys: tuple[str, ...] = ()
+    if primary_setup == SETUP_OI_VALLEY_REVERSAL_LONG:
+        preferred_keys = ("h4_ema55_reclaim",)
+    elif primary_setup == SETUP_M15_SQUEEZE_TACTICAL_LONG:
+        preferred_keys = ("m15_ema20_ema60",)
+    elif primary_setup.startswith("H4_"):
+        preferred_keys = (
+            "h4_descending_resistance",
+            "h4_support",
+            "h4_resistance",
+            "h4_boll_mid",
+            "h4_ema20_ema60",
+            "h4_ema20",
+            "h4_ema60",
+        )
+    elif primary_setup.startswith("H1_"):
+        preferred_keys = (
+            "h1_support",
+            "h1_resistance",
+            "h1_boll_mid",
+            "h1_ema20_ema60",
+            "h1_ema20",
+            "h1_ema60",
+            "breakout_retest",
+            "breakdown_retest",
+        )
+    ordered_keys = tuple(dict.fromkeys((*preferred_keys, *labels.keys())))
     matched: dict[tuple[str, str], list[str]] = {}
-    for key, label in labels.items():
+    for key in ordered_keys:
+        label = labels.get(key)
+        if label is None:
+            continue
         level = side_levels.get(key)
         if not _entry_level_hit(entry_price, level) or not isinstance(level, dict):
             continue
@@ -3468,9 +3723,11 @@ def _entry_position_text(
         if not values:
             continue
         zone_key = (_summary_price(min(values)), _summary_price(max(values)))
-        matched.setdefault(zone_key, []).append(label)
+        if not matched:
+            matched[zone_key] = [label]
+        break
     details = []
-    for (low_text, high_text), names in list(matched.items())[:3]:
+    for (low_text, high_text), names in list(matched.items())[:1]:
         zone_text = low_text if low_text == high_text else f"{low_text}-{high_text}"
         details.append(f"{'/'.join(names)}≈{zone_text}")
     actual = f"实际开仓≈{_summary_price(entry_price)}"
@@ -3561,6 +3818,13 @@ def _entry_context_from_signal(signal: dict[str, object]) -> dict[str, object]:
         "long_short_ratio",
         "funding_rate",
         "daily_bias",
+        "h4_direction",
+        "h4_location",
+        "h4_structure_type",
+        "direction_gate",
+        "direction_veto_reason",
+        "oi_valley_long_eligible",
+        "oi_valley_direction_gate_reason",
         "h4_structure",
         "h1_structure",
         "h4_ma_cluster",
@@ -3576,6 +3840,11 @@ def _entry_context_from_signal(signal: dict[str, object]) -> dict[str, object]:
         "distribution_short_stage",
         "m15_precision",
         "setup_type",
+        "primary_setup",
+        "supporting_evidence",
+        "entry_trigger",
+        "entry_state",
+        "score_evidence_families",
         "entry_levels",
     )
     return {key: signal[key] for key in keys if key in signal}
@@ -3775,6 +4044,16 @@ def _fill_from_payload(payload: dict[str, Any]) -> PaperFill:
         planned_risk_usdt=float(payload.get("planned_risk_usdt", 0.0)),
         mae_r=float(payload.get("mae_r", 0.0)),
         mfe_r=float(payload.get("mfe_r", 0.0)),
+        trade_cycle_id=str(payload.get("trade_cycle_id", "")),
+        primary_setup=str(payload.get("primary_setup", "")),
+        supporting_evidence=tuple(
+            str(item) for item in (payload.get("supporting_evidence") or ())
+        ),
+        entry_trigger=str(payload.get("entry_trigger", "")),
+        validation_state=str(payload.get("validation_state", "")),
+        soft_stop_price=float(payload.get("soft_stop_price", 0.0)),
+        hard_stop_price=float(payload.get("hard_stop_price", 0.0)),
+        exit_category=str(payload.get("exit_category", "")),
     )
 
 
@@ -3812,7 +4091,111 @@ def _position_fill_metadata(position: Position) -> dict[str, object]:
         "planned_risk_usdt": planned_risk,
         "mae_r": mae_r,
         "mfe_r": mfe_r,
+        "trade_cycle_id": str(
+            position.metadata.get("trade_cycle_id")
+            or _trade_cycle_id(position.symbol, position.opened_at)
+        ),
+        "primary_setup": str(
+            position.metadata.get("primary_setup")
+            or context.get("primary_setup")
+            or context.get("setup_type")
+            or ""
+        ),
+        "supporting_evidence": tuple(
+            str(item)
+            for item in (
+                position.metadata.get("supporting_evidence")
+                or context.get("supporting_evidence")
+                or ()
+            )
+        ),
+        "entry_trigger": str(
+            position.metadata.get("entry_trigger")
+            or context.get("entry_trigger")
+            or ""
+        ),
+        "validation_state": str(
+            position.metadata.get("validation_state") or "UNVALIDATED"
+        ),
+        "soft_stop_price": float(
+            position.metadata.get("soft_stop_price")
+            or position.metadata.get("hard_stop_price")
+            or position.stop_price
+        ),
+        "hard_stop_price": float(
+            position.metadata.get("hard_stop_price") or position.stop_price
+        ),
     }
+
+
+def _trade_cycle_id(symbol: str, opened_at: datetime) -> str:
+    return f"{symbol.upper()}:{opened_at.isoformat()}"
+
+
+def _structure_signature(
+    context: dict[str, object],
+    side: PositionSide,
+) -> str:
+    if not isinstance(context, dict):
+        return ""
+    h4 = context.get("h4_structure") if isinstance(context.get("h4_structure"), dict) else {}
+    h1 = context.get("h1_trigger") if isinstance(context.get("h1_trigger"), dict) else {}
+    pullback = context.get("h1_pullback") if isinstance(context.get("h1_pullback"), dict) else {}
+    levels = context.get("entry_levels") if isinstance(context.get("entry_levels"), dict) else {}
+    side_levels = levels.get("long" if side == PositionSide.LONG else "short")
+    if not isinstance(side_levels, dict):
+        side_levels = {}
+
+    def price_token(mapping: dict[str, object], key: str) -> str:
+        value = _float_or_none(mapping.get(key))
+        return "" if value is None else f"{value:.8g}"
+
+    level_tokens: list[str] = []
+    for key, level in sorted(side_levels.items()):
+        if not isinstance(level, dict):
+            continue
+        level_tokens.append(
+            ":".join(
+                (
+                    str(key),
+                    price_token(level, "low"),
+                    price_token(level, "high"),
+                    price_token(level, "price"),
+                )
+            )
+        )
+    tokens = (
+        str(context.get("primary_setup") or context.get("setup_type") or ""),
+        str(h4.get("state") or ""),
+        price_token(h4, "support"),
+        price_token(h4, "resistance"),
+        str(h1.get("direction") or ""),
+        str(h1.get("state") or ""),
+        price_token(h1, "support"),
+        price_token(h1, "resistance"),
+        str(pullback.get("direction") or ""),
+        str(pullback.get("state") or ""),
+        *level_tokens,
+    )
+    signature = "|".join(tokens)
+    return signature if signature.strip("|") else ""
+
+
+def _exit_category_code(reason: str) -> str:
+    normalized = reason.strip().lower()
+    if "direction unvalidated" in normalized or "direction invalid" in normalized:
+        return "DIRECTION_INVALIDATED"
+    if normalized.startswith("stop loss") or "protected stop" in normalized:
+        return "STOP_LOSS"
+    if normalized.startswith("take profit") or "profit" in normalized:
+        return "TAKE_PROFIT"
+    if "rotation" in normalized:
+        return "ROTATION_EXIT"
+    if "structure" in normalized or "invalidated" in normalized:
+        return "STRUCTURE_EXIT"
+    if "manual" in normalized:
+        return "MANUAL_EXIT"
+    return "OTHER"
 
 
 def _parse_datetime(value: str | datetime) -> datetime:
@@ -3984,6 +4367,107 @@ def _update_position_excursions(position: Position, price: float) -> None:
     position.metadata["worst_price"] = worst_price
     position.metadata["max_favorable_distance"] = max(float(position.metadata.get("max_favorable_distance") or 0.0), favorable)
     position.metadata["max_adverse_distance"] = max(float(position.metadata.get("max_adverse_distance") or 0.0), adverse)
+
+
+def _update_position_validation(position: Position) -> None:
+    if str(position.metadata.get("validation_state") or "UNVALIDATED") == "VALIDATED":
+        return
+    stop_distance = float(
+        position.metadata.get("initial_stop_distance")
+        or abs(position.entry_price - position.stop_price)
+        or 0.0
+    )
+    favorable = float(position.metadata.get("max_favorable_distance") or 0.0)
+    if position.first_tp_done or (
+        stop_distance > 0
+        and favorable >= stop_distance * DIRECTION_VALIDATION_R
+    ):
+        position.metadata["validation_state"] = "VALIDATED"
+
+
+def _soft_stop_close_exit_reason(
+    position: Position,
+    indicator: IndicatorSnapshot | None,
+) -> str | None:
+    """Evaluate the structure boundary once per newly closed signal candle."""
+    if indicator is None:
+        return None
+    timestamp = indicator.timestamp
+    last_checked = position.metadata.get("soft_stop_last_checked_at")
+    if not last_checked:
+        position.metadata["soft_stop_last_checked_at"] = timestamp.isoformat()
+        return None
+    try:
+        if timestamp <= _parse_datetime(str(last_checked)):
+            return None
+    except (TypeError, ValueError):
+        pass
+    position.metadata["soft_stop_last_checked_at"] = timestamp.isoformat()
+    soft_stop = float(
+        position.metadata.get("soft_stop_price")
+        or position.metadata.get("hard_stop_price")
+        or position.stop_price
+    )
+    hard_stop = float(
+        position.metadata.get("hard_stop_price") or position.stop_price
+    )
+    if soft_stop <= 0 or math.isclose(soft_stop, hard_stop):
+        return None
+    crossed = (
+        indicator.close <= soft_stop
+        if position.side == PositionSide.LONG
+        else indicator.close >= soft_stop
+    )
+    if not crossed:
+        return None
+    return "stop loss: structure close confirmed beyond the primary setup"
+
+
+def _direction_validation_exit_reason(
+    position: Position,
+    price: float,
+    signal: dict[str, object],
+) -> str | None:
+    if str(position.metadata.get("validation_state") or "UNVALIDATED") == "VALIDATED":
+        return None
+    h4 = signal.get("h4_structure") if isinstance(signal.get("h4_structure"), dict) else {}
+    h1 = signal.get("h1_trigger") if isinstance(signal.get("h1_trigger"), dict) else {}
+    h4_state = str(h4.get("state") or "UNKNOWN")
+    h4_direction = str(h4.get("direction") or "NEUTRAL")
+    if h4_direction == "NEUTRAL":
+        if h4_state == "BREAKOUT_UP":
+            h4_direction = "LONG"
+        elif h4_state == "BREAKDOWN_DOWN":
+            h4_direction = "SHORT"
+    h1_direction = str(h1.get("direction") or "NONE")
+    h1_state = str(h1.get("state") or "UNKNOWN")
+    action = str(signal.get("action") or "")
+    trend = str(signal.get("trend_state") or signal.get("regime") or "")
+    if position.side == PositionSide.LONG:
+        invalidated = (
+            h4_direction == "SHORT"
+            or (h1_direction == "SHORT" and h1_state in {"BREAKDOWN", "RETEST"})
+            or (
+                action == SignalAction.ENTRY_SHORT.value
+                and trend == "ONE_WAY_DOWN"
+            )
+        )
+    else:
+        invalidated = (
+            h4_direction == "LONG"
+            or (h1_direction == "LONG" and h1_state in {"BREAKOUT", "RETEST"})
+            or (
+                action == SignalAction.ENTRY_LONG.value
+                and trend == "ONE_WAY_UP"
+            )
+        )
+    if not invalidated:
+        return None
+    return _outcome_exit_reason(
+        position,
+        price,
+        "direction unvalidated and higher-timeframe structure failed",
+    )
 
 
 def _stop_exit_reason(
@@ -4403,7 +4887,9 @@ def _protect_confirmed_breakout_position(position: Position, price: float, signa
     if stop_distance <= 0:
         return
     profit_distance = price - position.entry_price if position.side == PositionSide.LONG else position.entry_price - price
-    if profit_distance < stop_distance * 0.6:
+    # Do not tighten a fresh position after a small favorable move. The first
+    # target (or at least 1R) must validate the trade before breakout protection.
+    if not position.first_tp_done and profit_distance < stop_distance:
         return
     h4 = signal.get("h4_structure") if isinstance(signal.get("h4_structure"), dict) else {}
     h1 = signal.get("h1_trigger") if isinstance(signal.get("h1_trigger"), dict) else {}
@@ -4863,6 +5349,19 @@ def _auto_entry_prerequisite_blocks(
         blocks.append("directional entry signal not established")
     if score < AUTO_ENTRY_MIN_SCORE:
         blocks.append(f"final score {score} below auto-entry minimum {AUTO_ENTRY_MIN_SCORE}")
+    entry_state = str(signal.get("entry_state") or "")
+    if (
+        int(signal.get("entry_pipeline_version") or 0) >= 2
+        and entry_state
+        and entry_state != "READY"
+    ):
+        state_blocks = {
+            "DIRECTION_PENDING": "higher-timeframe direction is not established",
+            "POSITION_PENDING": "current price has not reached the selected primary setup",
+            "TRIGGER_PENDING": "entry trigger is not confirmed",
+            "VETOED": "entry has an active veto",
+        }
+        blocks.append(state_blocks.get(entry_state, f"entry state {entry_state} is not ready"))
     entry_position_block = (
         _auto_entry_position_block(signal)
         if include_entry_position
@@ -4923,6 +5422,46 @@ def _update_entry_position_fields(signal: dict[str, object]) -> None:
     signal["entry_timing"] = entry_position
     signal["entry_timing_reason"] = reason
     signal["suggested_entry_text"] = _suggested_entry_text(signal)
+    _update_entry_state_fields(signal)
+
+
+def _update_entry_state_fields(signal: dict[str, object]) -> None:
+    action = str(signal.get("action") or "")
+    side = (
+        PositionSide.LONG
+        if action == SignalAction.ENTRY_LONG.value
+        else PositionSide.SHORT
+        if action == SignalAction.ENTRY_SHORT.value
+        else None
+    )
+    signal["primary_setup"] = str(
+        signal.get("primary_setup")
+        or signal.get("setup_type")
+        or _entry_setup_from_context(signal)
+    )
+    families = signal.get("score_evidence_families")
+    if isinstance(families, dict):
+        signal["supporting_evidence"] = tuple(
+            f"{family}:{int(points):+d}"
+            for family, points in sorted(families.items())
+            if isinstance(points, (int, float)) and int(points) > 0
+        )
+    else:
+        signal["supporting_evidence"] = ()
+    if side is None:
+        signal["entry_trigger"] = ""
+        signal["entry_state"] = "DIRECTION_PENDING"
+        return
+    trigger = _entry_trigger_from_context(signal, side)
+    signal["entry_trigger"] = trigger
+    if str(signal.get("entry_timing") or "") != ENTRY_TIMING_GOOD:
+        signal["entry_state"] = "POSITION_PENDING"
+    elif not trigger:
+        signal["entry_state"] = "TRIGGER_PENDING"
+    elif signal.get("vetoes"):
+        signal["entry_state"] = "VETOED"
+    else:
+        signal["entry_state"] = "READY"
 
 
 _TRANSIENT_AUTO_ENTRY_BLOCK_PREFIXES = (
@@ -5192,6 +5731,7 @@ def _entry_level_display_labels(side: PositionSide) -> dict[str, str]:
     return {
         "distribution_range_high": "高位派发箱体上沿区",
         "descending_high_trendline": "下降顶点趋势线反抽区",
+        "h4_descending_resistance": "4H下降趋势线压力区",
         "h1_resistance": "1H压力反抽区",
         "h4_resistance": "4H压力反抽区",
         "h1_boll_mid": "1H BOLL中轨反抽区",
@@ -5354,6 +5894,12 @@ def _entry_zone_bounds(
     ):
         return None
     if (
+        side == PositionSide.SHORT
+        and "h4_descending_resistance" in matched_keys
+        and not _descending_resistance_short_confirmation_present(signal)
+    ):
+        return None
+    if (
         all(key in indicator_only_keys for key, _, _ in matched)
         and not _indicator_entry_confirmation_present(
             signal,
@@ -5379,6 +5925,36 @@ def _distribution_short_entry_confirmation_present(
     signal: dict[str, object],
 ) -> bool:
     return _distribution_short_rejection_high(signal) is not None
+
+
+def _descending_resistance_short_confirmation_present(
+    signal: dict[str, object],
+) -> bool:
+    """A projected 4h resistance is a setup location, never an entry trigger."""
+    if _distribution_short_entry_confirmation_present(signal):
+        return True
+    pullback = (
+        signal.get("h1_pullback")
+        if isinstance(signal.get("h1_pullback"), dict)
+        else {}
+    )
+    if (
+        str(pullback.get("direction") or "NONE") == "SHORT"
+        and str(pullback.get("state") or "UNKNOWN")
+        == "HEALTHY_PULLBACK"
+    ):
+        return True
+    precision = (
+        signal.get("m15_precision")
+        if isinstance(signal.get("m15_precision"), dict)
+        else {}
+    )
+    return (
+        str(precision.get("trend") or "UNKNOWN") == "DOWN"
+        and str(precision.get("pullback") or "UNKNOWN")
+        == "M15_SHORT_PULLBACK"
+        and _float_or_none(precision.get("short_stop_anchor")) is not None
+    )
 
 
 def _distribution_short_rejection_high(
@@ -5590,6 +6166,7 @@ def _entry_level_keys(side: PositionSide) -> tuple[str, ...]:
         else (
             "distribution_range_high",
             "descending_high_trendline",
+            "h4_descending_resistance",
             "h1_resistance",
             "h4_resistance",
             "h1_boll_mid",
@@ -5649,6 +6226,7 @@ def _core_scored_entry_zone_hit(
 
 def _setup_priority(setup_type: str) -> int:
     return {
+        SETUP_H4_DESCENDING_RESISTANCE_SHORT: 100,
         SETUP_M15_SQUEEZE_TACTICAL_LONG: 95,
         SETUP_OI_VALLEY_REVERSAL_LONG: 95,
         SETUP_DISTRIBUTION_STAGE1_SHORT: 95,
@@ -5716,6 +6294,21 @@ def _scored_entry_levels(
     # A distribution setup owns its price location. Do not let a generic 4h
     # EMA override replace "range high / descending lower high / markdown
     # retest" with a much lower indicator band.
+    setup_type = str(signal.get("setup_type") or "")
+    if (
+        side == PositionSide.SHORT
+        and setup_type == SETUP_H4_DESCENDING_RESISTANCE_SHORT
+        and _entry_level_has_values(
+            source.get("h4_descending_resistance")
+        )
+    ):
+        return {
+            side_key: {
+                "h4_descending_resistance": source[
+                    "h4_descending_resistance"
+                ],
+            }
+        }
     distribution_stage = str(
         signal.get("distribution_short_stage") or ""
     )
@@ -5725,7 +6318,6 @@ def _scored_entry_levels(
             source,
             distribution_stage,
         )
-    setup_type = str(signal.get("setup_type") or "")
     if (
         side == PositionSide.LONG
         and setup_type == SETUP_OI_VALLEY_REVERSAL_LONG
@@ -5773,6 +6365,7 @@ def _scored_entry_levels(
     if side == PositionSide.LONG:
         if setup_type == SETUP_M15_SQUEEZE_TACTICAL_LONG:
             add("m15_ema20_ema60")
+            return {side_key: selected} if selected else {}
         elif setup_type == SETUP_H4_PULLBACK_LONG:
             add("h4_support")
             if directional_trend:
@@ -5976,7 +6569,14 @@ def _entry_timeframe_for_signal(
     h4_keys = (
         ("h4_support", "h4_boll_mid", "h4_ema20_ema60", "h4_ema20", "h4_ema60")
         if side == PositionSide.LONG
-        else ("h4_resistance", "h4_boll_mid", "h4_ema20_ema60", "h4_ema20", "h4_ema60")
+        else (
+            "h4_descending_resistance",
+            "h4_resistance",
+            "h4_boll_mid",
+            "h4_ema20_ema60",
+            "h4_ema20",
+            "h4_ema60",
+        )
     )
     h1_hit = any(_entry_level_hit(price, side_levels.get(key)) for key in h1_keys)
     h4_hit = any(_entry_level_hit(price, side_levels.get(key)) for key in h4_keys)
@@ -6505,7 +7105,19 @@ def _timeframe_structure(
 ) -> dict[str, object]:
     lookback = min(settings.strategy.structure_lookback, len(candles) - 1, len(indicators) - 1)
     if lookback < 6:
-        return {"state": "UNKNOWN", "support": None, "resistance": None, "box_width_pct": 0.0}
+        return {
+            "state": "UNKNOWN",
+            "direction": "NEUTRAL",
+            "location": "UNKNOWN",
+            "structure_type": "UNKNOWN",
+            "support": None,
+            "resistance": None,
+            "box_width_pct": 0.0,
+            "descending_trendline_zone": None,
+            "descending_anchor_count": 0,
+            "ascending_trendline_zone": None,
+            "ascending_anchor_count": 0,
+        }
     current = candles[-1]
     indicator = indicators[-1]
     prior = candles[-lookback - 1 : -1]
@@ -6522,8 +7134,95 @@ def _timeframe_structure(
         state = "BOX_UPPER_HALF"
     else:
         state = "BOX_LOWER_HALF"
+    swing_highs, swing_lows = _confirmed_structure_swings(
+        candles,
+        lookback,
+    )
+    descending = _project_structure_line(
+        swing_highs,
+        len(candles) - 1,
+        descending=True,
+        buffer=buffer,
+    )
+    ascending = _project_structure_line(
+        swing_lows,
+        len(candles) - 1,
+        descending=False,
+        buffer=buffer,
+    )
+    direction = "NEUTRAL"
+    structure_type = "RANGE"
+    location = "UPPER_HALF" if current.close >= mid else "LOWER_HALF"
+    descending_zone = (
+        descending.get("zone")
+        if isinstance(descending, dict)
+        else None
+    )
+    ascending_zone = (
+        ascending.get("zone")
+        if isinstance(ascending, dict)
+        else None
+    )
+    descending_retest = _descending_breakout_retest_confirmed(
+        candles,
+        descending,
+        buffer,
+    )
+    ascending_retest = _ascending_breakdown_retest_confirmed(
+        candles,
+        ascending,
+        buffer,
+    )
+    if state == "BREAKOUT_UP" and descending is None:
+        direction = "LONG"
+        structure_type = "BREAKOUT_UP"
+        location = "BREAKOUT"
+    elif state == "BREAKDOWN_DOWN" and ascending is None:
+        direction = "SHORT"
+        structure_type = "BREAKDOWN_DOWN"
+        location = "BREAKDOWN"
+    elif descending is not None and ascending is not None:
+        structure_type = "CONTRACTING_RANGE"
+        location = (
+            "RESISTANCE"
+            if _candle_touches_zone(current, descending_zone)
+            else "SUPPORT"
+            if _candle_touches_zone(current, ascending_zone)
+            else location
+        )
+    elif descending is not None:
+        projected = float(descending["projected"])
+        if descending_retest:
+            direction = "LONG"
+            structure_type = "DESCENDING_BREAKOUT_RETEST"
+            location = "SUPPORT"
+        elif current.close > projected + buffer:
+            structure_type = "DESCENDING_BREAKOUT_PENDING"
+            location = "BREAKOUT"
+        else:
+            direction = "SHORT"
+            structure_type = "DESCENDING_RESISTANCE"
+            if _candle_touches_zone(current, descending_zone):
+                location = "RESISTANCE"
+    elif ascending is not None:
+        projected = float(ascending["projected"])
+        if ascending_retest:
+            direction = "SHORT"
+            structure_type = "ASCENDING_BREAKDOWN_RETEST"
+            location = "RESISTANCE"
+        elif current.close < projected - buffer:
+            structure_type = "ASCENDING_BREAKDOWN_PENDING"
+            location = "BREAKDOWN"
+        else:
+            direction = "LONG"
+            structure_type = "ASCENDING_SUPPORT"
+            if _candle_touches_zone(current, ascending_zone):
+                location = "SUPPORT"
     return {
         "state": state,
+        "direction": direction,
+        "location": location,
+        "structure_type": structure_type,
         "support": support,
         "resistance": resistance,
         "support_zone_low": support - buffer,
@@ -6532,7 +7231,131 @@ def _timeframe_structure(
         "resistance_zone_high": resistance + buffer,
         "box_mid": mid,
         "box_width_pct": box_width_pct,
+        "descending_trendline_zone": descending_zone,
+        "descending_anchor_count": (
+            int(descending.get("anchor_count") or 0)
+            if isinstance(descending, dict)
+            else 0
+        ),
+        "ascending_trendline_zone": ascending_zone,
+        "ascending_anchor_count": (
+            int(ascending.get("anchor_count") or 0)
+            if isinstance(ascending, dict)
+            else 0
+        ),
     }
+
+
+def _confirmed_structure_swings(
+    candles: list[Candle],
+    lookback: int,
+) -> tuple[list[tuple[int, float]], list[tuple[int, float]]]:
+    start = max(2, len(candles) - lookback - 1)
+    swing_highs: list[tuple[int, float]] = []
+    swing_lows: list[tuple[int, float]] = []
+    for idx in range(start, len(candles) - 2):
+        neighbors = (
+            candles[idx - 2],
+            candles[idx - 1],
+            candles[idx + 1],
+            candles[idx + 2],
+        )
+        if candles[idx].high >= max(candle.high for candle in neighbors):
+            swing_highs.append((idx, candles[idx].high))
+        if candles[idx].low <= min(candle.low for candle in neighbors):
+            swing_lows.append((idx, candles[idx].low))
+    return swing_highs, swing_lows
+
+
+def _project_structure_line(
+    swings: list[tuple[int, float]],
+    target_idx: int,
+    *,
+    descending: bool,
+    buffer: float,
+) -> dict[str, object] | None:
+    if len(swings) < 3:
+        return None
+    anchors = swings[-3:]
+    values = [value for _, value in anchors]
+    valid = (
+        values[0] > values[1] > values[2]
+        if descending
+        else values[0] < values[1] < values[2]
+    )
+    if not valid:
+        return None
+    first_idx, first_value = anchors[0]
+    last_idx, last_value = anchors[-1]
+    if last_idx <= first_idx:
+        return None
+    slope = (last_value - first_value) / (last_idx - first_idx)
+    projected = last_value + slope * (target_idx - last_idx)
+    if projected <= 0:
+        return None
+    return {
+        "projected": projected,
+        "slope": slope,
+        "last_anchor_index": last_idx,
+        "last_anchor_value": last_value,
+        "anchor_count": len(anchors),
+        "zone": {
+            "low": max(projected - buffer, 0.0),
+            "high": projected + buffer,
+            "price": projected,
+        },
+    }
+
+
+def _descending_breakout_retest_confirmed(
+    candles: list[Candle],
+    trendline: dict[str, object] | None,
+    buffer: float,
+) -> bool:
+    if trendline is None or len(candles) < 2:
+        return False
+    slope = float(trendline.get("slope") or 0.0)
+    projected = float(trendline.get("projected") or 0.0)
+    previous_projected = projected - slope
+    previous = candles[-2]
+    current = candles[-1]
+    return (
+        previous.close > previous_projected + buffer
+        and current.low <= projected + buffer
+        and current.close >= projected
+    )
+
+
+def _ascending_breakdown_retest_confirmed(
+    candles: list[Candle],
+    trendline: dict[str, object] | None,
+    buffer: float,
+) -> bool:
+    if trendline is None or len(candles) < 2:
+        return False
+    slope = float(trendline.get("slope") or 0.0)
+    projected = float(trendline.get("projected") or 0.0)
+    previous_projected = projected - slope
+    previous = candles[-2]
+    current = candles[-1]
+    return (
+        previous.close < previous_projected - buffer
+        and current.high >= projected - buffer
+        and current.close <= projected
+    )
+
+
+def _candle_touches_zone(
+    candle: Candle,
+    zone: object,
+) -> bool:
+    if not isinstance(zone, dict):
+        return False
+    low = _float_or_none(zone.get("low"))
+    high = _float_or_none(zone.get("high"))
+    if low is None or high is None:
+        return False
+    return candle.high >= low and candle.low <= high
 
 
 def _one_hour_trigger(
@@ -7527,6 +8350,9 @@ def _entry_level_context(
             "vwap_pullback": _indicator_band(h1_indicator, h1_indicator.vwap if h1_indicator else None),
         },
         "short": {
+            "h4_descending_resistance": _zone_from_object(
+                h4_structure.get("descending_trendline_zone")
+            ),
             "distribution_range_high": _zone_from_object(
                 distribution_short.get("range_high_zone")
             ),
@@ -7843,6 +8669,16 @@ def _apply_multi_timeframe_context(signal: dict[str, object], context: dict[str,
         else {}
     )
     h4_state = str(h4.get("state") or "UNKNOWN")
+    h4_direction = str(h4.get("direction") or "NEUTRAL")
+    if h4_direction == "NEUTRAL":
+        if h4_state == "BREAKOUT_UP":
+            h4_direction = "LONG"
+        elif h4_state == "BREAKDOWN_DOWN":
+            h4_direction = "SHORT"
+    h4_location = str(h4.get("location") or "UNKNOWN")
+    h4_structure_type = str(
+        h4.get("structure_type") or h4_state
+    )
     h1_direction = str(h1.get("direction") or "NONE")
     h1_state = str(h1.get("state") or "UNKNOWN")
     pullback_direction = str(h1_pullback.get("direction") or "NONE")
@@ -7853,33 +8689,105 @@ def _apply_multi_timeframe_context(signal: dict[str, object], context: dict[str,
     smart_money_phase = str(out.get("smart_money_phase") or "")
     distribution_short_stage = _distribution_short_stage(out, context)
     setup_type = str(out.get("setup_type") or "")
+    oi_valley_ema55_long_detected = (
+        str(h4_oi_valley_long.get("state") or "") == "CONFIRMED"
+    )
+    oi_valley_long_reversal_detected = (
+        _oi_valley_long_reversal_confirmed(
+            h4_oi_valley,
+            h1,
+            h1_pullback,
+            h4_oi_valley_long,
+        )
+    )
+    oi_valley_long_detected = (
+        oi_valley_long_reversal_detected
+        or str(h4_oi_valley.get("state") or "")
+        in {"CONFIRMED", "EXHAUSTION"}
+    )
+    oi_valley_direction_allows_long = h4_direction == "LONG"
+    oi_valley_long_eligible = (
+        oi_valley_long_detected
+        and oi_valley_direction_allows_long
+    )
+    oi_valley_long_reversal = (
+        oi_valley_long_reversal_detected
+        and oi_valley_direction_allows_long
+    )
+    oi_valley_ema55_long = (
+        oi_valley_ema55_long_detected
+        and oi_valley_direction_allows_long
+    )
+    oi_valley_direction_gate_reason = (
+        "4h direction is not long"
+        if oi_valley_long_detected
+        and not oi_valley_direction_allows_long
+        else ""
+    )
+    if (
+        setup_type == SETUP_OI_VALLEY_REVERSAL_LONG
+        and not oi_valley_long_reversal
+    ):
+        # Legacy or restored signals must not retain an OI-led long setup
+        # after the higher-timeframe direction gate becomes ineligible.
+        setup_type = ""
+    direction_gate = (
+        "LONG_ONLY"
+        if h4_direction == "LONG"
+        else "SHORT_ONLY"
+        if h4_direction == "SHORT"
+        else "WAIT_BREAKOUT_RETEST"
+        if h4_structure_type
+        in {
+            "DESCENDING_BREAKOUT_PENDING",
+            "ASCENDING_BREAKDOWN_PENDING",
+        }
+        else "NEUTRAL"
+    )
+    direction_blocked = False
+    direction_veto_reason = ""
+    if (
+        direction_gate == "SHORT_ONLY"
+        and action == SignalAction.ENTRY_LONG.value
+    ):
+        direction_blocked = True
+        direction_veto_reason = (
+            "4h direction is short; descending resistance or breakdown blocks new long"
+        )
+    elif (
+        direction_gate == "LONG_ONLY"
+        and action == SignalAction.ENTRY_SHORT.value
+    ):
+        direction_blocked = True
+        direction_veto_reason = (
+            "4h direction is long; ascending support or breakout blocks new short"
+        )
+    elif (
+        direction_gate == "WAIT_BREAKOUT_RETEST"
+        and action
+        in {
+            SignalAction.ENTRY_LONG.value,
+            SignalAction.ENTRY_SHORT.value,
+        }
+    ):
+        direction_blocked = True
+        direction_veto_reason = (
+            "4h trendline break is pending a closed-candle retest"
+        )
+    if direction_veto_reason:
+        vetoes.append(direction_veto_reason)
     handoff_confirmed = (
         str(high_distribution_handoff.get("state") or "")
         == "CONFIRMED"
     )
-    oi_valley_ema55_long = (
-        str(h4_oi_valley_long.get("state") or "") == "CONFIRMED"
-    )
-    if oi_valley_ema55_long and action != SignalAction.ENTRY_LONG.value:
-        # The complete 4h setup is allowed to override a lagging lower-timeframe
-        # short bias, but it starts as A quality and never inherits that short
-        # signal's S score or side-specific veto text.
-        action = SignalAction.ENTRY_LONG.value
-        out["candidate_action"] = action
-        out["action"] = action
-        out["trend_state"] = "CHOP"
-        trend_state = "CHOP"
-        score = AUTO_ENTRY_MIN_SCORE
-        evidence_families = {}
-        reasons = [
-            "4h OI-valley absorption overrides the lagging lower-timeframe short bias"
-        ]
-        vetoes = [
-            veto
-            for veto in vetoes
-            if "extreme volatility" in str(veto).lower()
-        ]
-        setup_type = SETUP_OI_VALLEY_REVERSAL_LONG
+    if oi_valley_long_detected and not oi_valley_direction_allows_long:
+        reasons.append(
+            "4h direction is not long; OI valley remains observation-only"
+        )
+    elif oi_valley_ema55_long:
+        reasons.append(
+            "4h OI-valley absorption is supporting evidence only; direction and trigger still decide entry"
+        )
     if handoff_confirmed:
         reasons.append(
             "high distribution handoff complete: OI rebuilt while price failed and long/short ratio rose"
@@ -7907,7 +8815,9 @@ def _apply_multi_timeframe_context(signal: dict[str, object], context: dict[str,
                 )
             )
     entry_timeframe_override: str | None = (
-        "4h" if oi_valley_ema55_long else None
+        "4h"
+        if oi_valley_ema55_long and action == SignalAction.ENTRY_LONG.value
+        else None
     )
     m15_long_exception = _strong_m15_pullback_allowed(
         PositionSide.LONG,
@@ -7953,15 +8863,9 @@ def _apply_multi_timeframe_context(signal: dict[str, object], context: dict[str,
         )
         reasons.append(
             "1h EMA20/EMA60 repeatedly breached as resistance; promote entry, stop, and target to 4h"
-        )
+    )
     rsi14 = _float_or_none(out.get("rsi14"))
     weak_deleverage_rebound = _weak_deleverage_rebound(out, h4_oi, h1_pullback)
-    oi_valley_long_reversal = _oi_valley_long_reversal_confirmed(
-        h4_oi_valley,
-        h1,
-        h1_pullback,
-        h4_oi_valley_long,
-    )
     if action == SignalAction.ENTRY_LONG.value:
         if m15_long_exception:
             setup_type = _prefer_setup_type(
@@ -7974,7 +8878,7 @@ def _apply_multi_timeframe_context(signal: dict[str, object], context: dict[str,
         elif daily_bias == "BULL":
             add_family_score(SCORE_FAMILY_DIRECTION, 5)
             reasons.append("1d bullish bias supports long")
-        if h4_state in {"BREAKOUT_UP", "BOX_UPPER_HALF"}:
+        if h4_direction == "LONG":
             add_family_score(SCORE_FAMILY_DIRECTION, 6)
             reasons.append("4h structure supports upside")
         ma_score, ma_reasons, ma_vetoes = _ma_cluster_signal_adjustment(PositionSide.LONG, h4_ma_cluster, h1_ma_cluster)
@@ -7997,12 +8901,11 @@ def _apply_multi_timeframe_context(signal: dict[str, object], context: dict[str,
             )
             reasons.append(f"1h {h1_state.lower()} confirms long trigger")
         elif h1_direction == "SHORT":
+            vetoes.append("1h trigger opposes long entry")
             if oi_valley_ema55_long:
                 reasons.append(
-                    "1h direction still lags the confirmed 4h reversal; retain A-size only"
+                    "4h OI valley is present, but a 1h long trigger is still required"
                 )
-            else:
-                vetoes.append("1h trigger opposes long entry")
         if pullback_direction == "LONG":
             if weak_deleverage_rebound:
                 score -= 18
@@ -8089,10 +8992,13 @@ def _apply_multi_timeframe_context(signal: dict[str, object], context: dict[str,
                 reasons.append(
                     "4h OI exhaustion formed; downside wick reclaimed support"
                 )
-        elif str(h4_oi_valley.get("state") or "") in {
+        elif (
+            not oi_valley_long_reversal_detected
+            and str(h4_oi_valley.get("state") or "") in {
             "CONFIRMED",
             "EXHAUSTION",
-        }:
+            }
+        ):
             reasons.append(
                 "4h OI valley formed; wait for a downside-wick support reclaim before long"
             )
@@ -8111,6 +9017,18 @@ def _apply_multi_timeframe_context(signal: dict[str, object], context: dict[str,
         reasons.extend(rsi_reasons)
         vetoes.extend(rsi_vetoes)
     elif action == SignalAction.ENTRY_SHORT.value:
+        if h4_direction == "SHORT":
+            add_family_score(SCORE_FAMILY_DIRECTION, 6)
+            reasons.append("4h structure supports downside")
+        if h4_structure_type == "DESCENDING_RESISTANCE":
+            setup_type = _prefer_setup_type(
+                setup_type,
+                SETUP_H4_DESCENDING_RESISTANCE_SHORT,
+            )
+            entry_timeframe_override = "4h"
+            reasons.append(
+                "4h lower highs define descending resistance; wait for a confirmed short rejection"
+            )
         if distribution_short_stage == DISTRIBUTION_STAGE_RANGE:
             setup_type = _prefer_setup_type(
                 setup_type,
@@ -8150,10 +9068,10 @@ def _apply_multi_timeframe_context(signal: dict[str, object], context: dict[str,
         elif daily_bias == "BEAR":
             add_family_score(SCORE_FAMILY_DIRECTION, 5)
             reasons.append("1d bearish bias supports short")
-        if h4_state == "BREAKDOWN_DOWN":
-            add_family_score(SCORE_FAMILY_DIRECTION, 6)
-            reasons.append("4h structure supports downside")
-        elif h4_state == "BOX_LOWER_HALF":
+        if (
+            h4_state == "BOX_LOWER_HALF"
+            and h4_location != "RESISTANCE"
+        ):
             reasons.append(
                 "4h direction remains bearish, but price is in the lower half; wait for a bounce"
             )
@@ -8189,7 +9107,14 @@ def _apply_multi_timeframe_context(signal: dict[str, object], context: dict[str,
             elif pullback_state == "LOW_PULLBACK" and risk_state in {"SHORT_CROWD", "OI_ABNORMAL", "FUNDING_HOT"}:
                 score -= 20
                 vetoes.append("low pullback with OI/funding/crowd risk; avoid short entry")
-        elif _low_area_needs_short_pullback(h4_state, h1_direction, h1_state):
+        elif (
+            h4_location != "RESISTANCE"
+            and _low_area_needs_short_pullback(
+                h4_state,
+                h1_direction,
+                h1_state,
+            )
+        ):
             if _core_scored_entry_zone_hit(
                 out,
                 entry_levels,
@@ -8290,10 +9215,10 @@ def _apply_multi_timeframe_context(signal: dict[str, object], context: dict[str,
     if trend_stage_phase == TREND_STAGE_LATE and action in {SignalAction.ENTRY_LONG.value, SignalAction.ENTRY_SHORT.value}:
         out["leverage_cap"] = min(int(out.get("leverage_cap") or 99), 5)
         reasons.append("trend late stage; wait for a new pullback before fresh entry")
-    if oi_valley_ema55_long:
-        # A countertrend reversal is intentionally one capital unit even when
-        # the supporting evidence would otherwise lift the score into S.
-        score = min(max(score, AUTO_ENTRY_MIN_SCORE), ENTRY_QUALITY_S_MIN_SCORE - 1)
+    if oi_valley_ema55_long and action == SignalAction.ENTRY_LONG.value:
+        # The setup may support an existing long candidate, but it cannot create
+        # direction or lift a sub-threshold score into an automatic entry.
+        score = min(score, ENTRY_QUALITY_S_MIN_SCORE - 1)
         if risk_state == "LONG_CROWD":
             reasons.append(
                 "absolute long/short ratio remains crowded; reversal quality capped at A"
@@ -8301,7 +9226,9 @@ def _apply_multi_timeframe_context(signal: dict[str, object], context: dict[str,
     final_score = max(0, score)
     out["score"] = final_score
     out["score_evidence_families"] = dict(sorted(evidence_families.items()))
-    if final_score < AUTO_MAIN_POOL_MIN_SCORE:
+    if direction_blocked:
+        out["action"] = SignalAction.WATCH.value
+    elif final_score < AUTO_MAIN_POOL_MIN_SCORE:
         out["action"] = SignalAction.NO_TRADE.value
     elif final_score < AUTO_ENTRY_MIN_SCORE:
         out["action"] = SignalAction.WATCH.value
@@ -8315,6 +9242,11 @@ def _apply_multi_timeframe_context(signal: dict[str, object], context: dict[str,
     out["reasons"] = tuple(reasons)
     out["vetoes"] = tuple(vetoes)
     out["daily_bias"] = daily_bias
+    out["h4_direction"] = h4_direction
+    out["h4_location"] = h4_location
+    out["h4_structure_type"] = h4_structure_type
+    out["direction_gate"] = direction_gate
+    out["direction_veto_reason"] = direction_veto_reason
     out["h4_structure"] = h4
     out["h1_structure"] = h1_structure
     out["h4_ma_cluster"] = h4_ma_cluster
@@ -8322,6 +9254,10 @@ def _apply_multi_timeframe_context(signal: dict[str, object], context: dict[str,
     out["h4_oi"] = h4_oi
     out["h4_oi_valley"] = h4_oi_valley
     out["h4_oi_valley_long"] = h4_oi_valley_long
+    out["oi_valley_long_eligible"] = oi_valley_long_eligible
+    out["oi_valley_direction_gate_reason"] = (
+        oi_valley_direction_gate_reason
+    )
     out["h1_trigger"] = h1
     out["h1_pullback"] = h1_pullback
     out["h1_ema_reliability"] = h1_ema_reliability
@@ -8344,6 +9280,7 @@ def _apply_multi_timeframe_context(signal: dict[str, object], context: dict[str,
         out.pop("setup_type", None)
     out["entry_levels"] = selected_entry_levels
     out["trend_stage_phase"] = trend_stage_phase
+    out["entry_pipeline_version"] = 2
     out.pop("entry_confirmation_required", None)
     out.pop("entry_zone_confirmation", None)
     _update_entry_position_fields(out)
@@ -8657,6 +9594,40 @@ def _refine_stop_with_setup_structure(
         if stop_anchor is not None and 0 < stop_anchor < entry_price:
             return stop_anchor, "4h_oi_valley_floor_structure"
 
+    if (
+        side == PositionSide.SHORT
+        and setup_type == SETUP_H4_DESCENDING_RESISTANCE_SHORT
+    ):
+        h4 = (
+            signal.get("h4_structure")
+            if isinstance(signal.get("h4_structure"), dict)
+            else context.get("h4_structure")
+            if isinstance(context.get("h4_structure"), dict)
+            else {}
+        )
+        zone = (
+            h4.get("descending_trendline_zone")
+            if isinstance(h4.get("descending_trendline_zone"), dict)
+            else {}
+        )
+        zone_high = _float_or_none(zone.get("high"))
+        if zone_high is not None and zone_high > entry_price:
+            structure_stop = (
+                zone_high
+                + _structure_stop_buffer(entry_price, indicator)
+            )
+            return (
+                max(
+                    structure_stop,
+                    entry_price
+                    + _minimum_precision_stop_distance(
+                        entry_price,
+                        indicator,
+                    ),
+                ),
+                "4h_descending_resistance_structure",
+            )
+
     if side == PositionSide.SHORT and (
         stage in {DISTRIBUTION_STAGE_RANGE, DISTRIBUTION_STAGE_DESCENDING}
         or setup_type
@@ -8735,7 +9706,12 @@ def _setup_stop_timeframes(
     entry_timeframe: str,
     side: PositionSide,
 ) -> tuple[str, ...]:
-    if setup_type in {SETUP_H4_PULLBACK_LONG, SETUP_H4_PULLBACK_SHORT, SETUP_OI_VALLEY_REVERSAL_LONG}:
+    if setup_type in {
+        SETUP_H4_PULLBACK_LONG,
+        SETUP_H4_PULLBACK_SHORT,
+        SETUP_H4_DESCENDING_RESISTANCE_SHORT,
+        SETUP_OI_VALLEY_REVERSAL_LONG,
+    }:
         return ("4h", "1h")
     if setup_type in {
         SETUP_DISTRIBUTION_STAGE3_SHORT,
@@ -8967,6 +9943,14 @@ def _short_structure_stop_candidates(
     candidates = [
         _max_above(entry, h1.get("resistance_zone_high"), h1.get("resistance")),
         _max_above(entry, h4.get("resistance_zone_high"), h4.get("resistance")),
+        _max_above(
+            entry,
+            (
+                h4.get("descending_trendline_zone", {}).get("high")
+                if isinstance(h4.get("descending_trendline_zone"), dict)
+                else None
+            ),
+        ),
         _max_above(entry, h1_cluster.get("upper"), h1_cluster.get("ema60")),
         _max_above(entry, h4_cluster.get("upper"), h4_cluster.get("ema60")),
     ]

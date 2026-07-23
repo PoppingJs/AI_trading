@@ -210,10 +210,55 @@ def test_completed_trade_and_win_rate_share_full_lifecycle_pnl() -> None:
 
     assert snapshot["summary"]["trade_count"] == 2
     assert snapshot["summary"]["win_rate"] == 0.5
+    assert snapshot["summary"]["closed_trade_pnl"] == 3.0
+    assert snapshot["summary"]["open_trade_pnl"] == 0.0
     assert snapshot["account"]["fills"] == trades
     assert result["summary"]["trade_count"] == 2
     assert result["summary"]["win_rate"] == 0.5
+    assert result["summary"]["closed_trade_pnl"] == 3.0
+    assert result["summary"]["open_trade_pnl"] == 0.0
     assert result["account"]["fills"] == trades
+
+
+def test_explicit_trade_cycle_id_is_the_authoritative_lifecycle_key() -> None:
+    opened = datetime(2026, 7, 10, 1, tzinfo=UTC)
+    cycle_id = "TESTUSDT:cycle-001"
+    fills = [
+        _fill(
+            timestamp=opened,
+            action="OPEN",
+            price=100.0,
+            realized_pnl=0.0,
+            opened_at=opened,
+            fee=0.5,
+            trade_cycle_id=cycle_id,
+        ),
+        _fill(
+            timestamp=opened + timedelta(minutes=15),
+            action="PARTIAL_CLOSE",
+            price=102.0,
+            realized_pnl=3.0,
+            opened_at=opened + timedelta(seconds=1),
+            trade_cycle_id=cycle_id,
+        ),
+        _fill(
+            timestamp=opened + timedelta(minutes=30),
+            action="CLOSE",
+            price=99.0,
+            realized_pnl=-1.0,
+            opened_at=opened + timedelta(seconds=2),
+            closed_at=opened + timedelta(minutes=30),
+            trade_cycle_id=cycle_id,
+        ),
+    ]
+
+    trades = _completed_trade_payloads(fills)
+
+    assert len(trades) == 1
+    assert trades[0]["id"] == cycle_id
+    assert trades[0]["trade_cycle_id"] == cycle_id
+    assert trades[0]["partials"] == 1
+    assert trades[0]["realized_pnl"] == 1.5
 
 
 def test_current_day_end_is_floored_to_completed_base_interval() -> None:
@@ -237,6 +282,7 @@ def _fill(
     fee: float = 0.0,
     quantity: float = 1.0,
     margin_usdt: float = 20.0,
+    trade_cycle_id: str = "",
 ) -> PaperFill:
     return PaperFill(
         timestamp=timestamp,
@@ -257,4 +303,5 @@ def _fill(
         opened_at=opened_at,
         closed_at=closed_at,
         planned_risk_usdt=5.0,
+        trade_cycle_id=trade_cycle_id,
     )

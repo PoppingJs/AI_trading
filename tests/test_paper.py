@@ -12,11 +12,13 @@ from ai_trading.config import AppSettings
 from ai_trading.models import Candle, IndicatorSnapshot, Position, PositionSide, SignalAction
 from ai_trading.risk import TradePlan
 from ai_trading.paper import (
+    AUTO_ENTRY_MIN_SCORE,
     DISTRIBUTION_STAGE_DESCENDING,
     DISTRIBUTION_STAGE_MARKDOWN,
     DISTRIBUTION_STAGE_RANGE,
     MARKET_PRICE_STALE_SECONDS,
     SETUP_H1_PULLBACK_LONG,
+    SETUP_H4_DESCENDING_RESISTANCE_SHORT,
     SETUP_H4_PULLBACK_SHORT,
     SETUP_OI_VALLEY_REVERSAL_LONG,
     STATE_SAVE_SECONDS,
@@ -30,6 +32,7 @@ from ai_trading.paper import (
     _auto_signal_allowed,
     _candidate_prefilter_allowed,
     _confirmed_structure_exit_reason,
+    _direction_validation_exit_reason,
     _daily_pnl_payload,
     _entry_quality_grade,
     _distribution_short_stage,
@@ -43,6 +46,7 @@ from ai_trading.paper import (
     _exit_plan_error,
     _four_hour_oi_valley,
     _four_hour_oi_valley_long_setup,
+    _four_hour_structure,
     _fixed_margin_for_quality,
     _high_distribution_handoff,
     _high_distribution_handoff_exit_reason,
@@ -75,12 +79,14 @@ from ai_trading.paper import (
     _risk_exit_reason,
     _scored_entry_levels,
     _signal_entry_timing,
+    _soft_stop_close_exit_reason,
     _stop_exit_reason,
     _strong_trend_invalidated,
     _structure_take_profit_reason,
     _take_profits_for_final_stop,
     _tighten_short_support_stop,
     _update_position_excursions,
+    _update_position_validation,
     _update_entry_position_fields,
 )
 
@@ -321,9 +327,10 @@ def indicator_snapshot(
     oi_change: float | None = None,
     open_interest: float | None = None,
     long_short_ratio: float | None = None,
+    timestamp: datetime | None = None,
 ) -> IndicatorSnapshot:
     return IndicatorSnapshot(
-        timestamp=datetime(2026, 1, 1, tzinfo=UTC),
+        timestamp=timestamp or datetime(2026, 1, 1, tzinfo=UTC),
         close=close,
         ema20=ema20,
         ema50=99.0,
@@ -371,6 +378,46 @@ def test_paper_engine_manual_long_close_profit() -> None:
     assert close_fill["entry_position"] == "手动开仓≈100"
     assert not engine.account.positions
     assert engine.status()["equity"] > 1000
+
+
+def test_open_partial_and_close_share_one_trade_cycle_id() -> None:
+    engine = PaperTradingEngine(
+        AppSettings(),
+        starting_balance=1000,
+        market_data=FakeMarketData(),
+    )
+    position = asyncio.run(
+        engine.open_position(
+            "TESTUSDT",
+            "LONG",
+            margin_usdt=100,
+            leverage=5,
+            stop_loss=98.0,
+            take_profit_1=102.0,
+            take_profit_2=104.0,
+        )
+    )
+
+    engine._close_position_fraction_unlocked(
+        position,
+        102.0,
+        0.35,
+        "take profit: target 1 reached",
+    )
+    engine._close_position_unlocked(
+        position,
+        103.0,
+        "take profit: target 2 reached",
+    )
+
+    cycle_ids = {fill.trade_cycle_id for fill in engine.account.fills}
+    assert cycle_ids == {position.metadata["trade_cycle_id"]}
+    assert [fill.action for fill in engine.account.fills] == [
+        "OPEN",
+        "PARTIAL_CLOSE",
+        "CLOSE",
+    ]
+    assert engine.account.fills[-1].exit_category == "TAKE_PROFIT"
 
 
 def test_take_profit_1_partially_closes_and_moves_stop_above_break_even() -> None:
@@ -496,6 +543,76 @@ def test_full_exit_requires_new_entry_timeframe_candle_before_reentry(
     assert engine._reentry_block_reason("TESTUSDT") is None
 
 
+def test_auto_reentry_requires_a_new_confirmed_structure_not_only_a_new_candle() -> None:
+    engine = PaperTradingEngine(
+        AppSettings(),
+        starting_balance=1000,
+        market_data=FakeMarketData(),
+    )
+    candle_time = datetime(2026, 7, 1, 0, 0, tzinfo=UTC)
+    engine._timeframe_candles["TESTUSDT"] = {
+        "1h": [
+            Candle(
+                timestamp=candle_time,
+                open=100.0,
+                high=101.0,
+                low=99.0,
+                close=100.0,
+                volume=1000.0,
+            )
+        ]
+    }
+    position = asyncio.run(
+        engine.open_position(
+            "TESTUSDT",
+            "LONG",
+            margin_usdt=100,
+            leverage=5,
+            stop_loss=98.0,
+            take_profit_1=102.0,
+            take_profit_2=104.0,
+            entry_context={
+                "stop_timeframe": "1h",
+                "h1_trigger": {"direction": "LONG", "state": "RETEST"},
+            },
+        )
+    )
+    engine.latest_signals["TESTUSDT"] = {
+        "action": SignalAction.WATCH.value,
+        "h4_structure": {"state": "BREAKDOWN_DOWN", "support": 98.0},
+        "h1_trigger": {"direction": "SHORT", "state": "BREAKDOWN"},
+    }
+    engine._close_position_unlocked(position, 98.0, "stop loss: structure failed")
+    engine._timeframe_candles["TESTUSDT"]["1h"].append(
+        Candle(
+            timestamp=candle_time + timedelta(hours=1),
+            open=98.0,
+            high=99.0,
+            low=97.0,
+            close=98.5,
+            volume=1000.0,
+        )
+    )
+
+    assert (
+        engine._reentry_block_reason("TESTUSDT")
+        == "waiting for a new confirmed structure after full exit"
+    )
+
+    engine.latest_signals["TESTUSDT"] = {
+        "action": SignalAction.ENTRY_LONG.value,
+        "h4_structure": {"state": "BOX_LOWER_HALF", "support": 97.0},
+        "h1_trigger": {"direction": "LONG", "state": "RETEST"},
+        "entry_levels": {
+            "long": {
+                "h1_support": {"low": 97.0, "high": 98.5, "price": 98.0},
+            }
+        },
+    }
+
+    assert engine._reentry_block_reason("TESTUSDT") is None
+
+
 def test_paper_status_pnl_components_reconcile_to_total() -> None:
     market = FakeMarketData()
     engine = PaperTradingEngine(AppSettings(), starting_balance=1000, market_data=market)
@@ -558,7 +675,7 @@ def test_closed_fill_preserves_actual_auto_entry_position() -> None:
         )
     )
     assert position.metadata["entry_position"] == (
-        "1H支撑回踩≈99-101；1H BOLL中轨回踩≈99.5-100.5；实际开仓≈100"
+        "1H支撑回踩≈99-101；实际开仓≈100"
     )
 
     market.price = 105.0
@@ -599,12 +716,18 @@ def test_paper_engine_persists_positions_and_fills(tmp_path: Path) -> None:
     assert status["starting_balance"] == 1000
     assert status["positions"][0]["symbol"] == "BTCUSDT"
     assert status["fills"][0]["action"] == "OPEN"
+    assert status["fills"][0]["trade_cycle_id"]
+    assert status["fills"][0]["validation_state"] == "UNVALIDATED"
 
     restored.latest_prices["BTCUSDT"] = 110.0
     asyncio.run(restored.close_position("BTCUSDT", reason="test close"))
     restored_again = PaperTradingEngine(AppSettings(), starting_balance=500, market_data=FakeMarketData(), state_path=state_path)
     assert restored_again.status()["positions"] == []
     assert restored_again.status()["fills"][-1]["action"] == "CLOSE"
+    assert (
+        restored_again.status()["fills"][0]["trade_cycle_id"]
+        == restored_again.status()["fills"][-1]["trade_cycle_id"]
+    )
 
 
 def test_paper_engine_persists_last_mark_price_for_open_positions(tmp_path: Path) -> None:
@@ -1322,6 +1445,107 @@ def test_confirmed_breakout_moves_long_stop_to_structure_protection() -> None:
 
     assert position.stop_price >= 102.4
     assert position.metadata["breakout_protected"] is True
+
+
+def test_breakout_protection_does_not_tighten_before_one_r_validation() -> None:
+    position = asyncio.run(
+        PaperTradingEngine(
+            AppSettings(),
+            starting_balance=1000,
+            market_data=FakeMarketData(),
+        ).open_position(
+            "TESTUSDT",
+            "LONG",
+            margin_usdt=100,
+            leverage=5,
+            stop_loss=99.0,
+        )
+    )
+    position.entry_price = 100.0
+    position.stop_price = 99.0
+    position.metadata["initial_stop_distance"] = 1.0
+    signal = {
+        "h4_structure": {"state": "BREAKOUT_UP", "resistance": 100.5},
+        "h1_trigger": {"direction": "LONG", "state": "BREAKOUT"},
+    }
+
+    _protect_confirmed_breakout_position(
+        position,
+        100.7,
+        signal,
+        indicator_snapshot(close=100.7, atr=0.5, ema20=100.4),
+    )
+
+    assert position.stop_price == 99.0
+    assert not position.metadata.get("breakout_protected")
+
+
+def test_soft_structure_stop_waits_for_new_candle_close_while_hard_stop_stays_fixed() -> None:
+    opened = datetime(2026, 7, 20, 1, tzinfo=UTC)
+    position = Position(
+        symbol="TESTUSDT",
+        side=PositionSide.LONG,
+        entry_price=100.0,
+        quantity=1.0,
+        opened_at=opened,
+        stop_price=98.0,
+        take_profit_1=102.0,
+        take_profit_2=104.0,
+        metadata={
+            "soft_stop_price": 99.0,
+            "hard_stop_price": 98.0,
+            "initial_stop_distance": 2.0,
+        },
+    )
+
+    assert _soft_stop_close_exit_reason(
+        position,
+        indicator_snapshot(
+            close=100.0,
+            timestamp=opened + timedelta(hours=1),
+        ),
+    ) is None
+    assert _soft_stop_close_exit_reason(
+        position,
+        indicator_snapshot(
+            close=98.8,
+            timestamp=opened + timedelta(hours=2),
+        ),
+    ) == "stop loss: structure close confirmed beyond the primary setup"
+    assert position.stop_price == 98.0
+
+
+def test_unvalidated_direction_exits_on_opposite_structure_but_validated_trade_does_not() -> None:
+    position = Position(
+        symbol="TESTUSDT",
+        side=PositionSide.LONG,
+        entry_price=100.0,
+        quantity=1.0,
+        opened_at=datetime(2026, 7, 20, 1, tzinfo=UTC),
+        stop_price=98.0,
+        take_profit_1=102.0,
+        take_profit_2=104.0,
+        metadata={
+            "validation_state": "UNVALIDATED",
+            "initial_stop_distance": 2.0,
+            "max_favorable_distance": 0.2,
+        },
+    )
+    opposite = {
+        "action": SignalAction.ENTRY_SHORT.value,
+        "trend_state": "ONE_WAY_DOWN",
+        "h4_structure": {"state": "BREAKDOWN_DOWN"},
+        "h1_trigger": {"direction": "SHORT", "state": "BREAKDOWN"},
+    }
+
+    reason = _direction_validation_exit_reason(position, 99.0, opposite)
+    assert reason is not None and "direction unvalidated" in reason
+
+    position.metadata["max_favorable_distance"] = 0.7
+    _update_position_validation(position)
+
+    assert position.metadata["validation_state"] == "VALIDATED"
+    assert _direction_validation_exit_reason(position, 99.0, opposite) is None
 
 
 def test_confirmed_structure_exit_uses_1h_4h_body_break_not_m15_noise() -> None:
@@ -2057,6 +2281,27 @@ def test_auto_signal_score_tiers_and_margins() -> None:
     assert not _auto_signal_allowed({**base_signal, "score": 90, "risk_state": "NORMAL", "vetoes": ("1h trigger opposes long entry",)})
     assert not _auto_signal_allowed({"score": 90, "risk_state": "NORMAL"})
 
+
+def test_version_two_entry_pipeline_requires_an_explicit_trigger() -> None:
+    signal = {
+        "entry_pipeline_version": 2,
+        "action": SignalAction.ENTRY_LONG.value,
+        "score": 90,
+        "price": 100.0,
+        "entry_levels": {
+            "long": {
+                "h1_support": {"low": 99.0, "high": 101.0, "price": 100.0},
+            }
+        },
+        "vetoes": (),
+    }
+
+    _update_entry_position_fields(signal)
+
+    assert signal["entry_timing"] == "GOOD"
+    assert signal["entry_state"] == "TRIGGER_PENDING"
+    assert "entry trigger is not confirmed" in _auto_entry_prerequisite_blocks(signal)
+
 def test_entry_quality_uses_only_a_and_s_score_bands() -> None:
     assert _entry_quality_grade(
         score=100,
@@ -2564,6 +2809,7 @@ def test_multi_timeframe_context_sets_oi_valley_setup_from_source_without_reason
     context = {
         "summary": "context",
         "daily_bias": "NEUTRAL",
+        "h4_structure": {"state": "BREAKOUT_UP"},
         "h4_oi_valley": {"state": "CONFIRMED"},
         "h1_trigger": {"direction": "LONG", "state": "FAKE_BREAKDOWN"},
         "h1_pullback": {"direction": "NONE", "state": "WAIT"},
@@ -2582,6 +2828,179 @@ def test_multi_timeframe_context_sets_oi_valley_setup_from_source_without_reason
 
     assert adjusted["setup_type"] == SETUP_OI_VALLEY_REVERSAL_LONG
     assert set(adjusted["entry_levels"]["long"]) == {"sweep_reclaim_support"}
+    assert adjusted["h4_direction"] == "LONG"
+    assert adjusted["oi_valley_long_eligible"] is True
+
+
+def test_ema55_oi_valley_supports_long_only_after_h4_direction_is_long() -> None:
+    adjusted = _apply_multi_timeframe_context(
+        {
+            "action": SignalAction.ENTRY_LONG.value,
+            "candidate_action": SignalAction.ENTRY_LONG.value,
+            "score": 82,
+            "trend_state": "TREND_LONG",
+            "risk_state": "NORMAL",
+            "price": 100.0,
+            "reasons": ("base long direction",),
+            "vetoes": (),
+        },
+        {
+            "summary": "context",
+            "daily_bias": "NEUTRAL",
+            "h4_structure": {
+                "state": "BOX_LOWER_HALF",
+                "direction": "LONG",
+                "structure_type": "ASCENDING_SUPPORT",
+            },
+            "h4_oi_valley": {"state": "EXHAUSTION"},
+            "h4_oi_valley_long": {"state": "CONFIRMED"},
+            "h1_trigger": {
+                "direction": "LONG",
+                "state": "RETEST",
+            },
+            "h1_pullback": {"direction": "NONE", "state": "WAIT"},
+            "entry_levels": {
+                "long": {
+                    "h4_ema55_reclaim": {
+                        "low": 99.0,
+                        "high": 101.0,
+                        "price": 100.0,
+                    },
+                    "h1_support": {
+                        "low": 98.0,
+                        "high": 99.0,
+                        "price": 98.5,
+                    },
+                },
+            },
+        },
+    )
+
+    assert adjusted["oi_valley_long_eligible"] is True
+    assert adjusted["oi_valley_direction_gate_reason"] == ""
+    assert adjusted["setup_type"] == SETUP_OI_VALLEY_REVERSAL_LONG
+    assert adjusted["entry_timeframe_override"] == "4h"
+    assert set(adjusted["entry_levels"]["long"]) == {
+        "h4_ema55_reclaim"
+    }
+    assert adjusted["score_evidence_families"]["DERIVATIVES"] == 12
+
+
+@pytest.mark.parametrize(
+    "h4_structure",
+    [
+        {"state": "BOX_UPPER_HALF"},
+        {"state": "BOX_LOWER_HALF", "direction": "NEUTRAL"},
+        {"state": "UNKNOWN"},
+    ],
+)
+def test_oi_valley_does_not_take_over_other_long_setup_without_h4_long(
+    h4_structure: dict[str, object],
+) -> None:
+    adjusted = _apply_multi_timeframe_context(
+        {
+            "action": SignalAction.ENTRY_LONG.value,
+            "candidate_action": SignalAction.ENTRY_LONG.value,
+            "score": 88,
+            "trend_state": "TREND_LONG",
+            "risk_state": "NORMAL",
+            "price": 100.0,
+            "setup_type": SETUP_OI_VALLEY_REVERSAL_LONG,
+            "reasons": ("base long direction",),
+            "vetoes": (),
+        },
+        {
+            "summary": "context",
+            "daily_bias": "NEUTRAL",
+            "h4_structure": h4_structure,
+            "h4_oi_valley": {"state": "EXHAUSTION"},
+            "h4_oi_valley_long": {"state": "CONFIRMED"},
+            "h1_trigger": {"direction": "NONE", "state": "WAIT"},
+            "h1_pullback": {
+                "direction": "LONG",
+                "state": "HEALTHY_PULLBACK",
+            },
+            "entry_levels": {
+                "long": {
+                    "h1_support": {
+                        "low": 99.0,
+                        "high": 101.0,
+                        "price": 100.0,
+                    },
+                    "h4_ema55_reclaim": {
+                        "low": 99.0,
+                        "high": 101.0,
+                        "price": 100.0,
+                    },
+                },
+            },
+        },
+    )
+
+    assert adjusted["h4_direction"] == "NEUTRAL"
+    assert adjusted["oi_valley_long_eligible"] is False
+    assert (
+        adjusted["oi_valley_direction_gate_reason"]
+        == "4h direction is not long"
+    )
+    assert adjusted["setup_type"] == SETUP_H1_PULLBACK_LONG
+    assert "h4_ema55_reclaim" not in adjusted["entry_levels"]["long"]
+    assert set(adjusted["entry_levels"]["long"]) == {"h1_support"}
+    assert "DERIVATIVES" not in adjusted["score_evidence_families"]
+    assert "entry_timeframe_override" not in adjusted
+    assert adjusted["action"] == SignalAction.ENTRY_LONG.value
+
+
+def test_h4_short_direction_blocks_long_and_oi_valley_cannot_override_it() -> None:
+    adjusted = _apply_multi_timeframe_context(
+        {
+            "action": SignalAction.ENTRY_LONG.value,
+            "candidate_action": SignalAction.ENTRY_LONG.value,
+            "score": 100,
+            "trend_state": "TREND_LONG",
+            "risk_state": "NORMAL",
+            "price": 100.0,
+            "reasons": ("base long direction",),
+            "vetoes": (),
+        },
+        {
+            "summary": "context",
+            "daily_bias": "NEUTRAL",
+            "h4_structure": {
+                "state": "BOX_UPPER_HALF",
+                "direction": "SHORT",
+                "structure_type": "DESCENDING_RESISTANCE",
+            },
+            "h4_oi_valley": {"state": "EXHAUSTION"},
+            "h4_oi_valley_long": {"state": "CONFIRMED"},
+            "h1_trigger": {
+                "direction": "LONG",
+                "state": "RETEST",
+            },
+            "h1_pullback": {"direction": "NONE", "state": "WAIT"},
+            "entry_levels": {
+                "long": {
+                    "breakout_retest": {
+                        "low": 99.0,
+                        "high": 101.0,
+                        "price": 100.0,
+                    },
+                    "h4_ema55_reclaim": {
+                        "low": 99.0,
+                        "high": 101.0,
+                        "price": 100.0,
+                    },
+                },
+            },
+        },
+    )
+
+    assert adjusted["action"] == SignalAction.WATCH.value
+    assert adjusted["direction_gate"] == "SHORT_ONLY"
+    assert adjusted["oi_valley_long_eligible"] is False
+    assert adjusted["setup_type"] != SETUP_OI_VALLEY_REVERSAL_LONG
+    assert "DERIVATIVES" not in adjusted["score_evidence_families"]
+    assert "h4_ema55_reclaim" not in adjusted["entry_levels"]["long"]
 
 
 def test_separated_ema20_and_ema60_do_not_create_a_bridge_entry_zone() -> None:
@@ -3031,7 +3450,7 @@ def test_four_hour_oi_valley_absorption_builds_ema55_reversal_long() -> None:
     assert setup["stop_anchor"] < setup["floor_price"]
 
 
-def test_ema55_oi_valley_reversal_overrides_short_as_a_quality_long() -> None:
+def test_ema55_oi_valley_is_supporting_evidence_and_cannot_override_short() -> None:
     adjusted = _apply_multi_timeframe_context(
         {
             "action": SignalAction.ENTRY_SHORT.value,
@@ -3067,11 +3486,18 @@ def test_ema55_oi_valley_reversal_overrides_short_as_a_quality_long() -> None:
         },
     )
 
-    assert adjusted["action"] == SignalAction.ENTRY_LONG.value
-    assert adjusted["setup_type"] == SETUP_OI_VALLEY_REVERSAL_LONG
-    assert 85 <= adjusted["score"] < 100
-    assert set(adjusted["entry_levels"]["long"]) == {"h4_ema55_reclaim"}
-    assert not adjusted["vetoes"]
+    assert adjusted["action"] == SignalAction.WATCH.value
+    assert adjusted["candidate_action"] == SignalAction.ENTRY_SHORT.value
+    assert adjusted["score"] < AUTO_ENTRY_MIN_SCORE
+    assert adjusted["oi_valley_long_eligible"] is False
+    assert (
+        adjusted["oi_valley_direction_gate_reason"]
+        == "4h direction is not long"
+    )
+    assert (
+        "4h direction is not long; OI valley remains observation-only"
+        in adjusted["reasons"]
+    )
 
 
 def test_oi_valley_reversal_stop_and_early_invalidation_use_4h_structure() -> None:
@@ -3151,7 +3577,11 @@ def test_confirmed_four_hour_oi_valley_exits_short_and_needs_wick_for_long() -> 
 
     context = {
         "daily_bias": "NEUTRAL",
-        "h4_structure": {"state": "BOX_LOWER_HALF"},
+        "h4_structure": {
+            "state": "BOX_LOWER_HALF",
+            "direction": "LONG",
+            "structure_type": "ASCENDING_SUPPORT",
+        },
         "h1_structure": {"support": 99.0, "support_zone_low": 98.5, "support_zone_high": 99.5},
         "h4_ma_cluster": {},
         "h1_ma_cluster": {},
@@ -3397,6 +3827,120 @@ def test_distribution_structure_projects_the_latest_lower_high_line() -> None:
     assert line["low"] == pytest.approx(99.8)
     assert line["high"] == pytest.approx(100.6)
     assert line["anchor_count"] == 3
+
+
+def _descending_h4_market() -> tuple[list[Candle], list[IndicatorSnapshot]]:
+    start = datetime(2026, 7, 19, tzinfo=UTC)
+    candles: list[Candle] = []
+    anchor_highs = {3: 110.0, 9: 105.0, 15: 100.0}
+    for index in range(22):
+        high = anchor_highs.get(index, 101.0 - index * 0.3)
+        if index == 21:
+            high = 95.2
+        close = high - 0.3
+        candles.append(
+            Candle(
+                timestamp=start + timedelta(hours=index * 4),
+                open=close - 0.2,
+                high=high,
+                low=high - 2.0,
+                close=close,
+                volume=1000.0,
+            )
+        )
+    indicators = [
+        indicator_snapshot(
+            close=candle.close,
+            atr=1.0,
+            timestamp=candle.timestamp,
+        )
+        for candle in candles
+    ]
+    return candles, indicators
+
+
+def test_four_hour_structure_separates_descending_direction_from_box_location() -> None:
+    candles, indicators = _descending_h4_market()
+
+    structure = _four_hour_structure(
+        candles,
+        indicators,
+        AppSettings(),
+    )
+
+    assert structure["state"] == "BOX_LOWER_HALF"
+    assert structure["direction"] == "SHORT"
+    assert structure["location"] == "RESISTANCE"
+    assert structure["structure_type"] == "DESCENDING_RESISTANCE"
+    assert structure["descending_anchor_count"] == 3
+    assert structure["descending_trendline_zone"]["price"] == pytest.approx(
+        95.0
+    )
+
+
+def test_descending_trendline_break_needs_a_closed_retest_before_turning_long() -> None:
+    candles, indicators = _descending_h4_market()
+    current = candles[-1]
+    candles[-1] = Candle(
+        timestamp=current.timestamp,
+        open=95.2,
+        high=96.5,
+        low=94.8,
+        close=96.0,
+        volume=current.volume,
+    )
+    indicators[-1] = indicator_snapshot(
+        close=96.0,
+        atr=1.0,
+        timestamp=current.timestamp,
+    )
+
+    pending = _four_hour_structure(
+        candles,
+        indicators,
+        AppSettings(),
+    )
+
+    assert pending["direction"] == "NEUTRAL"
+    assert pending["structure_type"] == "DESCENDING_BREAKOUT_PENDING"
+
+    previous = candles[-2]
+    candles[-2] = Candle(
+        timestamp=previous.timestamp,
+        open=95.5,
+        high=96.8,
+        low=94.8,
+        close=96.5,
+        volume=previous.volume,
+    )
+    indicators[-2] = indicator_snapshot(
+        close=96.5,
+        atr=1.0,
+        timestamp=previous.timestamp,
+    )
+    candles[-1] = Candle(
+        timestamp=current.timestamp,
+        open=95.6,
+        high=95.7,
+        low=94.9,
+        close=95.1,
+        volume=current.volume,
+    )
+    indicators[-1] = indicator_snapshot(
+        close=95.1,
+        atr=1.0,
+        timestamp=current.timestamp,
+    )
+
+    confirmed = _four_hour_structure(
+        candles,
+        indicators,
+        AppSettings(),
+    )
+
+    assert confirmed["direction"] == "LONG"
+    assert confirmed["location"] == "SUPPORT"
+    assert confirmed["structure_type"] == "DESCENDING_BREAKOUT_RETEST"
 
 
 def test_two_anchor_distribution_projection_needs_resistance_confluence() -> None:
@@ -4591,9 +5135,221 @@ def test_multi_timeframe_healthy_pullback_adds_score() -> None:
     adjusted = _apply_multi_timeframe_context(signal, context)
     _update_entry_position_fields(adjusted)
 
-    assert adjusted["score"] == 98
+    assert adjusted["score"] == 97
+    assert "4h structure supports upside" not in adjusted["reasons"]
+    assert adjusted["h4_direction"] == "NEUTRAL"
+    assert adjusted["direction_gate"] == "NEUTRAL"
     assert "1h BOLL/EMA pullback held with clean risk" in adjusted["reasons"]
     assert not adjusted["vetoes"]
+
+
+def test_descending_four_hour_resistance_blocks_long_without_flipping_short() -> None:
+    candles, indicators = _descending_h4_market()
+    h4 = _four_hour_structure(candles, indicators, AppSettings())
+    adjusted = _apply_multi_timeframe_context(
+        {
+            "action": SignalAction.ENTRY_LONG.value,
+            "score": 100,
+            "risk_state": "NORMAL",
+            "price": 95.1,
+            "reasons": (),
+            "vetoes": (),
+        },
+        {
+            "daily_bias": "NEUTRAL",
+            "h4_structure": h4,
+            "h1_trigger": {
+                "direction": "LONG",
+                "state": "RETEST",
+            },
+            "entry_levels": {
+                "long": {
+                    "breakout_retest": {
+                        "low": 94.8,
+                        "high": 95.3,
+                        "price": 95.0,
+                    }
+                }
+            },
+            "summary": "MTF: FIL-like descending resistance",
+        },
+    )
+
+    assert adjusted["action"] == SignalAction.WATCH.value
+    assert adjusted["direction_gate"] == "SHORT_ONLY"
+    assert adjusted["h4_structure_type"] == "DESCENDING_RESISTANCE"
+    assert adjusted["direction_veto_reason"] in adjusted["vetoes"]
+    assert adjusted["action"] != SignalAction.ENTRY_SHORT.value
+
+
+def test_descending_four_hour_resistance_short_uses_only_its_primary_zone() -> None:
+    candles, indicators = _descending_h4_market()
+    h4 = _four_hour_structure(candles, indicators, AppSettings())
+    descending_zone = h4["descending_trendline_zone"]
+    adjusted = _apply_multi_timeframe_context(
+        {
+            "action": SignalAction.ENTRY_SHORT.value,
+            "score": 90,
+            "risk_state": "NORMAL",
+            "price": 95.1,
+            "reasons": (),
+            "vetoes": (),
+        },
+        {
+            "daily_bias": "NEUTRAL",
+            "h4_structure": h4,
+            "h1_trigger": {
+                "direction": "SHORT",
+                "state": "RETEST",
+                "rejection_high": 95.3,
+            },
+            "entry_levels": {
+                "short": {
+                    "h4_descending_resistance": descending_zone,
+                    "vwap_retest": {
+                        "low": 93.0,
+                        "high": 94.0,
+                        "price": 93.5,
+                    },
+                }
+            },
+            "summary": "MTF: FIL-like descending resistance",
+        },
+    )
+
+    assert adjusted["action"] == SignalAction.ENTRY_SHORT.value
+    assert adjusted["setup_type"] == SETUP_H4_DESCENDING_RESISTANCE_SHORT
+    assert set(adjusted["entry_levels"]["short"]) == {
+        "h4_descending_resistance"
+    }
+    assert adjusted["entry_timeframe_override"] == "4h"
+    assert adjusted["entry_state"] == "READY"
+    assert adjusted["entry_trigger"] == "1H_RETEST"
+    assert not adjusted["vetoes"]
+    assert _auto_signal_allowed(adjusted)
+
+
+def test_descending_four_hour_resistance_touch_alone_is_not_an_entry_trigger() -> None:
+    candles, indicators = _descending_h4_market()
+    h4 = _four_hour_structure(candles, indicators, AppSettings())
+    adjusted = _apply_multi_timeframe_context(
+        {
+            "action": SignalAction.ENTRY_SHORT.value,
+            "score": 100,
+            "risk_state": "NORMAL",
+            "price": 95.1,
+            "reasons": (),
+            "vetoes": (),
+        },
+        {
+            "daily_bias": "NEUTRAL",
+            "h4_structure": h4,
+            "h1_trigger": {"direction": "NONE", "state": "WAIT"},
+            "entry_levels": {
+                "short": {
+                    "h4_descending_resistance": h4[
+                        "descending_trendline_zone"
+                    ],
+                }
+            },
+            "summary": "MTF: FIL-like descending resistance",
+        },
+    )
+
+    assert adjusted["action"] == SignalAction.ENTRY_SHORT.value
+    assert adjusted["entry_state"] == "POSITION_PENDING"
+    assert adjusted["entry_timing"] != "GOOD"
+    assert not _auto_signal_allowed(adjusted)
+
+
+def test_descending_four_hour_resistance_accepts_m15_short_rejection() -> None:
+    candles, indicators = _descending_h4_market()
+    h4 = _four_hour_structure(candles, indicators, AppSettings())
+    adjusted = _apply_multi_timeframe_context(
+        {
+            "action": SignalAction.ENTRY_SHORT.value,
+            "score": 100,
+            "risk_state": "NORMAL",
+            "price": 95.1,
+            "reasons": (),
+            "vetoes": (),
+        },
+        {
+            "daily_bias": "NEUTRAL",
+            "h4_structure": h4,
+            "h1_trigger": {"direction": "NONE", "state": "WAIT"},
+            "m15_precision": {
+                "trend": "DOWN",
+                "pullback": "M15_SHORT_PULLBACK",
+                "short_stop_anchor": 95.5,
+            },
+            "entry_levels": {
+                "short": {
+                    "h4_descending_resistance": h4[
+                        "descending_trendline_zone"
+                    ],
+                }
+            },
+            "summary": "MTF: FIL-like descending resistance",
+        },
+    )
+
+    assert adjusted["entry_state"] == "READY"
+    assert adjusted["entry_trigger"] == "15M_M15_SHORT_PULLBACK"
+    assert _auto_signal_allowed(adjusted)
+
+
+def test_unconfirmed_four_hour_trendline_break_waits_for_closed_retest() -> None:
+    adjusted = _apply_multi_timeframe_context(
+        {
+            "action": SignalAction.ENTRY_LONG.value,
+            "score": 100,
+            "risk_state": "NORMAL",
+            "reasons": (),
+            "vetoes": (),
+        },
+        {
+            "h4_structure": {
+                "state": "BOX_UPPER_HALF",
+                "direction": "NEUTRAL",
+                "location": "BREAKOUT",
+                "structure_type": "DESCENDING_BREAKOUT_PENDING",
+            },
+            "h1_trigger": {
+                "direction": "LONG",
+                "state": "BREAKOUT",
+            },
+            "summary": "MTF: breakout pending retest",
+        },
+    )
+
+    assert adjusted["action"] == SignalAction.WATCH.value
+    assert adjusted["direction_gate"] == "WAIT_BREAKOUT_RETEST"
+    assert (
+        "4h trendline break is pending a closed-candle retest"
+        in adjusted["vetoes"]
+    )
+
+
+def test_legacy_four_hour_breakdown_state_still_maps_to_short_direction() -> None:
+    adjusted = _apply_multi_timeframe_context(
+        {
+            "action": SignalAction.ENTRY_LONG.value,
+            "score": 100,
+            "risk_state": "NORMAL",
+            "reasons": (),
+            "vetoes": (),
+        },
+        {
+            "h4_structure": {"state": "BREAKDOWN_DOWN"},
+            "h1_trigger": {"direction": "NONE", "state": "WAIT"},
+            "summary": "MTF: legacy structure payload",
+        },
+    )
+
+    assert adjusted["h4_direction"] == "SHORT"
+    assert adjusted["direction_gate"] == "SHORT_ONLY"
+    assert adjusted["action"] == SignalAction.WATCH.value
 
 
 def test_high_score_without_core_entry_structure_is_capped_below_auto_entry() -> None:
@@ -5171,6 +5927,31 @@ def test_setup_structure_stop_prefers_setup_timeframe_over_entry_timeframe() -> 
 
     assert stop > 112.0
     assert basis == "4h_structure"
+
+
+def test_descending_four_hour_resistance_stop_sits_above_the_trendline_zone() -> None:
+    stop, basis = _refine_stop_with_setup_structure(
+        PositionSide.SHORT,
+        96.0,
+        95.1,
+        {
+            "setup_type": SETUP_H4_DESCENDING_RESISTANCE_SHORT,
+            "h4_structure": {
+                "descending_trendline_zone": {
+                    "low": 94.6,
+                    "high": 95.4,
+                    "price": 95.0,
+                }
+            },
+        },
+        {},
+        indicator_snapshot(close=95.1, atr=1.0),
+        timeframe="4h",
+    )
+
+    assert stop > 95.4
+    assert stop >= 95.1 * 1.012
+    assert basis == "4h_descending_resistance_structure"
 
 
 def test_setup_structure_stop_falls_back_when_structure_is_missing() -> None:
