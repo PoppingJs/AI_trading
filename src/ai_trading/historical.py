@@ -676,9 +676,27 @@ async def _download_derivatives(
     end_ms = _to_ms(end)
     oi: dict[datetime, float] = {}
     ratios: dict[datetime, float] = {}
+    taker: dict[datetime, tuple[float, float, float]] = {}
+    top_accounts: dict[datetime, float] = {}
+    top_positions: dict[datetime, float] = {}
     step_ms = _TIMEFRAME_SECONDS[timeframe] * 1000
     while cursor < end_ms:
-        oi_batch, ratio_batch = await asyncio.gather(
+        optional_calls = [
+            _optional_derivatives_history(
+                client,
+                method_name,
+                symbol,
+                timeframe,
+                cursor,
+                end_ms,
+            )
+            for method_name in (
+                "taker_buy_sell_volume",
+                "top_trader_account_ratio",
+                "top_trader_position_ratio",
+            )
+        ]
+        oi_batch, ratio_batch, taker_batch, top_account_batch, top_position_batch = await asyncio.gather(
             client.open_interest_history(
                 symbol,
                 timeframe,
@@ -693,11 +711,15 @@ async def _download_derivatives(
                 start_time_ms=cursor,
                 end_time_ms=end_ms,
             ),
+            *optional_calls,
         )
         if not oi_batch or not ratio_batch:
             break
         oi.update(oi_batch)
         ratios.update(ratio_batch)
+        taker.update(taker_batch)
+        top_accounts.update(top_account_batch)
+        top_positions.update(top_position_batch)
         latest = min(max(oi_batch), max(ratio_batch))
         next_cursor = _to_ms(latest) + step_ms
         if next_cursor <= cursor:
@@ -719,9 +741,52 @@ async def _download_derivatives(
                 open_interest=oi[timestamp],
                 long_short_ratio=ratios[timestamp],
                 funding_rate=funding_rate,
+                taker_buy_sell_ratio=(
+                    taker[timestamp][0]
+                    if timestamp in taker
+                    else None
+                ),
+                taker_buy_volume=(
+                    taker[timestamp][1]
+                    if timestamp in taker
+                    else None
+                ),
+                taker_sell_volume=(
+                    taker[timestamp][2]
+                    if timestamp in taker
+                    else None
+                ),
+                top_account_long_short_ratio=top_accounts.get(timestamp),
+                top_position_long_short_ratio=top_positions.get(timestamp),
             )
         )
     return snapshots
+
+
+async def _optional_derivatives_history(
+    client: BinanceFuturesMarketData,
+    method_name: str,
+    symbol: str,
+    timeframe: str,
+    start_time_ms: int,
+    end_time_ms: int,
+) -> dict:
+    """Load an optional derivatives series without breaking old/fake clients."""
+
+    method = getattr(client, method_name, None)
+    if not callable(method):
+        return {}
+    try:
+        result = await method(
+            symbol,
+            timeframe,
+            limit=500,
+            start_time_ms=start_time_ms,
+            end_time_ms=end_time_ms,
+        )
+    except Exception:
+        return {}
+    return result if isinstance(result, dict) else {}
 
 
 async def _download_funding(
@@ -1460,7 +1525,17 @@ def _symbol_payload(data: HistoricalSymbolData) -> dict[str, object]:
         },
         "derivatives": {
             timeframe: [
-                [row.timestamp.isoformat(), row.open_interest, row.long_short_ratio, row.funding_rate]
+                [
+                    row.timestamp.isoformat(),
+                    row.open_interest,
+                    row.long_short_ratio,
+                    row.funding_rate,
+                    row.taker_buy_sell_ratio,
+                    row.taker_buy_volume,
+                    row.taker_sell_volume,
+                    row.top_account_long_short_ratio,
+                    row.top_position_long_short_ratio,
+                ]
                 for row in rows
             ]
             for timeframe, rows in data.derivatives.items()
@@ -1511,6 +1586,31 @@ def _symbol_from_payload(raw: object) -> HistoricalSymbolData:
                 open_interest=float(row[1]) if row[1] is not None else None,
                 long_short_ratio=float(row[2]) if row[2] is not None else None,
                 funding_rate=float(row[3]) if row[3] is not None else None,
+                taker_buy_sell_ratio=(
+                    float(row[4])
+                    if len(row) > 4 and row[4] is not None
+                    else None
+                ),
+                taker_buy_volume=(
+                    float(row[5])
+                    if len(row) > 5 and row[5] is not None
+                    else None
+                ),
+                taker_sell_volume=(
+                    float(row[6])
+                    if len(row) > 6 and row[6] is not None
+                    else None
+                ),
+                top_account_long_short_ratio=(
+                    float(row[7])
+                    if len(row) > 7 and row[7] is not None
+                    else None
+                ),
+                top_position_long_short_ratio=(
+                    float(row[8])
+                    if len(row) > 8 and row[8] is not None
+                    else None
+                ),
             )
             for row in rows
         )

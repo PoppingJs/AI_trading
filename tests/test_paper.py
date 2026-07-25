@@ -9,7 +9,14 @@ import pytest
 
 from ai_trading.api import create_app
 from ai_trading.config import AppSettings
-from ai_trading.models import Candle, IndicatorSnapshot, Position, PositionSide, SignalAction
+from ai_trading.models import (
+    Candle,
+    DerivativesSnapshot,
+    IndicatorSnapshot,
+    Position,
+    PositionSide,
+    SignalAction,
+)
 from ai_trading.risk import TradePlan
 from ai_trading.paper import (
     AUTO_ENTRY_MIN_SCORE,
@@ -316,6 +323,62 @@ class FakeMarketData:
 
         symbols = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XAUUSDT"] + [f"TEST{idx}USDT" for idx in range(limit)]
         return [Symbol(symbol) for symbol in symbols]
+
+
+def test_single_symbol_incomplete_derivatives_is_local_and_recovers() -> None:
+    class PartialDerivativesMarket(FakeMarketData):
+        def __init__(self) -> None:
+            super().__init__()
+            self.fail_zec = True
+
+        async def derivatives_bundle(
+            self,
+            symbol,
+            interval,
+            candle_times,
+            *,
+            include_funding=True,
+        ):
+            timestamps = list(candle_times)
+            if symbol == "ZECUSDT" and self.fail_zec:
+                raise RuntimeError(
+                    "ZECUSDT derivatives data is incomplete"
+                )
+            return [
+                DerivativesSnapshot(
+                    timestamp=timestamp,
+                    open_interest=1_000_000.0,
+                    long_short_ratio=1.0,
+                    funding_rate=0.0 if include_funding else None,
+                )
+                for timestamp in timestamps
+            ]
+
+    market = PartialDerivativesMarket()
+    engine = PaperTradingEngine(
+        AppSettings(),
+        symbols=["ZECUSDT", "REUSDT"],
+        market_data=market,
+    )
+
+    asyncio.run(engine.refresh_once())
+
+    assert engine.last_error is None
+    assert set(engine.status()["symbol_data_warnings"]) == {"ZECUSDT"}
+    assert "REUSDT" not in engine._symbol_data_warnings
+    engine.running = True
+    zec_signal = engine.status()["latest_signals"]["ZECUSDT"]
+    assert zec_signal["data_warning"].startswith("衍生品数据不完整")
+    assert any(
+        str(reason).startswith("衍生品数据不完整")
+        for reason in zec_signal["vetoes"]
+    )
+
+    market.fail_zec = False
+    asyncio.run(engine.refresh_once())
+
+    assert engine.last_error is None
+    assert engine.status()["symbol_data_warnings"] == {}
 
 
 def indicator_snapshot(
@@ -1996,13 +2059,172 @@ def test_multi_timeframe_score_deduplicates_evidence_across_families() -> None:
 
     adjusted = _apply_multi_timeframe_context(signal, context)
 
-    assert adjusted["score"] == 76
+    assert adjusted["score"] == 79
     assert adjusted["score_evidence_families"] == {
         "DERIVATIVES": 15,
-        "DIRECTION": 6,
+        "DIRECTION": 9,
         "MA_POSITION": 20,
         "TRIGGER": 10,
     }
+    assert adjusted["legacy_score"] == 76
+    assert adjusted["score_delta_vs_legacy"] == 3
+
+
+def test_direction_score_uses_h4_as_primary_with_limited_daily_alignment() -> None:
+    adjusted = _apply_multi_timeframe_context(
+        {
+            "action": SignalAction.WATCH.value,
+            "candidate_action": SignalAction.ENTRY_LONG.value,
+            "score": 71,
+            "reasons": (),
+            "vetoes": (),
+            "risk_state": "NORMAL",
+            "trend_state": "TREND_LONG",
+        },
+        {
+            "daily_bias": "BULL",
+            "h4_structure": {
+                "state": "BOX_LOWER_HALF",
+                "direction": "LONG",
+                "structure_type": "ASCENDING_SUPPORT",
+            },
+            "h1_trigger": {"direction": "NONE", "state": "WAIT"},
+        },
+    )
+
+    assert adjusted["score"] == 80
+    assert adjusted["action"] == SignalAction.ENTRY_LONG.value
+    assert adjusted["score_evidence_families"]["DIRECTION"] == 9
+    assert adjusted["legacy_score"] == 77
+    assert adjusted["legacy_action"] == SignalAction.WATCH.value
+    assert adjusted["score_delta_vs_legacy"] == 3
+    assert adjusted["direction_score_breakdown"] == {
+        "candidate_direction": "LONG",
+        "daily_bias": "BULL",
+        "h4_direction": "LONG",
+        "h4_base_score": 6,
+        "daily_background_score": 0,
+        "multi_timeframe_alignment_bonus": 3,
+        "direction_positive_score": 9,
+        "direction_penalty": 0,
+        "direction_cap": 9,
+        "daily_aligned": True,
+        "h4_aligned": True,
+    }
+
+
+def test_direction_alignment_is_symmetric_for_short_entries() -> None:
+    adjusted = _apply_multi_timeframe_context(
+        {
+            "action": SignalAction.WATCH.value,
+            "candidate_action": SignalAction.ENTRY_SHORT.value,
+            "score": 71,
+            "reasons": (),
+            "vetoes": (),
+            "risk_state": "NORMAL",
+            "trend_state": "TREND_SHORT",
+        },
+        {
+            "daily_bias": "BEAR",
+            "h4_structure": {
+                "state": "BOX_UPPER_HALF",
+                "direction": "SHORT",
+                "structure_type": "RANGE",
+            },
+            "h1_trigger": {"direction": "NONE", "state": "WAIT"},
+        },
+    )
+
+    assert adjusted["score"] == 80
+    assert adjusted["action"] == SignalAction.ENTRY_SHORT.value
+    assert adjusted["score_evidence_families"]["DIRECTION"] == 9
+    assert adjusted["legacy_score"] == 77
+    assert adjusted["legacy_action"] == SignalAction.WATCH.value
+    assert adjusted["score_delta_vs_legacy"] == 3
+
+
+def test_direction_family_replaces_stale_oversized_cached_score() -> None:
+    adjusted = _apply_multi_timeframe_context(
+        {
+            "action": SignalAction.WATCH.value,
+            "candidate_action": SignalAction.ENTRY_LONG.value,
+            "score": 90,
+            "score_evidence_families": {"DIRECTION": 20},
+            "reasons": (),
+            "vetoes": (),
+            "risk_state": "NORMAL",
+            "trend_state": "TREND_LONG",
+        },
+        {
+            "daily_bias": "BULL",
+            "h4_structure": {
+                "state": "ASCENDING_SUPPORT",
+                "direction": "LONG",
+                "structure_type": "TREND",
+            },
+            "h1_trigger": {"direction": "LONG", "state": "WAIT"},
+        },
+    )
+
+    assert adjusted["score"] == 79
+    assert adjusted["score_evidence_families"]["DIRECTION"] == 9
+    assert adjusted["direction_score_breakdown"]["direction_cap"] == 9
+
+
+def test_daily_direction_alone_is_background_not_a_full_h4_score() -> None:
+    adjusted = _apply_multi_timeframe_context(
+        {
+            "action": SignalAction.WATCH.value,
+            "candidate_action": SignalAction.ENTRY_LONG.value,
+            "score": 70,
+            "reasons": (),
+            "vetoes": (),
+            "risk_state": "NORMAL",
+            "trend_state": "TREND_LONG",
+        },
+        {
+            "daily_bias": "BULL",
+            "h4_structure": {
+                "state": "BOX_LOWER_HALF",
+                "direction": "NEUTRAL",
+                "structure_type": "RANGE",
+            },
+            "h1_trigger": {"direction": "NONE", "state": "WAIT"},
+        },
+    )
+
+    assert adjusted["score"] == 73
+    assert adjusted["score_evidence_families"]["DIRECTION"] == 3
+    assert adjusted["direction_score_breakdown"]["h4_base_score"] == 0
+    assert adjusted["direction_score_breakdown"]["daily_background_score"] == 3
+    assert adjusted["direction_score_breakdown"]["multi_timeframe_alignment_bonus"] == 0
+
+
+def test_unconfirmed_h1_direction_does_not_add_trigger_score() -> None:
+    adjusted = _apply_multi_timeframe_context(
+        {
+            "action": SignalAction.WATCH.value,
+            "candidate_action": SignalAction.ENTRY_LONG.value,
+            "score": 70,
+            "reasons": (),
+            "vetoes": (),
+            "risk_state": "NORMAL",
+            "trend_state": "TREND_LONG",
+        },
+        {
+            "daily_bias": "NEUTRAL",
+            "h4_structure": {
+                "state": "BOX_LOWER_HALF",
+                "direction": "LONG",
+                "structure_type": "ASCENDING_SUPPORT",
+            },
+            "h1_trigger": {"direction": "LONG", "state": "WAIT"},
+        },
+    )
+
+    assert adjusted["score"] == 76
+    assert "TRIGGER" not in adjusted["score_evidence_families"]
+    assert adjusted["entry_trigger"] == ""
 
 
 def test_ma_cluster_uses_strongest_location_evidence_only() -> None:
@@ -2301,6 +2523,130 @@ def test_version_two_entry_pipeline_requires_an_explicit_trigger() -> None:
     assert signal["entry_timing"] == "GOOD"
     assert signal["entry_state"] == "TRIGGER_PENDING"
     assert "entry trigger is not confirmed" in _auto_entry_prerequisite_blocks(signal)
+
+
+def test_watch_signal_below_entry_threshold_is_score_pending_not_direction_pending() -> None:
+    signal = {
+        "entry_pipeline_version": 2,
+        "action": SignalAction.WATCH.value,
+        "candidate_action": SignalAction.ENTRY_LONG.value,
+        "score": 76,
+        "h4_direction": "LONG",
+        "h1_trigger": {
+            "direction": "LONG",
+            "state": "RETEST",
+        },
+        "vetoes": (),
+    }
+
+    _update_entry_position_fields(signal)
+
+    assert signal["entry_state"] == "SCORE_PENDING"
+    assert signal["entry_trigger"] == "1H_RETEST"
+    assert signal["entry_timing_reason"] == (
+        "entry position blocked: final score 76 below "
+        "auto-entry minimum 80"
+    )
+    assert _auto_entry_prerequisite_blocks(signal) == (
+        "final score 76 below auto-entry minimum 80",
+    )
+
+
+def test_watch_signal_with_hard_veto_is_not_reported_as_missing_direction() -> None:
+    signal = {
+        "entry_pipeline_version": 2,
+        "action": SignalAction.WATCH.value,
+        "candidate_action": SignalAction.ENTRY_LONG.value,
+        "score": 90,
+        "h4_direction": "SHORT",
+        "vetoes": ("4h direction is short",),
+    }
+
+    _update_entry_position_fields(signal)
+
+    assert signal["entry_state"] == "VETOED"
+    assert "entry has an active veto" in _auto_entry_prerequisite_blocks(signal)
+
+
+def test_watch_signal_with_h4_direction_reports_position_pending() -> None:
+    signal = {
+        "entry_pipeline_version": 2,
+        "action": SignalAction.WATCH.value,
+        "candidate_action": SignalAction.ENTRY_LONG.value,
+        "score": 90,
+        "h4_direction": "LONG",
+        "price": 105.0,
+        "entry_levels": {
+            "long": {
+                "h1_support": {
+                    "low": 99.0,
+                    "high": 101.0,
+                    "price": 100.0,
+                },
+            },
+        },
+        "vetoes": (),
+    }
+
+    _update_entry_position_fields(signal)
+
+    assert signal["entry_state"] == "POSITION_PENDING"
+    assert signal["entry_timing"] == "WAIT"
+    assert "direction" not in signal["entry_timing_reason"]
+    assert _auto_entry_prerequisite_blocks(signal) == (
+        "current price has not reached the selected primary setup",
+    )
+
+
+def test_watch_signal_with_h4_direction_reports_trigger_pending() -> None:
+    signal = {
+        "entry_pipeline_version": 2,
+        "action": SignalAction.WATCH.value,
+        "candidate_action": SignalAction.ENTRY_LONG.value,
+        "score": 90,
+        "h4_direction": "LONG",
+        "price": 100.0,
+        "entry_levels": {
+            "long": {
+                "h1_support": {
+                    "low": 99.0,
+                    "high": 101.0,
+                    "price": 100.0,
+                },
+            },
+        },
+        "h1_trigger": {
+            "direction": "LONG",
+            "state": "WAIT",
+        },
+        "vetoes": (),
+    }
+
+    _update_entry_position_fields(signal)
+
+    assert signal["entry_state"] == "TRIGGER_PENDING"
+    assert signal["entry_timing"] == "GOOD"
+    assert _auto_entry_prerequisite_blocks(signal) == (
+        "entry trigger is not confirmed",
+    )
+
+
+def test_legacy_watch_signal_without_candidate_direction_remains_compatible() -> None:
+    signal = {
+        "entry_pipeline_version": 2,
+        "action": SignalAction.WATCH.value,
+        "score": 90,
+        "vetoes": (),
+    }
+
+    _update_entry_position_fields(signal)
+
+    assert signal["entry_state"] == "DIRECTION_PENDING"
+    assert _auto_entry_prerequisite_blocks(signal) == (
+        "directional entry signal not established",
+        "higher-timeframe direction is not established",
+    )
+
 
 def test_entry_quality_uses_only_a_and_s_score_bands() -> None:
     assert _entry_quality_grade(
@@ -2883,7 +3229,7 @@ def test_ema55_oi_valley_supports_long_only_after_h4_direction_is_long() -> None
     assert set(adjusted["entry_levels"]["long"]) == {
         "h4_ema55_reclaim"
     }
-    assert adjusted["score_evidence_families"]["DERIVATIVES"] == 12
+    assert adjusted["score_evidence_families"]["DERIVATIVES"] == 6
 
 
 @pytest.mark.parametrize(
@@ -5135,7 +5481,7 @@ def test_multi_timeframe_healthy_pullback_adds_score() -> None:
     adjusted = _apply_multi_timeframe_context(signal, context)
     _update_entry_position_fields(adjusted)
 
-    assert adjusted["score"] == 97
+    assert adjusted["score"] == 95
     assert "4h structure supports upside" not in adjusted["reasons"]
     assert adjusted["h4_direction"] == "NEUTRAL"
     assert adjusted["direction_gate"] == "NEUTRAL"

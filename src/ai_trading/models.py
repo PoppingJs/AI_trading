@@ -58,6 +58,11 @@ class DerivativesSnapshot:
     open_interest: float | None = None
     long_short_ratio: float | None = None
     funding_rate: float | None = None
+    taker_buy_sell_ratio: float | None = None
+    taker_buy_volume: float | None = None
+    taker_sell_volume: float | None = None
+    top_account_long_short_ratio: float | None = None
+    top_position_long_short_ratio: float | None = None
 
 
 @dataclass(frozen=True)
@@ -86,6 +91,11 @@ class IndicatorSnapshot:
     oi_change: float | None = None
     long_short_ratio: float | None = None
     funding_rate: float | None = None
+    taker_buy_sell_ratio: float | None = None
+    taker_buy_volume: float | None = None
+    taker_sell_volume: float | None = None
+    top_account_long_short_ratio: float | None = None
+    top_position_long_short_ratio: float | None = None
 
 
 @dataclass(frozen=True)
@@ -101,6 +111,9 @@ class StrategySignal:
     indicators: IndicatorSnapshot | None = None
     setup_type: str = ""
     score_evidence_families: tuple[tuple[str, int], ...] = ()
+    participant_flow_state: str = "NEUTRAL"
+    participant_flow_score: int = 0
+    participant_flow_reason: str = ""
 
 
 @dataclass

@@ -93,6 +93,41 @@ def test_realtime_dashboard_reserves_height_for_pnl_time_axis(tmp_path: Path) ->
     assert "MAX_DRAWDOWN: '最大回撤锁定'" in page
 
 
+def test_trade_exit_reasons_are_rendered_with_chinese_only_fallbacks(tmp_path: Path) -> None:
+    with TestClient(create_app(state_path=tmp_path / "paper_state.json")) as client:
+        realtime = client.get("/").text
+        backtest = client.get("/backtest").text
+
+    assert "wrapReason(exitReasonText(f.reason), 50)" in realtime
+    assert "wrapReason(tReason(f.reason), 50)" not in realtime
+    for english, chinese in (
+        (
+            "direction unvalidated and higher-timeframe structure failed",
+            "方向尚未验证且高周期结构失效",
+        ),
+        (
+            "structure close confirmed beyond the primary setup",
+            "实体收盘确认突破主交易结构",
+        ),
+        ("target 1 reached", "第一止盈目标达成"),
+        (
+            "4h body closed below support or EMA/BOLL zone",
+            "4小时实体跌破支撑或EMA/BOLL区域",
+        ),
+        (
+            "4h body closed above resistance or EMA/BOLL zone",
+            "4小时实体突破压力或EMA/BOLL区域",
+        ),
+    ):
+        assert english in realtime
+        assert chinese in realtime
+        assert english.lower() in backtest.lower()
+        assert chinese in backtest
+    assert "return '止损：交易条件失效';" in realtime
+    assert "return '止盈：达到目标或保护条件';" in realtime
+    assert "return '策略退出：触发既定离场条件';" in realtime
+
+
 def test_historical_job_replays_current_engine_and_reuses_latest_market_cache(
     monkeypatch,
     tmp_path: Path,

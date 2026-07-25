@@ -26,7 +26,7 @@ def load_candles_csv(path: str | Path) -> list[Candle]:
 
 
 def load_derivatives_csv(path: str | Path) -> list[DerivativesSnapshot]:
-    """Load derivative data from CSV columns: timestamp,open_interest,long_short_ratio,funding_rate."""
+    """Load derivative data; participant-flow columns remain optional."""
     rows: list[DerivativesSnapshot] = []
     with Path(path).open("r", encoding="utf-8", newline="") as handle:
         for row in csv.DictReader(handle):
@@ -36,6 +36,21 @@ def load_derivatives_csv(path: str | Path) -> list[DerivativesSnapshot]:
                     open_interest=_optional_float(row.get("open_interest")),
                     long_short_ratio=_optional_float(row.get("long_short_ratio")),
                     funding_rate=_optional_float(row.get("funding_rate")),
+                    taker_buy_sell_ratio=_optional_float(
+                        row.get("taker_buy_sell_ratio")
+                    ),
+                    taker_buy_volume=_optional_float(
+                        row.get("taker_buy_volume")
+                    ),
+                    taker_sell_volume=_optional_float(
+                        row.get("taker_sell_volume")
+                    ),
+                    top_account_long_short_ratio=_optional_float(
+                        row.get("top_account_long_short_ratio")
+                    ),
+                    top_position_long_short_ratio=_optional_float(
+                        row.get("top_position_long_short_ratio")
+                    ),
                 )
             )
     return rows

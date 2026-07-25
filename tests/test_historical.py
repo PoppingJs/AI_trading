@@ -12,10 +12,66 @@ from ai_trading.historical import (
     _inclusive_end_date,
     _progress_snapshot,
     _result_payload,
+    _symbol_from_payload,
+    _symbol_payload,
     analyze_replay_failures,
 )
-from ai_trading.models import Candle, PositionSide
+from ai_trading.models import Candle, DerivativesSnapshot, PositionSide
 from ai_trading.paper import PaperFill
+
+
+def test_historical_cache_round_trips_optional_participant_fields() -> None:
+    timestamp = datetime(2026, 7, 10, 1, tzinfo=UTC)
+    data = HistoricalSymbolData(
+        candles={},
+        derivatives={
+            "1h": (
+                DerivativesSnapshot(
+                    timestamp=timestamp,
+                    open_interest=10_000.0,
+                    long_short_ratio=1.1,
+                    funding_rate=0.0001,
+                    taker_buy_sell_ratio=1.08,
+                    taker_buy_volume=108.0,
+                    taker_sell_volume=100.0,
+                    top_account_long_short_ratio=1.03,
+                    top_position_long_short_ratio=1.12,
+                ),
+            )
+        },
+    )
+
+    restored = _symbol_from_payload(_symbol_payload(data))
+    row = restored.derivatives["1h"][0]
+
+    assert row.taker_buy_sell_ratio == 1.08
+    assert row.taker_buy_volume == 108.0
+    assert row.taker_sell_volume == 100.0
+    assert row.top_account_long_short_ratio == 1.03
+    assert row.top_position_long_short_ratio == 1.12
+
+
+def test_historical_cache_still_reads_legacy_four_column_derivatives() -> None:
+    restored = _symbol_from_payload(
+        {
+            "candles": {},
+            "derivatives": {
+                "1h": [
+                    [
+                        "2026-07-10T01:00:00+00:00",
+                        10_000.0,
+                        1.1,
+                        0.0001,
+                    ]
+                ]
+            },
+        }
+    )
+    row = restored.derivatives["1h"][0]
+
+    assert row.open_interest == 10_000.0
+    assert row.taker_buy_sell_ratio is None
+    assert row.top_position_long_short_ratio is None
 
 
 def test_failure_analysis_identifies_wick_stop_recovery() -> None:

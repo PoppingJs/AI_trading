@@ -47,9 +47,11 @@ class BinanceFuturesMarketData:
         base_url: str = FAPI_BASE_URL,
         timeout: float = 10.0,
         request_concurrency: int = 4,
+        api_key: str | None = None,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
+        self.api_key = api_key or os.getenv("BINANCE_API_KEY")
         self._client: httpx.AsyncClient | None = None
         self._request_semaphore = asyncio.Semaphore(max(int(request_concurrency), 1))
 
@@ -68,10 +70,16 @@ class BinanceFuturesMarketData:
         path: str,
         *,
         params: dict[str, object] | None = None,
+        headers: dict[str, str] | None = None,
     ) -> Any:
         client = await self._get_client()
         async with self._request_semaphore:
-            return await _get_json_with_retry(client, path, params=params)
+            return await _get_json_with_retry(
+                client,
+                path,
+                params=params,
+                headers=headers,
+            )
 
     async def top_usdt_perpetuals(self, limit: int = 20) -> list[FuturesSymbol]:
         exchange_info, tickers = await asyncio.gather(
@@ -184,6 +192,97 @@ class BinanceFuturesMarketData:
         )
         return {_from_ms(row["timestamp"]): float(row["longShortRatio"]) for row in rows}
 
+    async def taker_buy_sell_volume(
+        self,
+        symbol: str,
+        period: str = "15m",
+        *,
+        limit: int = 500,
+        start_time_ms: int | None = None,
+        end_time_ms: int | None = None,
+    ) -> dict[datetime, tuple[float, float, float]]:
+        params: dict[str, object] = {
+            "symbol": symbol.upper(),
+            "period": period,
+            "limit": limit,
+        }
+        if start_time_ms is not None:
+            params["startTime"] = start_time_ms
+        if end_time_ms is not None:
+            params["endTime"] = end_time_ms
+        rows = await self._get_json(
+            "/futures/data/takerlongshortRatio",
+            params=params,
+        )
+        return {
+            _from_ms(row["timestamp"]): (
+                float(row["buySellRatio"]),
+                float(row["buyVol"]),
+                float(row["sellVol"]),
+            )
+            for row in rows
+        }
+
+    async def top_trader_account_ratio(
+        self,
+        symbol: str,
+        period: str = "15m",
+        *,
+        limit: int = 500,
+        start_time_ms: int | None = None,
+        end_time_ms: int | None = None,
+    ) -> dict[datetime, float]:
+        if not self.api_key:
+            return {}
+        params: dict[str, object] = {
+            "symbol": symbol.upper(),
+            "period": period,
+            "limit": limit,
+        }
+        if start_time_ms is not None:
+            params["startTime"] = start_time_ms
+        if end_time_ms is not None:
+            params["endTime"] = end_time_ms
+        rows = await self._get_json(
+            "/futures/data/topLongShortAccountRatio",
+            params=params,
+            headers={"X-MBX-APIKEY": self.api_key},
+        )
+        return {
+            _from_ms(row["timestamp"]): float(row["longShortRatio"])
+            for row in rows
+        }
+
+    async def top_trader_position_ratio(
+        self,
+        symbol: str,
+        period: str = "15m",
+        *,
+        limit: int = 500,
+        start_time_ms: int | None = None,
+        end_time_ms: int | None = None,
+    ) -> dict[datetime, float]:
+        if not self.api_key:
+            return {}
+        params: dict[str, object] = {
+            "symbol": symbol.upper(),
+            "period": period,
+            "limit": limit,
+        }
+        if start_time_ms is not None:
+            params["startTime"] = start_time_ms
+        if end_time_ms is not None:
+            params["endTime"] = end_time_ms
+        rows = await self._get_json(
+            "/futures/data/topLongShortPositionRatio",
+            params=params,
+            headers={"X-MBX-APIKEY": self.api_key},
+        )
+        return {
+            _from_ms(row["timestamp"]): float(row["longShortRatio"])
+            for row in rows
+        }
+
     async def funding_rates(
         self,
         symbol: str,
@@ -259,10 +358,32 @@ class BinanceFuturesMarketData:
             if include_funding
             else _empty_mapping()
         )
-        oi_result, ratio_result, funding_result = await asyncio.gather(
+        (
+            oi_result,
+            ratio_result,
+            funding_result,
+            taker_result,
+            top_account_result,
+            top_position_result,
+        ) = await asyncio.gather(
             self.open_interest_history(symbol, interval, limit=limit),
             self.global_long_short_ratio(symbol, interval, limit=limit),
             funding_call,
+            self.taker_buy_sell_volume(
+                symbol,
+                interval,
+                limit=limit,
+            ),
+            self.top_trader_account_ratio(
+                symbol,
+                interval,
+                limit=limit,
+            ),
+            self.top_trader_position_ratio(
+                symbol,
+                interval,
+                limit=limit,
+            ),
             return_exceptions=True,
         )
         if (
@@ -273,6 +394,21 @@ class BinanceFuturesMarketData:
             raise BinanceMarketDataError(f"{symbol.upper()} derivatives data is incomplete")
         oi_by_time = oi_result if isinstance(oi_result, dict) else {}
         ratio_by_time = ratio_result if isinstance(ratio_result, dict) else {}
+        taker_by_time = (
+            taker_result
+            if isinstance(taker_result, dict)
+            else {}
+        )
+        top_account_by_time = (
+            top_account_result
+            if isinstance(top_account_result, dict)
+            else {}
+        )
+        top_position_by_time = (
+            top_position_result
+            if isinstance(top_position_result, dict)
+            else {}
+        )
         current_funding = (
             funding_result.get(symbol.upper())
             if isinstance(funding_result, dict)
@@ -284,6 +420,27 @@ class BinanceFuturesMarketData:
                 open_interest=oi_by_time.get(timestamp),
                 long_short_ratio=ratio_by_time.get(timestamp),
                 funding_rate=current_funding,
+                taker_buy_sell_ratio=(
+                    taker_by_time[timestamp][0]
+                    if timestamp in taker_by_time
+                    else None
+                ),
+                taker_buy_volume=(
+                    taker_by_time[timestamp][1]
+                    if timestamp in taker_by_time
+                    else None
+                ),
+                taker_sell_volume=(
+                    taker_by_time[timestamp][2]
+                    if timestamp in taker_by_time
+                    else None
+                ),
+                top_account_long_short_ratio=(
+                    top_account_by_time.get(timestamp)
+                ),
+                top_position_long_short_ratio=(
+                    top_position_by_time.get(timestamp)
+                ),
             )
             for timestamp in timestamps
         ]
@@ -331,10 +488,32 @@ class BinanceFuturesMarketData:
                     yield prices
     async def historical_bundle(self, symbol: str, interval: str = "15m", *, limit: int = 500) -> tuple[list[Candle], list[DerivativesSnapshot]]:
         candles = await self.klines(symbol, interval, limit=limit)
-        oi_result, ratio_result, funding_result = await asyncio.gather(
+        (
+            oi_result,
+            ratio_result,
+            funding_result,
+            taker_result,
+            top_account_result,
+            top_position_result,
+        ) = await asyncio.gather(
             self.open_interest_history(symbol, interval, limit=min(limit, 500)),
             self.global_long_short_ratio(symbol, interval, limit=min(limit, 500)),
             self.current_funding_rates([symbol]),
+            self.taker_buy_sell_volume(
+                symbol,
+                interval,
+                limit=min(limit, 500),
+            ),
+            self.top_trader_account_ratio(
+                symbol,
+                interval,
+                limit=min(limit, 500),
+            ),
+            self.top_trader_position_ratio(
+                symbol,
+                interval,
+                limit=min(limit, 500),
+            ),
             return_exceptions=True,
         )
         if (
@@ -345,6 +524,21 @@ class BinanceFuturesMarketData:
             raise BinanceMarketDataError(f"{symbol.upper()} historical bundle is incomplete")
         oi_by_time = oi_result
         ratio_by_time = ratio_result
+        taker_by_time = (
+            taker_result
+            if isinstance(taker_result, dict)
+            else {}
+        )
+        top_account_by_time = (
+            top_account_result
+            if isinstance(top_account_result, dict)
+            else {}
+        )
+        top_position_by_time = (
+            top_position_result
+            if isinstance(top_position_result, dict)
+            else {}
+        )
         current_funding = funding_result.get(symbol.upper())
 
         derivatives: list[DerivativesSnapshot] = []
@@ -355,6 +549,27 @@ class BinanceFuturesMarketData:
                     open_interest=oi_by_time.get(candle.timestamp),
                     long_short_ratio=ratio_by_time.get(candle.timestamp),
                     funding_rate=current_funding,
+                    taker_buy_sell_ratio=(
+                        taker_by_time[candle.timestamp][0]
+                        if candle.timestamp in taker_by_time
+                        else None
+                    ),
+                    taker_buy_volume=(
+                        taker_by_time[candle.timestamp][1]
+                        if candle.timestamp in taker_by_time
+                        else None
+                    ),
+                    taker_sell_volume=(
+                        taker_by_time[candle.timestamp][2]
+                        if candle.timestamp in taker_by_time
+                        else None
+                    ),
+                    top_account_long_short_ratio=(
+                        top_account_by_time.get(candle.timestamp)
+                    ),
+                    top_position_long_short_ratio=(
+                        top_position_by_time.get(candle.timestamp)
+                    ),
                 )
             )
         return candles, derivatives
@@ -377,12 +592,17 @@ async def _get_json_with_retry(
     path: str,
     *,
     params: dict[str, object] | None = None,
+    headers: dict[str, str] | None = None,
     attempts: int = 3,
 ) -> Any:
     last_exc: Exception | None = None
     for attempt in range(attempts):
         try:
-            response = await client.get(path, params=params)
+            response = await client.get(
+                path,
+                params=params,
+                headers=headers,
+            )
             response.raise_for_status()
             return response.json()
         except httpx.HTTPStatusError as exc:

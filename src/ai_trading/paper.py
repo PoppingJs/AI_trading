@@ -101,6 +101,13 @@ DISTRIBUTION_STAGE_MARKDOWN = "MARKDOWN_ACCELERATION"
 AUTO_ENTRY_MIN_SCORE = ENTRY_QUALITY_A_MIN_SCORE
 CORE_STRUCTURE_SCORE_CAP = AUTO_ENTRY_MIN_SCORE - 1
 MIN_ENTRY_REWARD_R = 1.2
+SCORE_MODEL_VERSION = 4
+LEGACY_SCORE_MODEL_VERSION = 2
+DIRECTION_H4_BASE_SCORE = 6
+DIRECTION_DAILY_BACKGROUND_SCORE = 3
+DIRECTION_ALIGNMENT_BONUS = 3
+DIRECTION_SCORE_CAP = 9
+DIRECTION_DAILY_LEGACY_SCORE = 5
 FIRST_TAKE_PROFIT_R = 0.8
 DIRECTION_VALIDATION_R = 0.35
 LARGE_TIMEFRAME_WICK_REJECTION_PCT = 0.02
@@ -340,6 +347,7 @@ class PaperTradingEngine:
         self._funding_updated_at: dict[str, datetime] = {}
         self._derivatives_source_at: dict[str, datetime] = {}
         self._current_funding_rates: dict[str, float] = {}
+        self._symbol_data_warnings: dict[str, str] = {}
         self._last_ws_update_at: datetime | None = None
         self._last_price_stream_error: str | None = None
         self._last_rest_price_refresh_at: datetime | None = None
@@ -358,6 +366,24 @@ class PaperTradingEngine:
     def _now(self) -> datetime:
         current = self._clock()
         return current if current.tzinfo is not None else current.replace(tzinfo=UTC)
+
+    def _record_derivatives_incomplete_warning(
+        self,
+        symbol: str,
+        error: BaseException | str,
+    ) -> None:
+        symbol = symbol.upper()
+        self._symbol_data_warnings[symbol] = (
+            "衍生品数据不完整，已保留上次有效值并仅暂停该币种新开仓；"
+            "其他币种继续运行"
+        )
+        self._oi_ratio_updated_at.pop(symbol, None)
+        self._derivatives_updated_at.pop(symbol, None)
+        if self.last_error and _is_derivatives_incomplete_error(self.last_error):
+            self.last_error = None
+
+    def _clear_symbol_data_warning(self, symbol: str) -> None:
+        self._symbol_data_warnings.pop(symbol.upper(), None)
 
     def _execution_price(
         self,
@@ -451,6 +477,7 @@ class PaperTradingEngine:
             self._funding_updated_at.clear()
             self._derivatives_source_at.clear()
             self._current_funding_rates.clear()
+            self._symbol_data_warnings.clear()
             self._universe_symbols.clear()
             self._candidate_symbols.clear()
             self._post_close_pool_review.clear()
@@ -806,6 +833,7 @@ class PaperTradingEngine:
             self._funding_updated_at,
             self._derivatives_source_at,
             self._current_funding_rates,
+            self._symbol_data_warnings,
             self.account.latest_signals,
         )
         for mapping in mappings:
@@ -1107,6 +1135,9 @@ class PaperTradingEngine:
                 and not self._price_fallback_task.done()
             ),
             "price_stream_error": self._last_price_stream_error,
+            "symbol_data_warnings": dict(
+                sorted(self._symbol_data_warnings.items())
+            ),
             "stale_position_symbols": stale_positions,
             "position_management_at": (
                 self._last_position_management_at.isoformat()
@@ -1241,6 +1272,9 @@ class PaperTradingEngine:
             if self.running and not has_position:
                 for reason in self._data_freshness_blocks(symbol, payload):
                     _record_auto_entry_block(payload, reason)
+            data_warning = self._symbol_data_warnings.get(symbol)
+            if data_warning:
+                payload["data_warning"] = data_warning
             payload["pool"] = (
                 "POSITION"
                 if has_position
@@ -1339,6 +1373,9 @@ class PaperTradingEngine:
             "latest_prices": latest_prices,
             "latest_signals": latest_signals,
             "latest_timeframe_contexts": latest_timeframe_contexts,
+            "symbol_data_warnings": dict(
+                sorted(self._symbol_data_warnings.items())
+            ),
             "positions": positions,
             "fills": [_fill_payload(fill) for fill in fills_snapshot],
             "daily_pnl": _daily_pnl_payload(self.account.daily_pnl_baselines, total_pnl, now=now),
@@ -1836,12 +1873,21 @@ class PaperTradingEngine:
                         candles = self._timeframe_candles.get(symbol, {}).get(timeframe, [])
                         if not candles:
                             continue
-                        snapshots = await refresh(
-                            symbol,
-                            timeframe,
-                            (candle.timestamp for candle in candles),
-                            include_funding=False,
-                        )
+                        try:
+                            snapshots = await refresh(
+                                symbol,
+                                timeframe,
+                                (candle.timestamp for candle in candles),
+                                include_funding=False,
+                            )
+                        except Exception as exc:
+                            if not _is_derivatives_incomplete_error(exc):
+                                raise
+                            self._record_derivatives_incomplete_warning(
+                                symbol,
+                                exc,
+                            )
+                            return False
                         existing = self._timeframe_derivatives.setdefault(symbol, {}).get(timeframe, [])
                         merged = _merge_derivatives(
                             existing,
@@ -1870,6 +1916,16 @@ class PaperTradingEngine:
                             )
                         if symbol in funding_rates:
                             self._funding_updated_at[symbol] = now
+                        if all(
+                            _derivatives_complete(
+                                self._timeframe_derivatives.get(
+                                    symbol,
+                                    {},
+                                ).get(timeframe, [])
+                            )
+                            for timeframe in {self.interval, "1h", "4h"}
+                        ):
+                            self._clear_symbol_data_warning(symbol)
                         self._publish_symbol_from_cache(symbol)
                     return changed
 
@@ -2086,7 +2142,14 @@ class PaperTradingEngine:
     async def _refresh_symbol(self, symbol: str) -> bool:
         history_limit = max(240, self.settings.strategy.ma_trend + 40)
         timeframe_candles: dict[str, list[Candle]] = {}
-        timeframe_derivatives: dict[str, list[DerivativesSnapshot]] = {}
+        timeframe_derivatives: dict[str, list[DerivativesSnapshot]] = {
+            timeframe: list(snapshots)
+            for timeframe, snapshots in self._timeframe_derivatives.get(
+                symbol,
+                {},
+            ).items()
+        }
+        derivatives_refresh_incomplete = False
         for timeframe in SUPPORTED_TIMEFRAMES:
             candles = await self.market_data.klines(
                 symbol,
@@ -2102,12 +2165,22 @@ class PaperTradingEngine:
                 closed = timeframe_candles.get(timeframe, [])
                 if not closed:
                     continue
-                snapshots = await refresh_derivatives(
-                    symbol,
-                    timeframe,
-                    (candle.timestamp for candle in closed),
-                    include_funding=False,
-                )
+                try:
+                    snapshots = await refresh_derivatives(
+                        symbol,
+                        timeframe,
+                        (candle.timestamp for candle in closed),
+                        include_funding=False,
+                    )
+                except Exception as exc:
+                    if not _is_derivatives_incomplete_error(exc):
+                        raise
+                    derivatives_refresh_incomplete = True
+                    self._record_derivatives_incomplete_warning(
+                        symbol,
+                        exc,
+                    )
+                    break
                 existing = self._timeframe_derivatives.get(symbol, {}).get(
                     timeframe,
                     [],
@@ -2129,7 +2202,7 @@ class PaperTradingEngine:
         self._timeframe_candles[symbol] = timeframe_candles
         self._timeframe_derivatives[symbol] = timeframe_derivatives
         now = self._now()
-        if all(
+        if not derivatives_refresh_incomplete and all(
             _derivatives_complete(timeframe_derivatives.get(timeframe, []))
             for timeframe in {self.interval, "1h", "4h"}
         ):
@@ -2144,6 +2217,7 @@ class PaperTradingEngine:
             ]
             if source_timestamps:
                 self._derivatives_source_at[symbol] = max(source_timestamps)
+            self._clear_symbol_data_warning(symbol)
         if symbol not in self.latest_prices:
             self._remember_mark_price(
                 symbol,
@@ -2219,6 +2293,21 @@ class PaperTradingEngine:
             "oi_change": current.oi_change if current else None,
             "long_short_ratio": current.long_short_ratio if current else None,
             "funding_rate": current.funding_rate if current else None,
+            "taker_buy_sell_ratio": (
+                current.taker_buy_sell_ratio
+                if current
+                else None
+            ),
+            "top_account_long_short_ratio": (
+                current.top_account_long_short_ratio
+                if current
+                else None
+            ),
+            "top_position_long_short_ratio": (
+                current.top_position_long_short_ratio
+                if current
+                else None
+            ),
             "price": live_price,
             "score": signal.score,
             "reasons": signal.reasons,
@@ -2226,6 +2315,9 @@ class PaperTradingEngine:
             "smart_money_phase": cycle.phase,
             "setup_type": signal.setup_type,
             "score_evidence_families": dict(signal.score_evidence_families),
+            "participant_flow_state": signal.participant_flow_state,
+            "participant_flow_score": signal.participant_flow_score,
+            "participant_flow_reason": signal.participant_flow_reason,
         }
         self.latest_signals[symbol] = _apply_multi_timeframe_context(payload, mtf_context)
         self.account.latest_signals[symbol] = dict(self.latest_signals[symbol])
@@ -2831,6 +2923,9 @@ class PaperTradingEngine:
     ) -> tuple[str, ...]:
         now = self._now()
         blocks: list[str] = []
+        data_warning = self._symbol_data_warnings.get(symbol)
+        if data_warning:
+            blocks.append(data_warning)
         price_updated_at = self._price_updated_at.get(symbol)
         if (
             price_updated_at is None
@@ -3817,12 +3912,23 @@ def _entry_context_from_signal(signal: dict[str, object]) -> dict[str, object]:
         "oi_change",
         "long_short_ratio",
         "funding_rate",
+        "taker_buy_sell_ratio",
+        "top_account_long_short_ratio",
+        "top_position_long_short_ratio",
+        "participant_flow_state",
+        "participant_flow_score",
+        "participant_flow_reason",
         "daily_bias",
         "h4_direction",
         "h4_location",
         "h4_structure_type",
         "direction_gate",
         "direction_veto_reason",
+        "direction_score_breakdown",
+        "score_model_version",
+        "legacy_score",
+        "legacy_action",
+        "score_delta_vs_legacy",
         "oi_valley_long_eligible",
         "oi_valley_direction_gate_reason",
         "h4_structure",
@@ -4204,6 +4310,10 @@ def _parse_datetime(value: str | datetime) -> datetime:
     else:
         parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+
+
+def _is_derivatives_incomplete_error(error: BaseException | str) -> bool:
+    return "derivatives data is incomplete" in str(error).lower()
 
 
 def _format_partial_market_errors(errors: list[str]) -> str | None:
@@ -5345,11 +5455,18 @@ def _auto_entry_prerequisite_blocks(
     action = str(signal.get("action") or "")
     score = int(signal.get("score") or 0)
     is_entry = action in {SignalAction.ENTRY_LONG.value, SignalAction.ENTRY_SHORT.value}
-    if not is_entry:
+    entry_state = str(signal.get("entry_state") or "")
+    if (
+        not is_entry
+        and score >= AUTO_ENTRY_MIN_SCORE
+        and (
+            not entry_state
+            or entry_state == "DIRECTION_PENDING"
+        )
+    ):
         blocks.append("directional entry signal not established")
     if score < AUTO_ENTRY_MIN_SCORE:
         blocks.append(f"final score {score} below auto-entry minimum {AUTO_ENTRY_MIN_SCORE}")
-    entry_state = str(signal.get("entry_state") or "")
     if (
         int(signal.get("entry_pipeline_version") or 0) >= 2
         and entry_state
@@ -5357,9 +5474,14 @@ def _auto_entry_prerequisite_blocks(
     ):
         state_blocks = {
             "DIRECTION_PENDING": "higher-timeframe direction is not established",
+            "SCORE_PENDING": (
+                f"final score {score} below auto-entry minimum "
+                f"{AUTO_ENTRY_MIN_SCORE}"
+            ),
             "POSITION_PENDING": "current price has not reached the selected primary setup",
             "TRIGGER_PENDING": "entry trigger is not confirmed",
             "VETOED": "entry has an active veto",
+            "SIGNAL_PENDING": "candidate signal has not been promoted to an entry action",
         }
         blocks.append(state_blocks.get(entry_state, f"entry state {entry_state} is not ready"))
     entry_position_block = (
@@ -5425,15 +5547,61 @@ def _update_entry_position_fields(signal: dict[str, object]) -> None:
     _update_entry_state_fields(signal)
 
 
+def _candidate_entry_side(
+    signal: dict[str, object],
+) -> PositionSide | None:
+    action = str(
+        signal.get("candidate_action")
+        or signal.get("action")
+        or ""
+    )
+    if action == SignalAction.ENTRY_LONG.value:
+        return PositionSide.LONG
+    if action == SignalAction.ENTRY_SHORT.value:
+        return PositionSide.SHORT
+    return None
+
+
+def _higher_timeframe_direction_established(
+    signal: dict[str, object],
+    side: PositionSide,
+) -> bool:
+    h4 = (
+        signal.get("h4_structure")
+        if isinstance(signal.get("h4_structure"), dict)
+        else {}
+    )
+    h4_direction = str(
+        signal.get("h4_direction")
+        or h4.get("direction")
+        or "NEUTRAL"
+    )
+    h4_state = str(h4.get("state") or "UNKNOWN")
+    if h4_direction == "NEUTRAL":
+        if h4_state == "BREAKOUT_UP":
+            h4_direction = "LONG"
+        elif h4_state == "BREAKDOWN_DOWN":
+            h4_direction = "SHORT"
+    direction_gate = str(signal.get("direction_gate") or "")
+    expected_direction = (
+        "LONG"
+        if side == PositionSide.LONG
+        else "SHORT"
+    )
+    expected_gate = (
+        "LONG_ONLY"
+        if side == PositionSide.LONG
+        else "SHORT_ONLY"
+    )
+    return (
+        h4_direction == expected_direction
+        or direction_gate == expected_gate
+    )
+
+
 def _update_entry_state_fields(signal: dict[str, object]) -> None:
     action = str(signal.get("action") or "")
-    side = (
-        PositionSide.LONG
-        if action == SignalAction.ENTRY_LONG.value
-        else PositionSide.SHORT
-        if action == SignalAction.ENTRY_SHORT.value
-        else None
-    )
+    side = _candidate_entry_side(signal)
     signal["primary_setup"] = str(
         signal.get("primary_setup")
         or signal.get("setup_type")
@@ -5448,6 +5616,36 @@ def _update_entry_state_fields(signal: dict[str, object]) -> None:
         )
     else:
         signal["supporting_evidence"] = ()
+    score = int(signal.get("score") or 0)
+    is_entry = action in {
+        SignalAction.ENTRY_LONG.value,
+        SignalAction.ENTRY_SHORT.value,
+    }
+    if not is_entry:
+        signal["entry_trigger"] = (
+            _entry_trigger_from_context(signal, side)
+            if side is not None
+            else ""
+        )
+        if score < AUTO_ENTRY_MIN_SCORE:
+            signal["entry_state"] = "SCORE_PENDING"
+        elif signal.get("vetoes"):
+            signal["entry_state"] = "VETOED"
+        elif (
+            side is None
+            or not _higher_timeframe_direction_established(
+                signal,
+                side,
+            )
+        ):
+            signal["entry_state"] = "DIRECTION_PENDING"
+        elif str(signal.get("entry_timing") or "") != ENTRY_TIMING_GOOD:
+            signal["entry_state"] = "POSITION_PENDING"
+        elif not signal["entry_trigger"]:
+            signal["entry_state"] = "TRIGGER_PENDING"
+        else:
+            signal["entry_state"] = "SIGNAL_PENDING"
+        return
     if side is None:
         signal["entry_trigger"] = ""
         signal["entry_state"] = "DIRECTION_PENDING"
@@ -5494,6 +5692,7 @@ _TRANSIENT_AUTO_ENTRY_BLOCK_PREFIXES = (
     "1h K-line context",
     "4h K-line context",
     "waiting for new ",
+    "衍生品数据不完整",
 )
 
 
@@ -5619,7 +5818,45 @@ def _rotation_candidate_allowed(signal: dict[str, object], indicator: IndicatorS
 def _signal_entry_timing(signal: dict[str, object]) -> tuple[str, str]:
     action = str(signal.get("action") or "")
     if action == SignalAction.WATCH.value:
-        return ENTRY_TIMING_BLOCK, "entry position blocked: directional entry signal not established"
+        score = int(signal.get("score") or 0)
+        if score < AUTO_ENTRY_MIN_SCORE:
+            return (
+                ENTRY_TIMING_BLOCK,
+                (
+                    "entry position blocked: final score "
+                    f"{score} below auto-entry minimum "
+                    f"{AUTO_ENTRY_MIN_SCORE}"
+                ),
+            )
+        candidate_side = _candidate_entry_side(signal)
+        if candidate_side is None:
+            return (
+                ENTRY_TIMING_BLOCK,
+                "entry position blocked: directional entry signal not established",
+            )
+        if not _higher_timeframe_direction_established(
+                signal,
+                candidate_side,
+        ):
+            return (
+                ENTRY_TIMING_BLOCK,
+                "entry position blocked: higher-timeframe direction is not established",
+            )
+        price = _float_or_none(signal.get("price"))
+        entry_levels = (
+            signal.get("entry_levels")
+            if isinstance(signal.get("entry_levels"), dict)
+            else {}
+        )
+        if not entry_levels:
+            return ENTRY_TIMING_BLOCK, "暂无有效建议入场区域"
+        if price is None:
+            return ENTRY_TIMING_WAIT, "等待最新价格"
+        return _side_entry_timing(
+            candidate_side,
+            price,
+            signal,
+        )
     if action == SignalAction.NO_TRADE.value:
         return ENTRY_TIMING_BLOCK, "entry position blocked: no trade signal"
     if action not in {SignalAction.ENTRY_LONG.value, SignalAction.ENTRY_SHORT.value}:
@@ -6775,6 +7012,9 @@ def _indicator_cache_key(
         latest_derivative.open_interest if latest_derivative else None,
         latest_derivative.long_short_ratio if latest_derivative else None,
         latest_derivative.funding_rate if latest_derivative else None,
+        latest_derivative.taker_buy_sell_ratio if latest_derivative else None,
+        latest_derivative.top_account_long_short_ratio if latest_derivative else None,
+        latest_derivative.top_position_long_short_ratio if latest_derivative else None,
     )
 
 
@@ -6891,6 +7131,41 @@ def _merge_derivatives(
                 else None
             ),
             funding_rate=funding if preserve_funding else new.funding_rate,
+            taker_buy_sell_ratio=(
+                new.taker_buy_sell_ratio
+                if new.taker_buy_sell_ratio is not None
+                else old.taker_buy_sell_ratio
+                if old
+                else None
+            ),
+            taker_buy_volume=(
+                new.taker_buy_volume
+                if new.taker_buy_volume is not None
+                else old.taker_buy_volume
+                if old
+                else None
+            ),
+            taker_sell_volume=(
+                new.taker_sell_volume
+                if new.taker_sell_volume is not None
+                else old.taker_sell_volume
+                if old
+                else None
+            ),
+            top_account_long_short_ratio=(
+                new.top_account_long_short_ratio
+                if new.top_account_long_short_ratio is not None
+                else old.top_account_long_short_ratio
+                if old
+                else None
+            ),
+            top_position_long_short_ratio=(
+                new.top_position_long_short_ratio
+                if new.top_position_long_short_ratio is not None
+                else old.top_position_long_short_ratio
+                if old
+                else None
+            ),
         )
     return [merged[timestamp] for timestamp in sorted(merged)][-500:]
 
@@ -6905,6 +7180,15 @@ def _with_current_funding(
             open_interest=snapshot.open_interest,
             long_short_ratio=snapshot.long_short_ratio,
             funding_rate=funding_rate,
+            taker_buy_sell_ratio=snapshot.taker_buy_sell_ratio,
+            taker_buy_volume=snapshot.taker_buy_volume,
+            taker_sell_volume=snapshot.taker_sell_volume,
+            top_account_long_short_ratio=(
+                snapshot.top_account_long_short_ratio
+            ),
+            top_position_long_short_ratio=(
+                snapshot.top_position_long_short_ratio
+            ),
         )
         for snapshot in snapshots
     ]
@@ -8615,7 +8899,92 @@ def _oi_valley_blocks_low_short_entry(
     return True
 
 
-def _apply_multi_timeframe_context(signal: dict[str, object], context: dict[str, object]) -> dict[str, object]:
+def _multi_timeframe_direction_score(
+    action: str,
+    daily_bias: str,
+    h4_direction: str,
+    *,
+    score_model: Literal["hierarchical", "legacy"] = "hierarchical",
+) -> dict[str, object]:
+    candidate_direction = (
+        "LONG"
+        if action == SignalAction.ENTRY_LONG.value
+        else "SHORT"
+        if action == SignalAction.ENTRY_SHORT.value
+        else "NONE"
+    )
+    aligned_daily_bias = (
+        "BULL"
+        if candidate_direction == "LONG"
+        else "BEAR"
+        if candidate_direction == "SHORT"
+        else "NEUTRAL"
+    )
+    opposing_daily_bias = (
+        "BEAR"
+        if candidate_direction == "LONG"
+        else "BULL"
+        if candidate_direction == "SHORT"
+        else "NEUTRAL"
+    )
+    h4_aligned = candidate_direction != "NONE" and h4_direction == candidate_direction
+    daily_aligned = candidate_direction != "NONE" and daily_bias == aligned_daily_bias
+    daily_opposed = candidate_direction != "NONE" and daily_bias == opposing_daily_bias
+
+    h4_base_score = DIRECTION_H4_BASE_SCORE if h4_aligned else 0
+    if score_model == "legacy":
+        daily_background_score = (
+            DIRECTION_DAILY_LEGACY_SCORE
+            if daily_aligned
+            else 0
+        )
+        alignment_bonus = 0
+        positive_score = max(
+            h4_base_score,
+            daily_background_score,
+        )
+        direction_cap = DIRECTION_H4_BASE_SCORE
+    else:
+        daily_background_score = (
+            DIRECTION_DAILY_BACKGROUND_SCORE
+            if daily_aligned and not h4_aligned
+            else 0
+        )
+        alignment_bonus = (
+            DIRECTION_ALIGNMENT_BONUS
+            if daily_aligned and h4_aligned
+            else 0
+        )
+        positive_score = min(
+            h4_base_score
+            + daily_background_score
+            + alignment_bonus,
+            DIRECTION_SCORE_CAP,
+        )
+        direction_cap = DIRECTION_SCORE_CAP
+
+    return {
+        "candidate_direction": candidate_direction,
+        "daily_bias": daily_bias,
+        "h4_direction": h4_direction,
+        "h4_base_score": h4_base_score,
+        "daily_background_score": daily_background_score,
+        "multi_timeframe_alignment_bonus": alignment_bonus,
+        "direction_positive_score": positive_score,
+        "direction_penalty": -10 if daily_opposed else 0,
+        "direction_cap": direction_cap,
+        "daily_aligned": daily_aligned,
+        "h4_aligned": h4_aligned,
+    }
+
+
+def _apply_multi_timeframe_context(
+    signal: dict[str, object],
+    context: dict[str, object],
+    *,
+    _score_model: Literal["hierarchical", "legacy"] = "hierarchical",
+    _include_score_comparison: bool = True,
+) -> dict[str, object]:
     out = dict(signal)
     reasons = list(out.get("reasons") or [])
     vetoes = list(out.get("vetoes") or [])
@@ -8638,6 +9007,16 @@ def _apply_multi_timeframe_context(signal: dict[str, object], context: dict[str,
             family,
             points,
         )
+
+    def replace_family_score(family: str, points: int) -> None:
+        nonlocal score
+        current = max(0, int(evidence_families.get(family, 0)))
+        target = max(0, int(points))
+        score += target - current
+        if target > 0:
+            evidence_families[family] = target
+        else:
+            evidence_families.pop(family, None)
     action = str(out.get("candidate_action") or out.get("action") or "")
     daily_bias = str(context.get("daily_bias") or "NEUTRAL")
     h4 = context.get("h4_structure") if isinstance(context.get("h4_structure"), dict) else {}
@@ -8679,8 +9058,26 @@ def _apply_multi_timeframe_context(signal: dict[str, object], context: dict[str,
     h4_structure_type = str(
         h4.get("structure_type") or h4_state
     )
+    direction_score_breakdown = _multi_timeframe_direction_score(
+        action,
+        daily_bias,
+        h4_direction,
+        score_model=_score_model,
+    )
+    replace_family_score(
+        SCORE_FAMILY_DIRECTION,
+        int(direction_score_breakdown["direction_positive_score"]),
+    )
+    score += int(direction_score_breakdown["direction_penalty"])
     h1_direction = str(h1.get("direction") or "NONE")
     h1_state = str(h1.get("state") or "UNKNOWN")
+    h1_trigger_confirmed = h1_state in {
+        "BREAKOUT",
+        "BREAKDOWN",
+        "RETEST",
+        "FAKE_BREAKOUT",
+        "FAKE_BREAKDOWN",
+    }
     pullback_direction = str(h1_pullback.get("direction") or "NONE")
     pullback_state = str(h1_pullback.get("state") or "UNKNOWN")
     h4_oi_state = str(h4_oi.get("state") or "UNKNOWN")
@@ -8873,14 +9270,15 @@ def _apply_multi_timeframe_context(signal: dict[str, object], context: dict[str,
                 SETUP_M15_SQUEEZE_TACTICAL_LONG,
             )
         if daily_bias == "BEAR":
-            score -= 10
-            reasons.append("1d bearish bias; long position size reduced")
-        elif daily_bias == "BULL":
-            add_family_score(SCORE_FAMILY_DIRECTION, 5)
-            reasons.append("1d bullish bias supports long")
-        if h4_direction == "LONG":
-            add_family_score(SCORE_FAMILY_DIRECTION, 6)
+            reasons.append("1d bearish bias; long entry quality reduced")
+        elif int(direction_score_breakdown["daily_background_score"]) > 0:
+            reasons.append("1d bullish bias provides background support for long")
+        if int(direction_score_breakdown["h4_base_score"]) > 0:
             reasons.append("4h structure supports upside")
+        if int(direction_score_breakdown["multi_timeframe_alignment_bonus"]) > 0:
+            reasons.append(
+                "1d and 4h directions align long; limited multi-timeframe bonus applied"
+            )
         ma_score, ma_reasons, ma_vetoes = _ma_cluster_signal_adjustment(PositionSide.LONG, h4_ma_cluster, h1_ma_cluster)
         add_family_score(SCORE_FAMILY_MA_POSITION, ma_score)
         reasons.extend(ma_reasons)
@@ -8893,14 +9291,14 @@ def _apply_multi_timeframe_context(signal: dict[str, object], context: dict[str,
                 h1_ma_cluster,
             ),
         )
-        if h1_direction == "LONG":
+        if h1_direction == "LONG" and h1_trigger_confirmed:
             add_family_score(SCORE_FAMILY_TRIGGER, 10)
             setup_type = _prefer_setup_type(
                 setup_type,
                 SETUP_H1_STRUCTURE_LONG,
             )
             reasons.append(f"1h {h1_state.lower()} confirms long trigger")
-        elif h1_direction == "SHORT":
+        elif h1_direction == "SHORT" and h1_trigger_confirmed:
             vetoes.append("1h trigger opposes long entry")
             if oi_valley_ema55_long:
                 reasons.append(
@@ -8971,10 +9369,13 @@ def _apply_multi_timeframe_context(signal: dict[str, object], context: dict[str,
                 "4h OI sharp drop is an event, not a confirmed OI valley; wait for OI rebuilding and downside-wick reclaim"
             )
         elif h4_oi_state == "REBUILD_BREAKOUT_LONG":
-            add_family_score(SCORE_FAMILY_DERIVATIVES, 12)
-            reasons.append("4h OI rebounds after deleverage and price breaks out; strong long restored")
+            add_family_score(SCORE_FAMILY_DERIVATIVES, 6)
+            reasons.append(
+                "4h OI rebounds after deleverage and price breaks out; "
+                "without participant-flow confirmation this remains weak derivatives evidence"
+            )
         if oi_valley_long_reversal:
-            add_family_score(SCORE_FAMILY_DERIVATIVES, 12)
+            add_family_score(SCORE_FAMILY_DERIVATIVES, 6)
             setup_type = _prefer_setup_type(
                 setup_type,
                 SETUP_OI_VALLEY_REVERSAL_LONG,
@@ -9017,9 +9418,16 @@ def _apply_multi_timeframe_context(signal: dict[str, object], context: dict[str,
         reasons.extend(rsi_reasons)
         vetoes.extend(rsi_vetoes)
     elif action == SignalAction.ENTRY_SHORT.value:
-        if h4_direction == "SHORT":
-            add_family_score(SCORE_FAMILY_DIRECTION, 6)
+        if daily_bias == "BULL":
+            reasons.append("1d bullish bias; short entry quality reduced")
+        elif int(direction_score_breakdown["daily_background_score"]) > 0:
+            reasons.append("1d bearish bias provides background support for short")
+        if int(direction_score_breakdown["h4_base_score"]) > 0:
             reasons.append("4h structure supports downside")
+        if int(direction_score_breakdown["multi_timeframe_alignment_bonus"]) > 0:
+            reasons.append(
+                "1d and 4h directions align short; limited multi-timeframe bonus applied"
+            )
         if h4_structure_type == "DESCENDING_RESISTANCE":
             setup_type = _prefer_setup_type(
                 setup_type,
@@ -9062,12 +9470,6 @@ def _apply_multi_timeframe_context(signal: dict[str, object], context: dict[str,
             reasons.append(
                 "stage 3 markdown acceleration: 1h/4h EMA/BOLL bounce rejection is eligible"
             )
-        if daily_bias == "BULL":
-            score -= 10
-            reasons.append("1d bullish bias; short position size reduced")
-        elif daily_bias == "BEAR":
-            add_family_score(SCORE_FAMILY_DIRECTION, 5)
-            reasons.append("1d bearish bias supports short")
         if (
             h4_state == "BOX_LOWER_HALF"
             and h4_location != "RESISTANCE"
@@ -9087,14 +9489,14 @@ def _apply_multi_timeframe_context(signal: dict[str, object], context: dict[str,
                 h1_ma_cluster,
             ),
         )
-        if h1_direction == "SHORT":
+        if h1_direction == "SHORT" and h1_trigger_confirmed:
             add_family_score(SCORE_FAMILY_TRIGGER, 10)
             setup_type = _prefer_setup_type(
                 setup_type,
                 SETUP_H1_STRUCTURE_SHORT,
             )
             reasons.append(f"1h {h1_state.lower()} confirms short trigger")
-        elif h1_direction == "LONG":
+        elif h1_direction == "LONG" and h1_trigger_confirmed:
             vetoes.append("1h trigger opposes short entry")
         if pullback_direction == "SHORT":
             if pullback_state == "HEALTHY_PULLBACK" and risk_state == "NORMAL":
@@ -9281,6 +9683,29 @@ def _apply_multi_timeframe_context(signal: dict[str, object], context: dict[str,
     out["entry_levels"] = selected_entry_levels
     out["trend_stage_phase"] = trend_stage_phase
     out["entry_pipeline_version"] = 2
+    out["direction_score_breakdown"] = dict(
+        direction_score_breakdown
+    )
+    out["score_model_version"] = (
+        SCORE_MODEL_VERSION
+        if _score_model == "hierarchical"
+        else LEGACY_SCORE_MODEL_VERSION
+    )
+    if _score_model == "hierarchical" and _include_score_comparison:
+        legacy = _apply_multi_timeframe_context(
+            signal,
+            context,
+            _score_model="legacy",
+            _include_score_comparison=False,
+        )
+        legacy_score = int(legacy.get("score") or 0)
+        out["legacy_score"] = legacy_score
+        out["legacy_action"] = str(legacy.get("action") or "")
+        out["score_delta_vs_legacy"] = final_score - legacy_score
+    else:
+        out.pop("legacy_score", None)
+        out.pop("legacy_action", None)
+        out.pop("score_delta_vs_legacy", None)
     out.pop("entry_confirmation_required", None)
     out.pop("entry_zone_confirmation", None)
     _update_entry_position_fields(out)

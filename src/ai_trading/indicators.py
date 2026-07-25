@@ -173,10 +173,24 @@ def build_indicators(
         oi_change = None
         long_short_ratio = None
         funding_rate = None
+        taker_buy_sell_ratio = None
+        taker_buy_volume = None
+        taker_sell_volume = None
+        top_account_long_short_ratio = None
+        top_position_long_short_ratio = None
         if derivative is not None:
             open_interest = derivative.open_interest
             long_short_ratio = derivative.long_short_ratio
             funding_rate = derivative.funding_rate
+            taker_buy_sell_ratio = derivative.taker_buy_sell_ratio
+            taker_buy_volume = derivative.taker_buy_volume
+            taker_sell_volume = derivative.taker_sell_volume
+            top_account_long_short_ratio = (
+                derivative.top_account_long_short_ratio
+            )
+            top_position_long_short_ratio = (
+                derivative.top_position_long_short_ratio
+            )
             if derivative.open_interest is not None and previous_oi:
                 oi_change = (derivative.open_interest - previous_oi) / previous_oi
             if derivative.open_interest is not None:
@@ -208,6 +222,15 @@ def build_indicators(
                 oi_change=oi_change,
                 long_short_ratio=long_short_ratio,
                 funding_rate=funding_rate,
+                taker_buy_sell_ratio=taker_buy_sell_ratio,
+                taker_buy_volume=taker_buy_volume,
+                taker_sell_volume=taker_sell_volume,
+                top_account_long_short_ratio=(
+                    top_account_long_short_ratio
+                ),
+                top_position_long_short_ratio=(
+                    top_position_long_short_ratio
+                ),
             )
         )
     return out

@@ -23,6 +23,8 @@ SCORE_FAMILY_MA_POSITION = "MA_POSITION"
 SCORE_FAMILY_DERIVATIVES = "DERIVATIVES"
 SCORE_FAMILY_DIRECTION = "DIRECTION"
 SCORE_FAMILY_TRIGGER = "TRIGGER"
+TAKER_FLOW_CONFIRM_RATIO = 1.05
+PARTICIPANT_RATIO_CHANGE_THRESHOLD = 0.02
 
 
 def apply_positive_evidence_family(
@@ -49,6 +51,8 @@ class CompositeStrategy:
         self.settings = settings or StrategySettings()
         self._last_long_evidence_families: dict[str, int] = {}
         self._last_short_evidence_families: dict[str, int] = {}
+        self._last_long_participant_flow = ParticipantFlowAssessment()
+        self._last_short_participant_flow = ParticipantFlowAssessment()
 
     def generate_signal(
         self,
@@ -91,6 +95,11 @@ class CompositeStrategy:
             if best_is_long
             else self._last_short_evidence_families
         )
+        best_participant_flow = (
+            self._last_long_participant_flow
+            if best_is_long
+            else self._last_short_participant_flow
+        )
         frozen_evidence_families = tuple(sorted(best_evidence_families.items()))
         direction = PositionSide.LONG if best_is_long else PositionSide.SHORT
         opposite_score = short_score if best_is_long else long_score
@@ -120,6 +129,11 @@ class CompositeStrategy:
                     indicators=current,
                     setup_type=best_setup_type,
                     score_evidence_families=frozen_evidence_families,
+                    participant_flow_state=best_participant_flow.state,
+                    participant_flow_score=best_participant_flow.score_for(
+                        direction
+                    ),
+                    participant_flow_reason=best_participant_flow.reason,
                 )
             return StrategySignal(
                 symbol=symbol,
@@ -137,6 +151,11 @@ class CompositeStrategy:
                 indicators=current,
                 setup_type=best_setup_type,
                 score_evidence_families=frozen_evidence_families,
+                participant_flow_state=best_participant_flow.state,
+                participant_flow_score=best_participant_flow.score_for(
+                    direction
+                ),
+                participant_flow_reason=best_participant_flow.reason,
             )
 
         if best_score >= self.settings.watch_threshold:
@@ -152,6 +171,11 @@ class CompositeStrategy:
                 indicators=current,
                 setup_type=best_setup_type,
                 score_evidence_families=frozen_evidence_families,
+                participant_flow_state=best_participant_flow.state,
+                participant_flow_score=best_participant_flow.score_for(
+                    direction
+                ),
+                participant_flow_reason=best_participant_flow.reason,
             )
 
         return StrategySignal(
@@ -162,10 +186,15 @@ class CompositeStrategy:
             score=best_score,
             direction=direction,
             vetoes=tuple(best_vetoes),
-            reasons=("score below trading threshold",),
+            reasons=tuple(
+                best_reasons + ["score below trading threshold"]
+            ),
             indicators=current,
             setup_type=best_setup_type,
             score_evidence_families=frozen_evidence_families,
+            participant_flow_state=best_participant_flow.state,
+            participant_flow_score=best_participant_flow.score_for(direction),
+            participant_flow_reason=best_participant_flow.reason,
         )
 
     def exit_signal(self, position_side: str, indicators: IndicatorSnapshot) -> StrategySignal | None:
@@ -328,6 +357,12 @@ class CompositeStrategy:
         previous = indicators[-2]
         cycle = self.smart_money_cycle(candles, indicators)
         structure = _market_structure(candles, indicators, self.settings)
+        participant_flow = _participant_flow_assessment(
+            candles,
+            indicators,
+            self.settings,
+        )
+        self._last_long_participant_flow = participant_flow
         strict_vetoes = self._strict_long_vetoes(candles, indicators) if self.settings.strict_trend_entry else []
         score = 0
         evidence_families: dict[str, int] = {}
@@ -383,10 +418,7 @@ class CompositeStrategy:
                 reasons.append("KC mid pullback held; volatility channel support favors long")
 
         if current.quote_flow_ratio is not None:
-            if self.settings.qps_min_ratio <= current.quote_flow_ratio <= self.settings.qps_extreme_ratio and current.close >= previous.close:
-                score += 5
-                reasons.append("QPS quote flow accelerates with price; traded value confirms long")
-            elif current.quote_flow_ratio > self.settings.qps_extreme_ratio and current.close < previous.close:
+            if current.quote_flow_ratio > self.settings.qps_extreme_ratio and current.close < previous.close:
                 reasons.append("QPS blow-off without price follow-through; long risk")
 
         if structure.long_confirmed:
@@ -399,96 +431,56 @@ class CompositeStrategy:
             setup_type = SETUP_H1_STRUCTURE_LONG
             reasons.append("market structure: resistance grind broke upward, shorts may be squeezed")
 
-        volume_score, volume_reason = _volume_breakout_retest_confirmation(candles, indicators, structure, "LONG", self.settings)
-        if volume_reason:
-            score += volume_score
-            if volume_score > 0:
-                setup_type = setup_type or SETUP_H1_STRUCTURE_LONG
-            reasons.append(volume_reason)
-
-        if _long_washout_confirmed(candles[-1], current, structure, self.settings):
+        trigger_score, trigger_reason = _price_volume_trigger_assessment(
+            candles,
+            indicators,
+            structure,
+            "LONG",
+            self.settings,
+        )
+        if trigger_reason:
             score = apply_positive_evidence_family(
                 score,
                 evidence_families,
-                SCORE_FAMILY_DERIVATIVES,
-                14,
+                SCORE_FAMILY_TRIGGER,
+                trigger_score,
             )
+            if trigger_score > 0:
+                setup_type = setup_type or SETUP_H1_STRUCTURE_LONG
+            reasons.append(trigger_reason)
+
+        if _long_washout_confirmed(candles[-1], current, structure, self.settings):
             setup_type = SETUP_H1_STRUCTURE_LONG
-            reasons.append("washout confirmed: downside wick swept support, OI dropped, close reclaimed key level")
-
-        if _lower_sweep_reclaimed(candles[-1], current, self.settings):
-            score += 8
-            setup_type = SETUP_H1_STRUCTURE_LONG
-            reasons.append("downside sweep reclaimed support; stop-run filter favors long")
-
-        if current.volume_ratio is not None:
-            if self.settings.volume_min_ratio <= current.volume_ratio <= self.settings.volume_extreme_ratio:
-                score += 15
-                reasons.append("volume confirms move without extreme blow-off")
-            elif current.volume_ratio >= 1.0:
-                score += 7
-                reasons.append("volume is acceptable but not strong")
-
-        if current.oi_change is not None:
-            if current.oi_change >= self.settings.oi_extreme_change:
-                score -= 8
-                reasons.append("open interest spike risk; long quality reduced until structure confirms")
-            elif self.settings.oi_mild_change_min <= current.oi_change < self.settings.oi_extreme_change:
-                score = apply_positive_evidence_family(
-                    score,
-                    evidence_families,
-                    SCORE_FAMILY_DERIVATIVES,
-                    15,
-                )
-                reasons.append("open interest rising mildly with price")
-            elif abs(current.oi_change) < self.settings.oi_mild_change_min:
-                score = apply_positive_evidence_family(
-                    score,
-                    evidence_families,
-                    SCORE_FAMILY_DERIVATIVES,
-                    6,
-                )
-                reasons.append("open interest stable")
-
-        if current.long_short_ratio is not None:
-            if current.long_short_ratio < self.settings.long_short_overcrowded_long:
-                score = apply_positive_evidence_family(
-                    score,
-                    evidence_families,
-                    SCORE_FAMILY_DERIVATIVES,
-                    10,
-                )
-                reasons.append("long/short ratio is not overcrowded long")
-            else:
-                score -= 10
-                reasons.append("long/short ratio overcrowded for longs; quality reduced but not hard blocked")
 
         if current.rsi14 is not None and 45 <= current.rsi14 <= 68:
             score += 10
             reasons.append("RSI in healthy long-trend range")
 
-        if current.funding_rate is not None:
-            if current.funding_rate >= self.settings.funding_hot_long:
-                score -= 8
-                reasons.append("funding overheated for longs; quality reduced but not hard blocked")
-            else:
-                score = apply_positive_evidence_family(
-                    score,
-                    evidence_families,
-                    SCORE_FAMILY_DERIVATIVES,
-                    10,
-                )
-                reasons.append("funding rate is not overheated for longs")
-
-        if cycle.long_bias > 0:
+        if participant_flow.long_score > 0:
             score = apply_positive_evidence_family(
                 score,
                 evidence_families,
                 SCORE_FAMILY_DERIVATIVES,
-                cycle.long_bias,
+                participant_flow.long_score,
             )
-            reasons.append(cycle.reason)
-        if cycle.long_veto:
+        if (
+            participant_flow.reason
+            and participant_flow.state != "NEUTRAL"
+        ):
+            reasons.append(participant_flow.reason)
+        if participant_flow.long_veto:
+            vetoes.append(participant_flow.long_veto)
+
+        risk_penalty, risk_reason = _derivatives_risk_adjustment(
+            "LONG",
+            current,
+            self.settings,
+        )
+        score += risk_penalty
+        if risk_reason:
+            reasons.append(risk_reason)
+
+        if cycle.phase == "DISTRIBUTION_EXIT" and cycle.long_veto:
             vetoes.append(cycle.long_veto)
 
         self._last_long_evidence_families = dict(evidence_families)
@@ -499,6 +491,12 @@ class CompositeStrategy:
         previous = indicators[-2]
         cycle = self.smart_money_cycle(candles, indicators)
         structure = _market_structure(candles, indicators, self.settings)
+        participant_flow = _participant_flow_assessment(
+            candles,
+            indicators,
+            self.settings,
+        )
+        self._last_short_participant_flow = participant_flow
         strict_vetoes = self._strict_short_vetoes(candles, indicators) if self.settings.strict_trend_entry else []
         score = 0
         evidence_families: dict[str, int] = {}
@@ -554,10 +552,7 @@ class CompositeStrategy:
                 reasons.append("KC mid retest rejected; volatility channel resistance favors short")
 
         if current.quote_flow_ratio is not None:
-            if self.settings.qps_min_ratio <= current.quote_flow_ratio <= self.settings.qps_extreme_ratio and current.close <= previous.close:
-                score += 5
-                reasons.append("QPS quote flow accelerates with price; traded value confirms short")
-            elif current.quote_flow_ratio > self.settings.qps_extreme_ratio and current.close > previous.close:
+            if current.quote_flow_ratio > self.settings.qps_extreme_ratio and current.close > previous.close:
                 reasons.append("QPS blow-off without price follow-through; short risk")
 
         if structure.short_confirmed:
@@ -570,97 +565,54 @@ class CompositeStrategy:
             setup_type = SETUP_H1_STRUCTURE_SHORT
             reasons.append("market structure: support grind broke downward, longs may be liquidated")
 
-        volume_score, volume_reason = _volume_breakout_retest_confirmation(candles, indicators, structure, "SHORT", self.settings)
-        if volume_reason:
-            score += volume_score
-            if volume_score > 0:
-                setup_type = setup_type or SETUP_H1_STRUCTURE_SHORT
-            reasons.append(volume_reason)
-
-        if _short_washout_confirmed(candles[-1], current, structure, self.settings):
+        trigger_score, trigger_reason = _price_volume_trigger_assessment(
+            candles,
+            indicators,
+            structure,
+            "SHORT",
+            self.settings,
+        )
+        if trigger_reason:
             score = apply_positive_evidence_family(
                 score,
                 evidence_families,
-                SCORE_FAMILY_DERIVATIVES,
-                14,
+                SCORE_FAMILY_TRIGGER,
+                trigger_score,
             )
+            if trigger_score > 0:
+                setup_type = setup_type or SETUP_H1_STRUCTURE_SHORT
+            reasons.append(trigger_reason)
+
+        if _short_washout_confirmed(candles[-1], current, structure, self.settings):
             setup_type = SETUP_H1_STRUCTURE_SHORT
-            reasons.append("washout confirmed: upside wick swept resistance, OI dropped, close rejected key level")
-
-        if _upper_sweep_rejected(candles[-1], current, self.settings):
-            score += 8
-            setup_type = SETUP_H1_STRUCTURE_SHORT
-            reasons.append("upside sweep rejected resistance; stop-run filter favors short")
-
-        if current.volume_ratio is not None:
-            if self.settings.volume_min_ratio <= current.volume_ratio <= self.settings.volume_extreme_ratio:
-                score += 15
-                reasons.append("volume confirms sell pressure without capitulation chase")
-            elif current.volume_ratio >= 1.0:
-                score += 7
-                reasons.append("volume is acceptable but not strong")
-
-        if current.oi_change is not None:
-            if current.oi_change >= self.settings.oi_extreme_change:
-                score -= 8
-                reasons.append("open interest spike risk; short quality reduced until structure confirms")
-            elif self.settings.oi_mild_change_min <= current.oi_change < self.settings.oi_extreme_change:
-                score = apply_positive_evidence_family(
-                    score,
-                    evidence_families,
-                    SCORE_FAMILY_DERIVATIVES,
-                    15,
-                )
-                reasons.append("open interest rising mildly with falling price")
-            elif abs(current.oi_change) < self.settings.oi_mild_change_min:
-                score = apply_positive_evidence_family(
-                    score,
-                    evidence_families,
-                    SCORE_FAMILY_DERIVATIVES,
-                    6,
-                )
-                reasons.append("open interest stable")
-
-        if current.long_short_ratio is not None:
-            if current.long_short_ratio > self.settings.long_short_overcrowded_short:
-                score = apply_positive_evidence_family(
-                    score,
-                    evidence_families,
-                    SCORE_FAMILY_DERIVATIVES,
-                    10,
-                )
-                reasons.append("long/short ratio is not overcrowded short")
-            else:
-                score -= 10
-                reasons.append("long/short ratio overcrowded for shorts; quality reduced but not hard blocked")
 
         if current.rsi14 is not None and 32 <= current.rsi14 <= 55:
             score += 10
             reasons.append("RSI in healthy short-trend range")
 
-        if current.funding_rate is not None:
-            if current.funding_rate <= self.settings.funding_hot_short:
-                score -= 8
-                reasons.append("funding overheated for shorts; quality reduced but not hard blocked")
-            else:
-                score = apply_positive_evidence_family(
-                    score,
-                    evidence_families,
-                    SCORE_FAMILY_DERIVATIVES,
-                    10,
-                )
-                reasons.append("funding rate is not overheated for shorts")
-
-        if cycle.short_bias > 0:
+        if participant_flow.short_score > 0:
             score = apply_positive_evidence_family(
                 score,
                 evidence_families,
                 SCORE_FAMILY_DERIVATIVES,
-                cycle.short_bias,
+                participant_flow.short_score,
             )
-            reasons.append(cycle.reason)
-        if cycle.short_veto:
-            vetoes.append(cycle.short_veto)
+        if (
+            participant_flow.reason
+            and participant_flow.state != "NEUTRAL"
+        ):
+            reasons.append(participant_flow.reason)
+        if participant_flow.short_veto:
+            vetoes.append(participant_flow.short_veto)
+
+        risk_penalty, risk_reason = _derivatives_risk_adjustment(
+            "SHORT",
+            current,
+            self.settings,
+        )
+        score += risk_penalty
+        if risk_reason:
+            reasons.append(risk_reason)
 
         self._last_short_evidence_families = dict(evidence_families)
         return score, reasons, vetoes, setup_type
@@ -733,6 +685,24 @@ class CompositeStrategy:
 
 
 @dataclass(frozen=True)
+class ParticipantFlowAssessment:
+    state: str = "NEUTRAL"
+    long_score: int = 0
+    short_score: int = 0
+    long_veto: str = ""
+    short_veto: str = ""
+    reason: str = ""
+    confidence: str = "NONE"
+
+    def score_for(self, side: PositionSide) -> int:
+        return (
+            self.long_score
+            if side == PositionSide.LONG
+            else self.short_score
+        )
+
+
+@dataclass(frozen=True)
 class SmartMoneyCycle:
     phase: str = "NEUTRAL"
     reason: str = "smart money cycle neutral"
@@ -750,6 +720,413 @@ class MarketStructure:
     short_confirmed: bool = False
     long_breakout_after_grind: bool = False
     short_breakdown_after_grind: bool = False
+
+
+def _participant_flow_assessment(
+    candles: Sequence[Candle],
+    indicators: Sequence[IndicatorSnapshot],
+    settings: StrategySettings,
+) -> ParticipantFlowAssessment:
+    """Classify one participant-flow state; never stack raw derivatives fields."""
+
+    if len(candles) < 2 or len(indicators) < 2:
+        return ParticipantFlowAssessment(
+            reason="参与者行为数据不足，衍生品证据不加分",
+        )
+
+    current = indicators[-1]
+    lookback = min(4, len(candles), len(indicators))
+    first_close = candles[-lookback].close
+    price_change = (
+        (candles[-1].close - first_close) / first_close
+        if first_close
+        else 0.0
+    )
+    price_up = price_change > 0
+    price_down = price_change < 0
+    crowd_change = _indicator_field_change(
+        indicators[-lookback:],
+        "long_short_ratio",
+    )
+    oi_window_change = _oi_change_over_window(indicators, lookback)
+    oi_change = current.oi_change
+    oi_building = (
+        (
+            oi_change is not None
+            and oi_change >= settings.oi_mild_change_min
+        )
+        or (
+            oi_window_change is not None
+            and oi_window_change >= settings.smart_money_oi_rebuild
+        )
+    )
+    oi_unwinding = (
+        (
+            oi_change is not None
+            and oi_change <= -settings.wash_oi_drop_min
+        )
+        or (
+            oi_window_change is not None
+            and oi_window_change <= -settings.smart_money_oi_rebuild
+        )
+    )
+    oi_not_unwinding = (
+        oi_change is not None
+        and oi_change > -settings.wash_oi_drop_min
+    )
+    taker_ratio = current.taker_buy_sell_ratio
+    taker_buying = (
+        taker_ratio is not None
+        and taker_ratio >= TAKER_FLOW_CONFIRM_RATIO
+    )
+    taker_selling = (
+        taker_ratio is not None
+        and taker_ratio <= 1 / TAKER_FLOW_CONFIRM_RATIO
+    )
+    crowd_shorts_increasing = (
+        crowd_change
+        <= -PARTICIPANT_RATIO_CHANGE_THRESHOLD
+    )
+    crowd_longs_increasing = (
+        crowd_change
+        >= PARTICIPANT_RATIO_CHANGE_THRESHOLD
+    )
+    top_position = current.top_position_long_short_ratio
+    top_account = current.top_account_long_short_ratio
+    top_position_long = (
+        top_position is not None and top_position > 1.0
+    )
+    top_position_short = (
+        top_position is not None and top_position < 1.0
+    )
+    top_account_hint = (
+        "；大户账户方向同步"
+        if (
+            top_account is not None
+            and (
+                (top_position_long and top_account > 1.0)
+                or (top_position_short and top_account < 1.0)
+            )
+        )
+        else ""
+    )
+
+    def directional_score(side: str) -> tuple[int, str]:
+        if side == "LONG":
+            if top_position_short:
+                return 0, "CONFLICT"
+            if top_position_long:
+                return 15, "HIGH"
+            return 10, "MEDIUM"
+        if top_position_long:
+            return 0, "CONFLICT"
+        if top_position_short:
+            return 15, "HIGH"
+        return 10, "MEDIUM"
+
+    def confidence_suffix(confidence: str) -> str:
+        if confidence == "HIGH":
+            return f"；大户持仓方向同步{top_account_hint}"
+        return "；大户持仓数据缺失，按中等置信度计分"
+
+    if (
+        price_up
+        and oi_building
+        and crowd_shorts_increasing
+        and taker_buying
+    ):
+        points, confidence = directional_score("LONG")
+        if points:
+            return ParticipantFlowAssessment(
+                state="CROWD_SHORT_TRAP_CONTINUATION",
+                long_score=points,
+                short_veto="散户空头继续增加且主动买盘、OI同步增强，禁止逆势做空",
+                reason=(
+                    "参与者行为：价格上涨、OI增加、散户空头增加且主动买盘占优，存在逼空延续"
+                    f"{confidence_suffix(confidence)}"
+                ),
+                confidence=confidence,
+            )
+        return ParticipantFlowAssessment(
+            state="PARTICIPANT_CONFLICT",
+            reason="参与者行为冲突：逼空特征与大户持仓方向相反，不加分",
+            confidence="CONFLICT",
+        )
+
+    if (
+        price_down
+        and oi_building
+        and crowd_longs_increasing
+        and taker_selling
+    ):
+        points, confidence = directional_score("SHORT")
+        if points:
+            return ParticipantFlowAssessment(
+                state="CROWD_LONG_TRAP_CONTINUATION",
+                short_score=points,
+                long_veto="散户多头继续补仓且主动卖盘、OI同步增强，禁止逆势做多",
+                reason=(
+                    "参与者行为：价格下跌、OI增加、散户多头增加且主动卖盘占优，存在多杀多延续"
+                    f"{confidence_suffix(confidence)}"
+                ),
+                confidence=confidence,
+            )
+        return ParticipantFlowAssessment(
+            state="PARTICIPANT_CONFLICT",
+            reason="参与者行为冲突：多杀多特征与大户持仓方向相反，不加分",
+            confidence="CONFLICT",
+        )
+
+    lower_reclaim = _lower_sweep_reclaimed(
+        candles[-1],
+        current,
+        settings,
+    )
+    upper_rejection = _upper_sweep_rejected(
+        candles[-1],
+        current,
+        settings,
+    )
+    if lower_reclaim and taker_buying and oi_not_unwinding:
+        points, confidence = directional_score("LONG")
+        if points:
+            return ParticipantFlowAssessment(
+                state="LONG_ABSORPTION_RECLAIM",
+                long_score=points,
+                reason=(
+                    "参与者行为：下影扫盘后快速收回，主动买盘承接且OI未流失，支持多头吸收"
+                    f"{confidence_suffix(confidence)}"
+                ),
+                confidence=confidence,
+            )
+    if upper_rejection and taker_selling and oi_not_unwinding:
+        points, confidence = directional_score("SHORT")
+        if points:
+            return ParticipantFlowAssessment(
+                state="SHORT_ABSORPTION_REJECTION",
+                short_score=points,
+                reason=(
+                    "参与者行为：上影扫盘后快速回落，主动卖盘压制且OI未流失，支持空头吸收"
+                    f"{confidence_suffix(confidence)}"
+                ),
+                confidence=confidence,
+            )
+
+    if price_up and oi_building and taker_buying:
+        points, confidence = directional_score("LONG")
+        if points:
+            return ParticipantFlowAssessment(
+                state="NEW_LONG_BUILD",
+                long_score=points,
+                reason=(
+                    "参与者行为：价格、OI与主动买盘同步增强，识别为新增多头建仓"
+                    f"{confidence_suffix(confidence)}"
+                ),
+                confidence=confidence,
+            )
+    if price_down and oi_building and taker_selling:
+        points, confidence = directional_score("SHORT")
+        if points:
+            return ParticipantFlowAssessment(
+                state="NEW_SHORT_BUILD",
+                short_score=points,
+                reason=(
+                    "参与者行为：价格、OI与主动卖盘同步增强，识别为新增空头建仓"
+                    f"{confidence_suffix(confidence)}"
+                ),
+                confidence=confidence,
+            )
+
+    if price_up and oi_unwinding:
+        return ParticipantFlowAssessment(
+            state="SHORT_COVERING_REBOUND",
+            long_score=6,
+            reason="参与者行为：价格上涨但OI下降，更像空头回补，仅提供弱多头证据",
+            confidence="LOW",
+        )
+    if price_down and oi_unwinding:
+        return ParticipantFlowAssessment(
+            state="LONG_LIQUIDATION_DROP",
+            short_score=6,
+            reason="参与者行为：价格下跌且OI下降，更像多头去杠杆，仅提供弱空头证据",
+            confidence="LOW",
+        )
+
+    if (
+        taker_ratio is not None
+        and top_position is not None
+        and (
+            (taker_buying and top_position_short)
+            or (taker_selling and top_position_long)
+        )
+    ):
+        return ParticipantFlowAssessment(
+            state="PARTICIPANT_CONFLICT",
+            reason="参与者行为冲突：主动成交方向与大户持仓方向不一致，不加分",
+            confidence="CONFLICT",
+        )
+    return ParticipantFlowAssessment(
+        state="NEUTRAL",
+        reason="参与者行为未形成一致证据，衍生品族不加分",
+        confidence="NONE",
+    )
+
+
+def _price_volume_trigger_assessment(
+    candles: Sequence[Candle],
+    indicators: Sequence[IndicatorSnapshot],
+    structure: MarketStructure,
+    side: str,
+    settings: StrategySettings,
+) -> tuple[int, str | None]:
+    """Return only the strongest price/volume trigger, capped at ten."""
+
+    candidates: list[tuple[int, str]] = []
+    volume_score, volume_reason = _volume_breakout_retest_confirmation(
+        candles,
+        indicators,
+        structure,
+        side,
+        settings,
+    )
+    if volume_reason and volume_score > 0:
+        candidates.append((min(volume_score, 10), volume_reason))
+
+    current = indicators[-1]
+    if side == "LONG" and _lower_sweep_reclaimed(
+        candles[-1],
+        current,
+        settings,
+    ):
+        sweep_score = (
+            10
+            if (current.volume_ratio or 0.0)
+            >= settings.volume_min_ratio
+            else 8
+        )
+        candidates.append(
+            (
+                sweep_score,
+                "下影扫盘后收回关键区域，量价触发族确认多头",
+            )
+        )
+    elif side == "SHORT" and _upper_sweep_rejected(
+        candles[-1],
+        current,
+        settings,
+    ):
+        sweep_score = (
+            10
+            if (current.volume_ratio or 0.0)
+            >= settings.volume_min_ratio
+            else 8
+        )
+        candidates.append(
+            (
+                sweep_score,
+                "上影扫盘后跌回关键区域，量价触发族确认空头",
+            )
+        )
+
+    if _contracting_doji_confirmed(candles, indicators, side):
+        candidates.append(
+            (
+                5,
+                (
+                    "缩量十字星后向上确认，提供多头触发"
+                    if side == "LONG"
+                    else "缩量十字星后向下确认，提供空头触发"
+                ),
+            )
+        )
+    if candidates:
+        return max(candidates, key=lambda item: item[0])
+    return 0, volume_reason
+
+
+def _contracting_doji_confirmed(
+    candles: Sequence[Candle],
+    indicators: Sequence[IndicatorSnapshot],
+    side: str,
+) -> bool:
+    if len(candles) < 2 or len(indicators) < 2:
+        return False
+    doji = candles[-2]
+    confirmation = candles[-1]
+    candle_range = doji.high - doji.low
+    if candle_range <= 0:
+        return False
+    small_body = abs(doji.close - doji.open) <= candle_range * 0.25
+    contracted_volume = (
+        indicators[-2].volume_ratio is not None
+        and indicators[-2].volume_ratio <= 0.85
+    )
+    if not (small_body and contracted_volume):
+        return False
+    if side == "LONG":
+        return confirmation.close > doji.high
+    return confirmation.close < doji.low
+
+
+def _derivatives_risk_adjustment(
+    side: str,
+    current: IndicatorSnapshot,
+    settings: StrategySettings,
+) -> tuple[int, str | None]:
+    """Apply only the strongest derivatives risk; normal values never add."""
+
+    risks: list[tuple[int, str]] = []
+    if (
+        current.oi_change is not None
+        and current.oi_change >= settings.oi_extreme_change
+    ):
+        risks.append(
+            (
+                -8,
+                "OI短时异常增加，等待结构确认后再评估",
+            )
+        )
+    if side == "LONG":
+        if (
+            current.long_short_ratio is not None
+            and current.long_short_ratio
+            >= settings.long_short_overcrowded_long
+        ):
+            risks.append((-10, "多头拥挤，交易质量扣分但不单独禁止开仓"))
+        if (
+            current.funding_rate is not None
+            and current.funding_rate >= settings.funding_hot_long
+        ):
+            risks.append((-8, "多头资金费率过热，交易质量扣分"))
+    else:
+        if (
+            current.long_short_ratio is not None
+            and current.long_short_ratio
+            <= settings.long_short_overcrowded_short
+        ):
+            risks.append((-10, "空头拥挤，交易质量扣分但不单独禁止开仓"))
+        if (
+            current.funding_rate is not None
+            and current.funding_rate <= settings.funding_hot_short
+        ):
+            risks.append((-8, "空头资金费率过热，交易质量扣分"))
+    if not risks:
+        return 0, None
+    return min(risks, key=lambda item: item[0])
+
+
+def _indicator_field_change(
+    indicators: Sequence[IndicatorSnapshot],
+    field_name: str,
+) -> float:
+    values = [
+        float(value)
+        for item in indicators
+        if (value := getattr(item, field_name, None)) is not None
+    ]
+    if len(values) < 2 or values[0] == 0:
+        return 0.0
+    return (values[-1] - values[0]) / values[0]
 
 
 def _market_structure(

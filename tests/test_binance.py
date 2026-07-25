@@ -4,7 +4,11 @@ import asyncio
 
 import httpx
 
-from ai_trading.binance import _get_json_with_retry, _websocket_proxy
+from ai_trading.binance import (
+    BinanceFuturesMarketData,
+    _get_json_with_retry,
+    _websocket_proxy,
+)
 
 
 def test_binance_retry_handles_rate_limit_response() -> None:
@@ -38,3 +42,41 @@ def test_websocket_proxy_prefers_dedicated_setting(monkeypatch) -> None:
     monkeypatch.setenv("BINANCE_WS_PROXY", "socks5://127.0.0.1:2080")
 
     assert _websocket_proxy() == "socks5h://127.0.0.1:2080"
+
+
+def test_top_trader_series_degrades_to_empty_without_api_key(
+    monkeypatch,
+) -> None:
+    monkeypatch.delenv("BINANCE_API_KEY", raising=False)
+    market = BinanceFuturesMarketData(api_key=None)
+
+    async def run() -> tuple[dict, dict]:
+        return (
+            await market.top_trader_account_ratio("BTCUSDT"),
+            await market.top_trader_position_ratio("BTCUSDT"),
+        )
+
+    assert asyncio.run(run()) == ({}, {})
+
+
+def test_taker_buy_sell_volume_parses_participant_flow_fields() -> None:
+    class FakeMarket(BinanceFuturesMarketData):
+        async def _get_json(self, path: str, **kwargs):  # type: ignore[override]
+            assert path == "/futures/data/takerlongshortRatio"
+            return [
+                {
+                    "timestamp": 1_700_000_000_000,
+                    "buySellRatio": "1.12",
+                    "buyVol": "112",
+                    "sellVol": "100",
+                }
+            ]
+
+    result = asyncio.run(
+        FakeMarket().taker_buy_sell_volume("BTCUSDT")
+    )
+    ratio, buy_volume, sell_volume = next(iter(result.values()))
+
+    assert ratio == 1.12
+    assert buy_volume == 112.0
+    assert sell_volume == 100.0

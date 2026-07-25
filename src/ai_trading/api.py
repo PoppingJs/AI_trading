@@ -256,6 +256,13 @@ def _signal_payload(signal) -> dict[str, object]:
         "score": signal.score,
         "vetoes": signal.vetoes,
         "reasons": signal.reasons,
+        "setup_type": signal.setup_type,
+        "score_evidence_families": dict(
+            signal.score_evidence_families
+        ),
+        "participant_flow_state": signal.participant_flow_state,
+        "participant_flow_score": signal.participant_flow_score,
+        "participant_flow_reason": signal.participant_flow_reason,
         "indicators": asdict(signal.indicators) if signal.indicators else None,
     }
 
@@ -790,6 +797,7 @@ PAPER_DASHBOARD_HTML = """
       'structure break stop': '结构破位止损',
       'ATR volatility stop': 'ATR波动止损',
       'take profit: target 2 reached': '止盈：达到第二止盈目标',
+      'take profit: target 1 reached': '止盈：达到第一止盈目标',
       'take profit: high distribution handoff complete': '止盈：高位换手完成',
       'take profit: 4h OI valley formed; downside trend exhausted': '止盈：4H OI洼地形成，下跌行情衰竭',
       'take profit: floating profit trailing stop': '止盈：浮盈回撤触发保护',
@@ -799,6 +807,9 @@ PAPER_DASHBOARD_HTML = """
       'stop loss: breakout protection stop': '止损：突破保护止损触发',
       'stop loss: signal structure failed': '止损：信号结构失效',
       'stop loss: signal direction or structure failed': '止损：信号方向或结构失效',
+      'take profit: direction unvalidated and higher-timeframe structure failed': '止盈：方向尚未验证且高周期结构失效，保护利润',
+      'stop loss: direction unvalidated and higher-timeframe structure failed': '止损：方向尚未验证且高周期结构失效',
+      'stop loss: structure close confirmed beyond the primary setup': '止损：实体收盘确认突破主交易结构',
       'stop loss: ATR volatility hard stop': '止损：ATR波动硬止损',
       'stop loss: 15m entry structure stop': '止损：15分钟入场结构失效',
       'stop loss: 4h OI-valley absorption floor failed by close': '止损：4H实体收盘跌破OI洼地吸筹底部',
@@ -807,6 +818,10 @@ PAPER_DASHBOARD_HTML = """
       'stop loss: 1h/4h body closed below support or EMA/BOLL zone': '止损：1小时/4小时实体跌破支撑或EMA/BOLL区域',
       'take profit: 1h/4h body closed above resistance or EMA/BOLL zone': '止盈：1小时/4小时实体突破压力或EMA/BOLL区域，保护利润',
       'stop loss: 1h/4h body closed above resistance or EMA/BOLL zone': '止损：1小时/4小时实体突破压力或EMA/BOLL区域',
+      'take profit: 4h body closed below support or EMA/BOLL zone': '止盈：4小时实体跌破支撑或EMA/BOLL区域，保护利润',
+      'stop loss: 4h body closed below support or EMA/BOLL zone': '止损：4小时实体跌破支撑或EMA/BOLL区域',
+      'take profit: 4h body closed above resistance or EMA/BOLL zone': '止盈：4小时实体突破压力或EMA/BOLL区域，保护利润',
+      'stop loss: 4h body closed above resistance or EMA/BOLL zone': '止损：4小时实体突破压力或EMA/BOLL区域',
       'take profit: strong trend EMA50 structure invalidated': '止盈：强趋势EMA50结构失效，保护利润',
       'stop loss: strong trend EMA50 structure invalidated': '止损：强趋势EMA50结构失效',
       'take profit: floating profit drawdown protection': '止盈：浮盈回撤保护',
@@ -1079,6 +1094,80 @@ PAPER_DASHBOARD_HTML = """
       if (String(value).startsWith('auto strategy score=')) return String(value).replace('auto strategy score=', '自动策略开仓，评分=');
       if (String(value).startsWith('MTF:')) return tMtfSummary(value);
       return value;
+    }
+    function exitReasonText(value) {
+      const reason = String(value || '').trim();
+      if (!reason) return '策略退出：触发既定离场条件';
+      if (reasonText[reason]) return reasonText[reason];
+      const lower = reason.toLowerCase();
+      if (lower.includes('rotation exit')) {
+        const symbol = (reason.match(/symbol=([^\\s]+)/) || [])[1] || '';
+        const score = (reason.match(/score=(\\d+)/) || [])[1] || '';
+        const type = lower.includes('efficiency rotation')
+          ? '效率调仓'
+          : lower.includes('trend invalidated')
+            ? '趋势失效调仓'
+            : '调仓退出';
+        const target = symbol ? `，换入 ${displaySymbol(symbol)}` : '';
+        return `${type}：标的相对优势下降${target}${score ? `，评分=${score}` : ''}`;
+      }
+      if (lower.includes('risk exit')) return '风险退出：触发持仓风险控制';
+      if (lower.includes('manual')) return '手动平仓';
+      if (lower.includes('funding settlement')) return '资金费结算';
+      let prefix = '策略退出';
+      if (lower.startsWith('stop loss')) prefix = '止损';
+      else if (lower.startsWith('take profit')) prefix = '止盈';
+      else if (lower.includes('time exit')) prefix = '时间退出';
+      const details = [
+        ['target 1 reached', '第一止盈目标达成'],
+        ['target 2 reached', '第二止盈目标达成'],
+        ['high distribution handoff complete', '高位换手完成'],
+        ['4h oi valley formed; downside trend exhausted', '4小时OI洼地形成，下跌行情衰竭'],
+        ['floating profit trailing stop', '浮盈回撤触发保护'],
+        ['protected stop slipped below entry', '保护止损成交后仍低于开仓价'],
+        ['protected stop after profit lock', '锁定利润后触发保护止损'],
+        ['signal direction or structure failed', '信号方向或结构失效'],
+        ['signal structure failed', '信号结构失效'],
+        ['direction unvalidated and higher-timeframe structure failed', '方向尚未验证且高周期结构失效'],
+        ['structure close confirmed beyond the primary setup', '实体收盘确认突破主交易结构'],
+        ['atr volatility hard stop', '触发ATR波动硬止损'],
+        ['15m entry structure stop', '15分钟入场结构失效'],
+        ['breakout protection stop', '突破保护止损触发'],
+        ['short trend support protection stop', '空头趋势支撑保护止损触发'],
+        ['oi-valley absorption floor failed by close', '4小时实体收盘跌破OI洼地吸筹底部'],
+        ['closed below ema55 while oi increased', '4小时收盘跌破EMA55且OI增加，疑似新增空头'],
+        ['body closed below support or ema/boll zone', '实体收盘跌破支撑或EMA/BOLL区域'],
+        ['body closed above resistance or ema/boll zone', '实体收盘突破压力或EMA/BOLL区域'],
+        ['strong trend ema50 structure invalidated', '强趋势EMA50结构失效'],
+        ['floating profit drawdown protection', '浮盈回撤保护'],
+        ['profit drawdown after long crowd risk', '浮盈回撤叠加多头拥挤风险'],
+        ['profit drawdown after short crowd risk', '浮盈回撤叠加空头拥挤风险'],
+        ['profit drawdown after oi abnormal risk', '浮盈回撤叠加OI异常风险'],
+        ['profit drawdown after funding overheated risk', '浮盈回撤叠加资金费率过热'],
+        ['profit drawdown after oi drop risk', '浮盈回撤叠加OI下降风险'],
+        ['profit drawdown after volume blow-off risk', '浮盈回撤叠加放量衰竭风险'],
+        ['profit drawdown after rsi overheated risk', '浮盈回撤叠加RSI过热'],
+        ['profit drawdown after rsi oversold risk', '浮盈回撤叠加RSI超卖'],
+        ['near 4h resistance with profit protection', '接近4小时压力位并保护利润'],
+        ['near 4h support with profit protection', '接近4小时支撑位并保护利润'],
+        ['4h support plus short exhaustion confirmed', '4小时支撑与空头衰竭确认'],
+        ['4h resistance plus long exhaustion confirmed', '4小时压力与多头衰竭确认'],
+        ['long crowd risk', '多头拥挤风险'],
+        ['short crowd risk', '空头拥挤风险'],
+        ['oi abnormal risk', 'OI异常风险'],
+        ['funding overheated risk', '资金费率过热风险'],
+        ['structure invalidated', '交易结构失效'],
+        ['trend late stage', '趋势进入末期'],
+        ['efficiency', '持仓效率下降']
+      ];
+      const matched = details.find(([needle]) => lower.includes(needle));
+      if (matched) return `${prefix}：${matched[1]}`;
+      if (prefix === '止损') return '止损：交易条件失效';
+      if (prefix === '止盈') return '止盈：达到目标或保护条件';
+      if (prefix === '时间退出') return '时间退出：持仓效率不足';
+      const prose = reason.replace(/\\b(?:EMA\\d*|BOLL|OI|ATR|RSI|VWAP|KC|QPS|USDT)\\b/gi, '');
+      if (/[\u4e00-\u9fff]/.test(reason) && !/[a-z]{3,}/i.test(prose)) return reason;
+      return '策略退出：触发既定离场条件';
     }
     function tVeto(value) {
       const reason = String(value || '').trim();
@@ -1713,7 +1802,7 @@ PAPER_DASHBOARD_HTML = """
         timeText(f.opened_at),
         timeText(f.closed_at),
         flowTableText(f.entry_position || '--'),
-        wrapReason(tReason(f.reason), 50)
+        wrapReason(exitReasonText(f.reason), 50)
       ]);
       const fillPages = paginateFillRows(fillHeaders, fillRows);
       const totalFillPages = Math.max(fillPages.length, 1);

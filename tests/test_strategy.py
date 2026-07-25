@@ -16,8 +16,10 @@ from ai_trading.models import (
 from ai_trading.strategy import (
     SCORE_FAMILY_DERIVATIVES,
     SCORE_FAMILY_MA_POSITION,
+    SCORE_FAMILY_TRIGGER,
     CompositeStrategy,
     MarketStructure,
+    _participant_flow_assessment,
     _volume_breakout_retest_confirmation,
     apply_positive_evidence_family,
 )
@@ -53,7 +55,7 @@ def test_strategy_defers_overheated_rsi_to_multi_timeframe_context() -> None:
     assert "RSI overheated for long entry" not in signal.vetoes
     assert "funding too hot for long entry" not in signal.vetoes
     assert "long side overcrowded" not in long_vetoes
-    assert "long/short ratio overcrowded for longs; quality reduced but not hard blocked" in long_reasons
+    assert "多头拥挤，交易质量扣分但不单独禁止开仓" in long_reasons
 
 
 def test_funding_and_oi_spike_reduce_score_without_standalone_veto() -> None:
@@ -73,8 +75,8 @@ def test_funding_and_oi_spike_reduce_score_without_standalone_veto() -> None:
     assert score > 0
     assert "funding too hot for long entry" not in vetoes
     assert "open interest spike risks liquidation sweep" not in vetoes
-    assert "funding overheated for longs; quality reduced but not hard blocked" in reasons
-    assert "open interest spike risk; long quality reduced until structure confirms" in reasons
+    assert "OI短时异常增加，等待结构确认后再评估" in reasons
+    assert "多头资金费率过热，交易质量扣分" not in reasons
 
 
 def test_strategy_uses_score_bands_and_keeps_risk_conditions_as_vetoes() -> None:
@@ -136,7 +138,7 @@ def test_long_short_ratio_overcrowding_reduces_quality_without_common_veto() -> 
     _, long_reasons, long_vetoes, _ = CompositeStrategy()._score_long(candles, indicators)
 
     assert "long side overcrowded" not in long_vetoes
-    assert "long/short ratio overcrowded for longs; quality reduced but not hard blocked" in long_reasons
+    assert "多头拥挤，交易质量扣分但不单独禁止开仓" in long_reasons
 
 
 def test_strategy_emits_long_when_score_is_strong() -> None:
@@ -153,16 +155,20 @@ def test_strategy_emits_long_when_score_is_strong() -> None:
         oi_change=0.003,
         long_short_ratio=1.2,
         funding_rate=0.0001,
+        taker_buy_sell_ratio=1.12,
+        top_account_long_short_ratio=1.1,
+        top_position_long_short_ratio=1.2,
     )
 
-    signal = CompositeStrategy(StrategySettings(score_threshold=65, strict_trend_entry=False)).generate_signal("BTCUSDT", candles, indicators)
+    signal = CompositeStrategy(StrategySettings(score_threshold=45, strict_trend_entry=False)).generate_signal("BTCUSDT", candles, indicators)
 
     assert signal.action == SignalAction.ENTRY_LONG
-    assert signal.score >= 65
+    assert signal.score >= 45
     assert dict(signal.score_evidence_families) == {
         SCORE_FAMILY_DERIVATIVES: 15,
         SCORE_FAMILY_MA_POSITION: 20,
     }
+    assert signal.participant_flow_state == "NEW_LONG_BUILD"
 
 
 def test_strategy_downgrades_but_does_not_block_after_upper_wick_sweep() -> None:
@@ -350,7 +356,115 @@ def test_strategy_rewards_washout_with_oi_drop_and_key_level_reclaim() -> None:
 
     signal = CompositeStrategy(settings).generate_signal("BTCUSDT", candles, indicators)
 
-    assert "washout confirmed: downside wick swept support, OI dropped, close reclaimed key level" in signal.reasons
+    assert "下影扫盘后收回关键区域，量价触发族确认多头" in signal.reasons
+    assert dict(signal.score_evidence_families)[SCORE_FAMILY_TRIGGER] == 10
+
+
+def test_participant_flow_detects_crowd_short_trap_without_stacking() -> None:
+    candles, derivatives = _trending_market()
+    indicators = build_indicators(candles, derivatives)
+    for offset, ratio in zip(range(4, 0, -1), (1.25, 1.18, 1.10, 1.02), strict=True):
+        idx = len(indicators) - offset
+        indicators[idx] = replace(
+            indicators[idx],
+            long_short_ratio=ratio,
+            oi_change=0.004,
+        )
+    indicators[-1] = replace(
+        indicators[-1],
+        taker_buy_sell_ratio=1.12,
+        top_account_long_short_ratio=1.08,
+        top_position_long_short_ratio=1.18,
+    )
+
+    assessment = _participant_flow_assessment(
+        candles,
+        indicators,
+        StrategySettings(),
+    )
+
+    assert assessment.state == "CROWD_SHORT_TRAP_CONTINUATION"
+    assert assessment.long_score == 15
+    assert assessment.short_score == 0
+    assert assessment.short_veto
+
+
+def test_participant_flow_detects_crowd_long_trap_for_short() -> None:
+    candles, derivatives = _trending_market()
+    indicators = build_indicators(candles, derivatives)
+    start = candles[-4].close
+    for offset, ratio in zip(range(4, 0, -1), (0.95, 1.02, 1.10, 1.18), strict=True):
+        idx = len(indicators) - offset
+        close = start - (5 - offset) * 0.7
+        candles[idx] = replace(candles[idx], close=close)
+        indicators[idx] = replace(
+            indicators[idx],
+            close=close,
+            long_short_ratio=ratio,
+            oi_change=0.004,
+        )
+    indicators[-1] = replace(
+        indicators[-1],
+        taker_buy_sell_ratio=0.90,
+        top_account_long_short_ratio=0.92,
+        top_position_long_short_ratio=0.82,
+    )
+
+    assessment = _participant_flow_assessment(
+        candles,
+        indicators,
+        StrategySettings(),
+    )
+
+    assert assessment.state == "CROWD_LONG_TRAP_CONTINUATION"
+    assert assessment.short_score == 15
+    assert assessment.long_score == 0
+    assert assessment.long_veto
+
+
+def test_participant_flow_missing_top_data_caps_score_at_ten() -> None:
+    candles, derivatives = _trending_market()
+    indicators = build_indicators(candles, derivatives)
+    indicators[-1] = replace(
+        indicators[-1],
+        oi_change=0.004,
+        taker_buy_sell_ratio=1.12,
+        top_account_long_short_ratio=None,
+        top_position_long_short_ratio=None,
+    )
+
+    assessment = _participant_flow_assessment(
+        candles,
+        indicators,
+        StrategySettings(),
+    )
+
+    assert assessment.state == "NEW_LONG_BUILD"
+    assert assessment.long_score == 10
+    assert assessment.confidence == "MEDIUM"
+
+
+def test_raw_volume_alone_does_not_create_a_positive_trigger_family() -> None:
+    candles, derivatives = _trending_market()
+    indicators = build_indicators(candles, derivatives)
+    indicators[-1] = replace(
+        indicators[-1],
+        volume_ratio=1.8,
+        taker_buy_sell_ratio=None,
+        top_account_long_short_ratio=None,
+        top_position_long_short_ratio=None,
+    )
+    strategy = CompositeStrategy(
+        StrategySettings(
+            score_threshold=999,
+            watch_threshold=1,
+            strict_trend_entry=False,
+        )
+    )
+
+    strategy._score_long(candles, indicators)
+
+    assert SCORE_FAMILY_TRIGGER not in strategy._last_long_evidence_families
 
 
 def test_base_timeframe_oi_flush_does_not_claim_a_four_hour_oi_valley() -> None:
