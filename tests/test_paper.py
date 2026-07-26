@@ -42,6 +42,7 @@ from ai_trading.paper import (
     _direction_validation_exit_reason,
     _daily_pnl_payload,
     _entry_quality_grade,
+    _entry_quality_assessment,
     _distribution_short_stage,
     _distribution_short_structure,
     _distribution_projection_supported,
@@ -72,6 +73,7 @@ from ai_trading.paper import (
     _preferred_exit_indicator,
     _protect_confirmed_breakout_position,
     _precision_stop_allowed,
+    _position_policy_score,
     _position_profit_management_enabled,
     _position_reached_initial_r,
     _refine_stop_with_ma_cluster,
@@ -82,6 +84,7 @@ from ai_trading.paper import (
     _refine_stop_with_retest_structure,
     _refine_take_profit_with_ma_cluster,
     _pyramid_allowed,
+    _refresh_entry_quality_for_live_price,
     _rotation_candidate_allowed,
     _risk_exit_reason,
     _scored_entry_levels,
@@ -96,6 +99,7 @@ from ai_trading.paper import (
     _update_position_validation,
     _update_entry_position_fields,
 )
+from ai_trading.strategy import SCORE_FAMILY_ENTRY_QUALITY
 
 
 def test_periodic_state_checkpoint_is_throttled_to_five_minutes() -> None:
@@ -2030,6 +2034,307 @@ def test_final_score_band_normalizes_signal_action(
 
     assert signal["score"] == score
     assert signal["action"] == expected_action
+
+
+def test_v5_entry_quality_can_promote_an_in_zone_v4_watch_signal() -> None:
+    adjusted = _apply_multi_timeframe_context(
+        {
+            "action": SignalAction.WATCH.value,
+            "candidate_action": SignalAction.ENTRY_LONG.value,
+            "score": 43,
+            "price": 100.0,
+            "reasons": (),
+            "vetoes": (),
+            "risk_state": "NORMAL",
+            "trend_state": "TREND_LONG",
+            "setup_type": SETUP_H1_PULLBACK_LONG,
+        },
+        {
+            "daily_bias": "NEUTRAL",
+            "h4_structure": {
+                "state": "ASCENDING_SUPPORT",
+                "direction": "LONG",
+                "structure_type": "TREND",
+                "support": 97.0,
+                "resistance": 106.0,
+            },
+            "h1_structure": {
+                "support": 98.5,
+                "support_zone_low": 98.5,
+                "resistance": 104.5,
+                "resistance_zone_high": 104.5,
+            },
+            "h1_trigger": {
+                "direction": "LONG",
+                "state": "RETEST",
+                "support": 98.5,
+                "resistance": 104.5,
+            },
+            "h1_pullback": {
+                "direction": "LONG",
+                "state": "HEALTHY_PULLBACK",
+            },
+            "entry_levels": {
+                "long": {
+                    "h1_support": {
+                        "low": 99.5,
+                        "high": 100.5,
+                        "price": 100.0,
+                    },
+                },
+            },
+            "summary": "entry quality integration",
+        },
+    )
+
+    assert adjusted["score_before_entry_quality"] == 71
+    assert adjusted["entry_quality_score"] == 12
+    assert adjusted["score"] == 83
+    assert adjusted["action"] == SignalAction.ENTRY_LONG.value
+    assert adjusted["v4_action"] == SignalAction.WATCH.value
+    assert adjusted["score_delta_vs_v4"] == 12
+    assert adjusted["score_model_version"] == 5
+    assert adjusted["score_evidence_families"][
+        SCORE_FAMILY_ENTRY_QUALITY
+    ] == 12
+    assert adjusted["effective_risk_reward"] >= 2.0
+    assert adjusted["entry_state"] == "READY"
+
+
+def test_entry_quality_estimates_outside_zone_without_scoring() -> None:
+    assessment = _entry_quality_assessment(
+        {
+            "action": SignalAction.ENTRY_LONG.value,
+            "candidate_action": SignalAction.ENTRY_LONG.value,
+            "score": 80,
+            "price": 102.0,
+            "risk_state": "NORMAL",
+            "vetoes": (),
+            "h4_direction": "LONG",
+            "direction_gate": "LONG_ONLY",
+            "setup_type": SETUP_H1_PULLBACK_LONG,
+            "h4_structure": {
+                "direction": "LONG",
+                "support": 97.0,
+                "resistance": 106.0,
+            },
+            "h1_structure": {
+                "support": 98.5,
+                "resistance": 104.5,
+            },
+            "h1_trigger": {
+                "direction": "LONG",
+                "state": "RETEST",
+                "support": 98.5,
+                "resistance": 104.5,
+            },
+            "entry_levels": {
+                "long": {
+                    "h1_support": {
+                        "low": 99.5,
+                        "high": 100.5,
+                        "price": 100.0,
+                    },
+                },
+            },
+        },
+        PositionSide.LONG,
+    )
+
+    assert assessment["entry_quality_status"] == "OUTSIDE_ENTRY_ZONE"
+    assert assessment["entry_quality_score"] == 0
+    assert assessment["entry_quality_in_zone"] is False
+    assert assessment["entry_quality_reference_price"] == pytest.approx(100.0)
+    assert assessment["effective_risk_reward"] is not None
+
+
+def test_known_structure_room_below_one_r_stays_observation() -> None:
+    adjusted = _apply_multi_timeframe_context(
+        {
+            "action": SignalAction.WATCH.value,
+            "candidate_action": SignalAction.ENTRY_LONG.value,
+            "score": 52,
+            "price": 100.0,
+            "reasons": (),
+            "vetoes": (),
+            "risk_state": "NORMAL",
+            "trend_state": "TREND_LONG",
+            "setup_type": SETUP_H1_PULLBACK_LONG,
+        },
+        {
+            "daily_bias": "NEUTRAL",
+            "h4_structure": {
+                "state": "ASCENDING_SUPPORT",
+                "direction": "LONG",
+                "support": 97.0,
+                "resistance": 100.8,
+            },
+            "h1_structure": {
+                "support": 98.5,
+                "resistance": 100.8,
+            },
+            "h1_trigger": {
+                "direction": "LONG",
+                "state": "RETEST",
+                "support": 98.5,
+                "resistance": 100.8,
+            },
+            "h1_pullback": {
+                "direction": "LONG",
+                "state": "HEALTHY_PULLBACK",
+            },
+            "entry_levels": {
+                "long": {
+                    "h1_support": {
+                        "low": 99.5,
+                        "high": 100.5,
+                        "price": 100.0,
+                    },
+                },
+            },
+            "summary": "low structure room",
+        },
+    )
+
+    assert adjusted["score_before_entry_quality"] == 80
+    assert adjusted["entry_quality_score"] == 0
+    assert adjusted["effective_risk_reward"] < 1.0
+    assert adjusted["entry_quality_status"] == "STRUCTURE_ROOM_BELOW_1R"
+    assert adjusted["action"] == SignalAction.WATCH.value
+
+
+def test_entry_quality_is_symmetric_for_short_structure() -> None:
+    assessment = _entry_quality_assessment(
+        {
+            "action": SignalAction.ENTRY_SHORT.value,
+            "candidate_action": SignalAction.ENTRY_SHORT.value,
+            "score": 80,
+            "price": 100.0,
+            "risk_state": "NORMAL",
+            "vetoes": (),
+            "h4_direction": "SHORT",
+            "direction_gate": "SHORT_ONLY",
+            "setup_type": "H1_PULLBACK_SHORT",
+            "h4_structure": {
+                "direction": "SHORT",
+                "support": 94.0,
+                "resistance": 103.0,
+            },
+            "h1_structure": {
+                "support": 95.5,
+                "resistance": 101.5,
+            },
+            "h1_trigger": {
+                "direction": "SHORT",
+                "state": "RETEST",
+                "support": 95.5,
+                "resistance": 101.5,
+            },
+            "entry_levels": {
+                "short": {
+                    "h1_resistance": {
+                        "low": 99.5,
+                        "high": 100.5,
+                        "price": 100.0,
+                    },
+                },
+            },
+        },
+        PositionSide.SHORT,
+    )
+
+    assert assessment["entry_quality_status"] == "QUALIFIED"
+    assert assessment["entry_quality_score"] == 12
+    assert assessment["effective_risk_reward"] >= 2.0
+
+
+def test_live_price_refresh_removes_and_restores_entry_quality_score() -> None:
+    signal = _apply_multi_timeframe_context(
+        {
+            "action": SignalAction.WATCH.value,
+            "candidate_action": SignalAction.ENTRY_LONG.value,
+            "score": 43,
+            "price": 100.0,
+            "reasons": (),
+            "vetoes": (),
+            "risk_state": "NORMAL",
+            "trend_state": "TREND_LONG",
+            "setup_type": SETUP_H1_PULLBACK_LONG,
+        },
+        {
+            "daily_bias": "NEUTRAL",
+            "h4_structure": {
+                "state": "ASCENDING_SUPPORT",
+                "direction": "LONG",
+                "support": 97.0,
+                "resistance": 106.0,
+            },
+            "h1_structure": {
+                "support": 98.5,
+                "resistance": 104.5,
+            },
+            "h1_trigger": {
+                "direction": "LONG",
+                "state": "RETEST",
+                "support": 98.5,
+                "resistance": 104.5,
+            },
+            "h1_pullback": {
+                "direction": "LONG",
+                "state": "HEALTHY_PULLBACK",
+            },
+            "entry_levels": {
+                "long": {
+                    "h1_support": {
+                        "low": 99.5,
+                        "high": 100.5,
+                        "price": 100.0,
+                    },
+                },
+            },
+            "summary": "live entry quality",
+        },
+    )
+    assert signal["score"] == 83
+    assert signal["action"] == SignalAction.ENTRY_LONG.value
+
+    signal["price"] = 102.0
+    _refresh_entry_quality_for_live_price(signal)
+
+    assert signal["score"] == 71
+    assert signal["entry_quality_score"] == 0
+    assert signal["entry_quality_status"] == "OUTSIDE_ENTRY_ZONE"
+    assert signal["action"] == SignalAction.WATCH.value
+    assert SCORE_FAMILY_ENTRY_QUALITY not in signal[
+        "score_evidence_families"
+    ]
+
+    signal["price"] = 100.0
+    _refresh_entry_quality_for_live_price(signal)
+
+    assert signal["score"] == 83
+    assert signal["entry_quality_score"] == 12
+    assert signal["action"] == SignalAction.ENTRY_LONG.value
+
+
+def test_entry_quality_bonus_does_not_upgrade_position_size_band() -> None:
+    promoted = {
+        "score": 102,
+        "score_before_entry_quality": 90,
+    }
+    newly_eligible = {
+        "score": 83,
+        "score_before_entry_quality": 71,
+    }
+
+    assert _position_policy_score(promoted) == 90
+    assert _entry_quality_grade(
+        score=_position_policy_score(promoted)
+    ) == "A"
+    assert _position_policy_score(newly_eligible) == 80
+    assert _entry_quality_grade(
+        score=_position_policy_score(newly_eligible)
+    ) == "A"
 
 
 def test_multi_timeframe_score_deduplicates_evidence_across_families() -> None:

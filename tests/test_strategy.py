@@ -147,6 +147,14 @@ def test_strategy_emits_long_when_score_is_strong() -> None:
     previous = indicators[-2]
     current = indicators[-1]
     indicators[-2] = replace(previous, close=(previous.boll_mid or previous.close) - 0.1)
+    indicators[-2] = replace(
+        indicators[-2],
+        oi_change=0.003,
+        long_short_ratio=1.19,
+        taker_buy_sell_ratio=1.10,
+        top_account_long_short_ratio=1.08,
+        top_position_long_short_ratio=1.15,
+    )
     indicators[-1] = replace(
         current,
         close=current.boll_mid + 0.2 if current.boll_mid else current.close,
@@ -169,6 +177,7 @@ def test_strategy_emits_long_when_score_is_strong() -> None:
         SCORE_FAMILY_MA_POSITION: 20,
     }
     assert signal.participant_flow_state == "NEW_LONG_BUILD"
+    assert signal.participant_flow_confirmed_bars == 2
 
 
 def test_strategy_downgrades_but_does_not_block_after_upper_wick_sweep() -> None:
@@ -369,13 +378,10 @@ def test_participant_flow_detects_crowd_short_trap_without_stacking() -> None:
             indicators[idx],
             long_short_ratio=ratio,
             oi_change=0.004,
+            taker_buy_sell_ratio=1.12,
+            top_account_long_short_ratio=1.08,
+            top_position_long_short_ratio=1.18,
         )
-    indicators[-1] = replace(
-        indicators[-1],
-        taker_buy_sell_ratio=1.12,
-        top_account_long_short_ratio=1.08,
-        top_position_long_short_ratio=1.18,
-    )
 
     assessment = _participant_flow_assessment(
         candles,
@@ -387,6 +393,7 @@ def test_participant_flow_detects_crowd_short_trap_without_stacking() -> None:
     assert assessment.long_score == 15
     assert assessment.short_score == 0
     assert assessment.short_veto
+    assert assessment.confirmed_bars == 3
 
 
 def test_participant_flow_detects_crowd_long_trap_for_short() -> None:
@@ -402,13 +409,10 @@ def test_participant_flow_detects_crowd_long_trap_for_short() -> None:
             close=close,
             long_short_ratio=ratio,
             oi_change=0.004,
+            taker_buy_sell_ratio=0.90,
+            top_account_long_short_ratio=0.92,
+            top_position_long_short_ratio=0.82,
         )
-    indicators[-1] = replace(
-        indicators[-1],
-        taker_buy_sell_ratio=0.90,
-        top_account_long_short_ratio=0.92,
-        top_position_long_short_ratio=0.82,
-    )
 
     assessment = _participant_flow_assessment(
         candles,
@@ -420,18 +424,20 @@ def test_participant_flow_detects_crowd_long_trap_for_short() -> None:
     assert assessment.short_score == 15
     assert assessment.long_score == 0
     assert assessment.long_veto
+    assert assessment.confirmed_bars == 3
 
 
 def test_participant_flow_missing_top_data_caps_score_at_ten() -> None:
     candles, derivatives = _trending_market()
     indicators = build_indicators(candles, derivatives)
-    indicators[-1] = replace(
-        indicators[-1],
-        oi_change=0.004,
-        taker_buy_sell_ratio=1.12,
-        top_account_long_short_ratio=None,
-        top_position_long_short_ratio=None,
-    )
+    for index in (-2, -1):
+        indicators[index] = replace(
+            indicators[index],
+            oi_change=0.004,
+            taker_buy_sell_ratio=1.12,
+            top_account_long_short_ratio=None,
+            top_position_long_short_ratio=None,
+        )
 
     assessment = _participant_flow_assessment(
         candles,
@@ -442,6 +448,37 @@ def test_participant_flow_missing_top_data_caps_score_at_ten() -> None:
     assert assessment.state == "NEW_LONG_BUILD"
     assert assessment.long_score == 10
     assert assessment.confidence == "MEDIUM"
+    assert assessment.confirmed_bars == 2
+
+
+def test_single_bar_participant_flow_is_weak_and_cannot_veto() -> None:
+    candles, derivatives = _trending_market()
+    indicators = build_indicators(candles, derivatives)
+    indicators[-2] = replace(
+        indicators[-2],
+        long_short_ratio=1.20,
+        oi_change=0.0,
+        taker_buy_sell_ratio=None,
+    )
+    indicators[-1] = replace(
+        indicators[-1],
+        long_short_ratio=1.10,
+        oi_change=0.004,
+        taker_buy_sell_ratio=1.12,
+        top_account_long_short_ratio=1.08,
+        top_position_long_short_ratio=1.18,
+    )
+
+    assessment = _participant_flow_assessment(
+        candles,
+        indicators,
+        StrategySettings(),
+    )
+
+    assert assessment.state == "NEW_LONG_BUILD"
+    assert assessment.long_score == 6
+    assert assessment.short_veto == ""
+    assert assessment.confirmed_bars == 1
 
 
 def test_raw_volume_alone_does_not_create_a_positive_trigger_family() -> None:

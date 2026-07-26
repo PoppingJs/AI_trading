@@ -113,6 +113,7 @@ class StrategySignal:
     score_evidence_families: tuple[tuple[str, int], ...] = ()
     participant_flow_state: str = "NEUTRAL"
     participant_flow_score: int = 0
+    participant_flow_confirmed_bars: int = 0
     participant_flow_reason: str = ""
 
 

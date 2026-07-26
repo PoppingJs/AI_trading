@@ -23,8 +23,11 @@ SCORE_FAMILY_MA_POSITION = "MA_POSITION"
 SCORE_FAMILY_DERIVATIVES = "DERIVATIVES"
 SCORE_FAMILY_DIRECTION = "DIRECTION"
 SCORE_FAMILY_TRIGGER = "TRIGGER"
+SCORE_FAMILY_ENTRY_QUALITY = "ENTRY_QUALITY"
 TAKER_FLOW_CONFIRM_RATIO = 1.05
 PARTICIPANT_RATIO_CHANGE_THRESHOLD = 0.02
+PARTICIPANT_FLOW_LOOKBACK_BARS = 3
+PARTICIPANT_FLOW_PERSISTENT_BARS = 2
 
 
 def apply_positive_evidence_family(
@@ -133,6 +136,9 @@ class CompositeStrategy:
                     participant_flow_score=best_participant_flow.score_for(
                         direction
                     ),
+                    participant_flow_confirmed_bars=(
+                        best_participant_flow.confirmed_bars
+                    ),
                     participant_flow_reason=best_participant_flow.reason,
                 )
             return StrategySignal(
@@ -155,6 +161,9 @@ class CompositeStrategy:
                 participant_flow_score=best_participant_flow.score_for(
                     direction
                 ),
+                participant_flow_confirmed_bars=(
+                    best_participant_flow.confirmed_bars
+                ),
                 participant_flow_reason=best_participant_flow.reason,
             )
 
@@ -175,6 +184,9 @@ class CompositeStrategy:
                 participant_flow_score=best_participant_flow.score_for(
                     direction
                 ),
+                participant_flow_confirmed_bars=(
+                    best_participant_flow.confirmed_bars
+                ),
                 participant_flow_reason=best_participant_flow.reason,
             )
 
@@ -194,6 +206,9 @@ class CompositeStrategy:
             score_evidence_families=frozen_evidence_families,
             participant_flow_state=best_participant_flow.state,
             participant_flow_score=best_participant_flow.score_for(direction),
+            participant_flow_confirmed_bars=(
+                best_participant_flow.confirmed_bars
+            ),
             participant_flow_reason=best_participant_flow.reason,
         )
 
@@ -693,6 +708,7 @@ class ParticipantFlowAssessment:
     short_veto: str = ""
     reason: str = ""
     confidence: str = "NONE"
+    confirmed_bars: int = 0
 
     def score_for(self, side: PositionSide) -> int:
         return (
@@ -727,247 +743,292 @@ def _participant_flow_assessment(
     indicators: Sequence[IndicatorSnapshot],
     settings: StrategySettings,
 ) -> ParticipantFlowAssessment:
-    """Classify one participant-flow state; never stack raw derivatives fields."""
+    """Classify one non-stacking flow state from the latest closed bars."""
 
-    if len(candles) < 2 or len(indicators) < 2:
+    sample_size = min(
+        PARTICIPANT_FLOW_LOOKBACK_BARS,
+        len(candles) - 1,
+        len(indicators) - 1,
+    )
+    if sample_size < 1:
         return ParticipantFlowAssessment(
             reason="参与者行为数据不足，衍生品证据不加分",
         )
 
-    current = indicators[-1]
-    lookback = min(4, len(candles), len(indicators))
-    first_close = candles[-lookback].close
-    price_change = (
-        (candles[-1].close - first_close) / first_close
-        if first_close
-        else 0.0
-    )
-    price_up = price_change > 0
-    price_down = price_change < 0
-    crowd_change = _indicator_field_change(
-        indicators[-lookback:],
-        "long_short_ratio",
-    )
-    oi_window_change = _oi_change_over_window(indicators, lookback)
-    oi_change = current.oi_change
-    oi_building = (
-        (
-            oi_change is not None
-            and oi_change >= settings.oi_mild_change_min
-        )
-        or (
-            oi_window_change is not None
-            and oi_window_change >= settings.smart_money_oi_rebuild
-        )
-    )
-    oi_unwinding = (
-        (
-            oi_change is not None
-            and oi_change <= -settings.wash_oi_drop_min
-        )
-        or (
-            oi_window_change is not None
-            and oi_window_change <= -settings.smart_money_oi_rebuild
-        )
-    )
-    oi_not_unwinding = (
-        oi_change is not None
-        and oi_change > -settings.wash_oi_drop_min
-    )
-    taker_ratio = current.taker_buy_sell_ratio
-    taker_buying = (
-        taker_ratio is not None
-        and taker_ratio >= TAKER_FLOW_CONFIRM_RATIO
-    )
-    taker_selling = (
-        taker_ratio is not None
-        and taker_ratio <= 1 / TAKER_FLOW_CONFIRM_RATIO
-    )
-    crowd_shorts_increasing = (
-        crowd_change
-        <= -PARTICIPANT_RATIO_CHANGE_THRESHOLD
-    )
-    crowd_longs_increasing = (
-        crowd_change
-        >= PARTICIPANT_RATIO_CHANGE_THRESHOLD
-    )
-    top_position = current.top_position_long_short_ratio
-    top_account = current.top_account_long_short_ratio
-    top_position_long = (
-        top_position is not None and top_position > 1.0
-    )
-    top_position_short = (
-        top_position is not None and top_position < 1.0
-    )
-    top_account_hint = (
-        "；大户账户方向同步"
+    rows: list[dict[str, object]] = []
+    start = len(candles) - sample_size
+    for index in range(start, len(candles)):
+        candle = candles[index]
+        previous_candle = candles[index - 1]
+        indicator = indicators[index]
+        previous_indicator = indicators[index - 1]
+        oi_change = indicator.oi_change
         if (
-            top_account is not None
-            and (
-                (top_position_long and top_account > 1.0)
-                or (top_position_short and top_account < 1.0)
-            )
+            oi_change is None
+            and indicator.open_interest is not None
+            and previous_indicator.open_interest
+        ):
+            oi_change = (
+                indicator.open_interest
+                - previous_indicator.open_interest
+            ) / previous_indicator.open_interest
+        crowd_change: float | None = None
+        if (
+            indicator.long_short_ratio is not None
+            and previous_indicator.long_short_ratio
+        ):
+            crowd_change = (
+                indicator.long_short_ratio
+                - previous_indicator.long_short_ratio
+            ) / previous_indicator.long_short_ratio
+        taker_ratio = indicator.taker_buy_sell_ratio
+        rows.append(
+            {
+                "price_up": candle.close > previous_candle.close,
+                "price_down": candle.close < previous_candle.close,
+                "oi_building": (
+                    oi_change is not None
+                    and oi_change >= settings.oi_mild_change_min
+                ),
+                "oi_unwinding": (
+                    oi_change is not None
+                    and oi_change <= -settings.wash_oi_drop_min
+                ),
+                "oi_not_unwinding": (
+                    oi_change is not None
+                    and oi_change > -settings.wash_oi_drop_min
+                ),
+                "taker_buying": (
+                    taker_ratio is not None
+                    and taker_ratio >= TAKER_FLOW_CONFIRM_RATIO
+                ),
+                "taker_selling": (
+                    taker_ratio is not None
+                    and taker_ratio <= 1 / TAKER_FLOW_CONFIRM_RATIO
+                ),
+                "crowd_change": crowd_change,
+                "top_position": indicator.top_position_long_short_ratio,
+                "top_account": indicator.top_account_long_short_ratio,
+            }
         )
+
+    def trailing_count(field_names: tuple[str, ...]) -> int:
+        count = 0
+        for row in reversed(rows):
+            if all(bool(row.get(field)) for field in field_names):
+                count += 1
+            else:
+                break
+        return count
+
+    def crowd_trap(row: dict[str, object], side: str) -> bool:
+        change = row.get("crowd_change")
+        if not isinstance(change, (int, float)):
+            return False
+        if side == "LONG":
+            return change <= -PARTICIPANT_RATIO_CHANGE_THRESHOLD
+        return change >= PARTICIPANT_RATIO_CHANGE_THRESHOLD
+
+    def crowd_not_chasing(row: dict[str, object], side: str) -> bool:
+        change = row.get("crowd_change")
+        if not isinstance(change, (int, float)):
+            return False
+        if side == "LONG":
+            return change < PARTICIPANT_RATIO_CHANGE_THRESHOLD
+        return change > -PARTICIPANT_RATIO_CHANGE_THRESHOLD
+
+    def top_alignment(row: dict[str, object], side: str) -> str:
+        value = row.get("top_position")
+        if not isinstance(value, (int, float)):
+            return "MISSING"
+        if side == "LONG":
+            return "ALIGNED" if value > 1.0 else "CONFLICT"
+        return "ALIGNED" if value < 1.0 else "CONFLICT"
+
+    long_count = trailing_count(
+        ("price_up", "oi_building", "taker_buying")
+    )
+    short_count = trailing_count(
+        ("price_down", "oi_building", "taker_selling")
+    )
+    side = (
+        "LONG"
+        if long_count > 0
+        else "SHORT"
+        if short_count > 0
         else ""
     )
+    confirmed_bars = long_count if side == "LONG" else short_count
 
-    def directional_score(side: str) -> tuple[int, str]:
+    if confirmed_bars >= PARTICIPANT_FLOW_PERSISTENT_BARS:
+        confirmed_rows = rows[-confirmed_bars:]
+        top_states = [
+            top_alignment(row, side)
+            for row in confirmed_rows
+        ]
+        if "CONFLICT" in top_states:
+            return ParticipantFlowAssessment(
+                state="PARTICIPANT_CONFLICT",
+                reason="参与者行为冲突：连续主动成交方向与大户持仓方向不一致，不加分",
+                confidence="CONFLICT",
+                confirmed_bars=confirmed_bars,
+            )
+        trap_bars = 0
+        for row in reversed(confirmed_rows):
+            if crowd_trap(row, side):
+                trap_bars += 1
+            else:
+                break
+        full_alignment = (
+            all(state == "ALIGNED" for state in top_states)
+            and all(
+                crowd_not_chasing(row, side)
+                for row in confirmed_rows
+            )
+        )
+        points = 15 if full_alignment else 10
+        confidence = "HIGH" if points == 15 else "MEDIUM"
+        missing_note = (
+            ""
+            if points == 15
+            else "；散户或大户持仓数据缺失/未完全同向，按中等置信度计分"
+        )
         if side == "LONG":
-            if top_position_short:
-                return 0, "CONFLICT"
-            if top_position_long:
-                return 15, "HIGH"
-            return 10, "MEDIUM"
-        if top_position_long:
-            return 0, "CONFLICT"
-        if top_position_short:
-            return 15, "HIGH"
-        return 10, "MEDIUM"
-
-    def confidence_suffix(confidence: str) -> str:
-        if confidence == "HIGH":
-            return f"；大户持仓方向同步{top_account_hint}"
-        return "；大户持仓数据缺失，按中等置信度计分"
-
-    if (
-        price_up
-        and oi_building
-        and crowd_shorts_increasing
-        and taker_buying
-    ):
-        points, confidence = directional_score("LONG")
-        if points:
+            trap_confirmed = (
+                trap_bars >= PARTICIPANT_FLOW_PERSISTENT_BARS
+            )
             return ParticipantFlowAssessment(
-                state="CROWD_SHORT_TRAP_CONTINUATION",
+                state=(
+                    "CROWD_SHORT_TRAP_CONTINUATION"
+                    if trap_confirmed
+                    else "NEW_LONG_BUILD"
+                ),
                 long_score=points,
-                short_veto="散户空头继续增加且主动买盘、OI同步增强，禁止逆势做空",
+                short_veto=(
+                    "连续至少2根已收盘K线显示散户空头增加，且价格、OI和主动买盘同步增强，禁止逆势做空"
+                    if trap_confirmed
+                    else ""
+                ),
                 reason=(
-                    "参与者行为：价格上涨、OI增加、散户空头增加且主动买盘占优，存在逼空延续"
-                    f"{confidence_suffix(confidence)}"
+                    f"参与者行为：连续{confirmed_bars}根已收盘K线价格、OI与主动买盘同步增强"
+                    + (
+                        "，散户空头持续增加，存在逼空延续"
+                        if trap_confirmed
+                        else "，识别为新增多头持续建仓"
+                    )
+                    + missing_note
                 ),
                 confidence=confidence,
+                confirmed_bars=confirmed_bars,
+            )
+        trap_confirmed = (
+            trap_bars >= PARTICIPANT_FLOW_PERSISTENT_BARS
+        )
+        return ParticipantFlowAssessment(
+            state=(
+                "CROWD_LONG_TRAP_CONTINUATION"
+                if trap_confirmed
+                else "NEW_SHORT_BUILD"
+            ),
+            short_score=points,
+            long_veto=(
+                "连续至少2根已收盘K线显示散户多头补仓，且价格、OI和主动卖盘同步增强，禁止逆势做多"
+                if trap_confirmed
+                else ""
+            ),
+            reason=(
+                f"参与者行为：连续{confirmed_bars}根已收盘K线价格、OI与主动卖盘同步增强"
+                + (
+                    "，散户多头持续补仓，存在多杀多延续"
+                    if trap_confirmed
+                    else "，识别为新增空头持续建仓"
+                )
+                + missing_note
+            ),
+            confidence=confidence,
+            confirmed_bars=confirmed_bars,
+        )
+
+    current = indicators[-1]
+    current_row = rows[-1]
+    if side:
+        top_state = top_alignment(current_row, side)
+        if top_state == "CONFLICT":
+            return ParticipantFlowAssessment(
+                state="PARTICIPANT_CONFLICT",
+                reason="参与者行为冲突：当前主动成交方向与大户持仓方向不一致，不加分",
+                confidence="CONFLICT",
+                confirmed_bars=1,
+            )
+        lower_reclaim = _lower_sweep_reclaimed(
+            candles[-1],
+            current,
+            settings,
+        )
+        upper_rejection = _upper_sweep_rejected(
+            candles[-1],
+            current,
+            settings,
+        )
+        if side == "LONG":
+            return ParticipantFlowAssessment(
+                state=(
+                    "LONG_ABSORPTION_RECLAIM"
+                    if lower_reclaim
+                    and bool(current_row.get("oi_not_unwinding"))
+                    else "NEW_LONG_BUILD"
+                ),
+                long_score=6,
+                reason=(
+                    "参与者行为：当前已收盘K线出现下影收回与主动买盘承接"
+                    if lower_reclaim
+                    else "参与者行为：当前已收盘K线价格、OI与主动买盘同向，等待连续确认"
+                ),
+                confidence="LOW",
+                confirmed_bars=1,
             )
         return ParticipantFlowAssessment(
-            state="PARTICIPANT_CONFLICT",
-            reason="参与者行为冲突：逼空特征与大户持仓方向相反，不加分",
-            confidence="CONFLICT",
+            state=(
+                "SHORT_ABSORPTION_REJECTION"
+                if upper_rejection
+                and bool(current_row.get("oi_not_unwinding"))
+                else "NEW_SHORT_BUILD"
+            ),
+            short_score=6,
+            reason=(
+                "参与者行为：当前已收盘K线出现上影回落与主动卖盘压制"
+                if upper_rejection
+                else "参与者行为：当前已收盘K线价格、OI与主动卖盘同向，等待连续确认"
+            ),
+            confidence="LOW",
+            confirmed_bars=1,
         )
 
     if (
-        price_down
-        and oi_building
-        and crowd_longs_increasing
-        and taker_selling
+        bool(current_row.get("price_up"))
+        and bool(current_row.get("oi_unwinding"))
     ):
-        points, confidence = directional_score("SHORT")
-        if points:
-            return ParticipantFlowAssessment(
-                state="CROWD_LONG_TRAP_CONTINUATION",
-                short_score=points,
-                long_veto="散户多头继续补仓且主动卖盘、OI同步增强，禁止逆势做多",
-                reason=(
-                    "参与者行为：价格下跌、OI增加、散户多头增加且主动卖盘占优，存在多杀多延续"
-                    f"{confidence_suffix(confidence)}"
-                ),
-                confidence=confidence,
-            )
-        return ParticipantFlowAssessment(
-            state="PARTICIPANT_CONFLICT",
-            reason="参与者行为冲突：多杀多特征与大户持仓方向相反，不加分",
-            confidence="CONFLICT",
-        )
-
-    lower_reclaim = _lower_sweep_reclaimed(
-        candles[-1],
-        current,
-        settings,
-    )
-    upper_rejection = _upper_sweep_rejected(
-        candles[-1],
-        current,
-        settings,
-    )
-    if lower_reclaim and taker_buying and oi_not_unwinding:
-        points, confidence = directional_score("LONG")
-        if points:
-            return ParticipantFlowAssessment(
-                state="LONG_ABSORPTION_RECLAIM",
-                long_score=points,
-                reason=(
-                    "参与者行为：下影扫盘后快速收回，主动买盘承接且OI未流失，支持多头吸收"
-                    f"{confidence_suffix(confidence)}"
-                ),
-                confidence=confidence,
-            )
-    if upper_rejection and taker_selling and oi_not_unwinding:
-        points, confidence = directional_score("SHORT")
-        if points:
-            return ParticipantFlowAssessment(
-                state="SHORT_ABSORPTION_REJECTION",
-                short_score=points,
-                reason=(
-                    "参与者行为：上影扫盘后快速回落，主动卖盘压制且OI未流失，支持空头吸收"
-                    f"{confidence_suffix(confidence)}"
-                ),
-                confidence=confidence,
-            )
-
-    if price_up and oi_building and taker_buying:
-        points, confidence = directional_score("LONG")
-        if points:
-            return ParticipantFlowAssessment(
-                state="NEW_LONG_BUILD",
-                long_score=points,
-                reason=(
-                    "参与者行为：价格、OI与主动买盘同步增强，识别为新增多头建仓"
-                    f"{confidence_suffix(confidence)}"
-                ),
-                confidence=confidence,
-            )
-    if price_down and oi_building and taker_selling:
-        points, confidence = directional_score("SHORT")
-        if points:
-            return ParticipantFlowAssessment(
-                state="NEW_SHORT_BUILD",
-                short_score=points,
-                reason=(
-                    "参与者行为：价格、OI与主动卖盘同步增强，识别为新增空头建仓"
-                    f"{confidence_suffix(confidence)}"
-                ),
-                confidence=confidence,
-            )
-
-    if price_up and oi_unwinding:
         return ParticipantFlowAssessment(
             state="SHORT_COVERING_REBOUND",
             long_score=6,
-            reason="参与者行为：价格上涨但OI下降，更像空头回补，仅提供弱多头证据",
+            reason="参与者行为：当前已收盘K线价格上涨但OI下降，更像空头回补，仅提供弱多头证据",
             confidence="LOW",
+            confirmed_bars=1,
         )
-    if price_down and oi_unwinding:
+    if (
+        bool(current_row.get("price_down"))
+        and bool(current_row.get("oi_unwinding"))
+    ):
         return ParticipantFlowAssessment(
             state="LONG_LIQUIDATION_DROP",
             short_score=6,
-            reason="参与者行为：价格下跌且OI下降，更像多头去杠杆，仅提供弱空头证据",
+            reason="参与者行为：当前已收盘K线价格下跌且OI下降，更像多头去杠杆，仅提供弱空头证据",
             confidence="LOW",
-        )
-
-    if (
-        taker_ratio is not None
-        and top_position is not None
-        and (
-            (taker_buying and top_position_short)
-            or (taker_selling and top_position_long)
-        )
-    ):
-        return ParticipantFlowAssessment(
-            state="PARTICIPANT_CONFLICT",
-            reason="参与者行为冲突：主动成交方向与大户持仓方向不一致，不加分",
-            confidence="CONFLICT",
+            confirmed_bars=1,
         )
     return ParticipantFlowAssessment(
         state="NEUTRAL",
-        reason="参与者行为未形成一致证据，衍生品族不加分",
+        reason="参与者行为未形成连续一致证据，衍生品族不加分",
         confidence="NONE",
     )
 

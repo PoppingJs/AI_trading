@@ -262,6 +262,9 @@ def _signal_payload(signal) -> dict[str, object]:
         ),
         "participant_flow_state": signal.participant_flow_state,
         "participant_flow_score": signal.participant_flow_score,
+        "participant_flow_confirmed_bars": (
+            signal.participant_flow_confirmed_bars
+        ),
         "participant_flow_reason": signal.participant_flow_reason,
         "indicators": asdict(signal.indicators) if signal.indicators else None,
     }

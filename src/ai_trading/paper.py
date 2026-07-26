@@ -41,6 +41,7 @@ from ai_trading.models import (
 from ai_trading.strategy import (
     SCORE_FAMILY_DERIVATIVES,
     SCORE_FAMILY_DIRECTION,
+    SCORE_FAMILY_ENTRY_QUALITY,
     SCORE_FAMILY_MA_POSITION,
     SCORE_FAMILY_TRIGGER,
     CompositeStrategy,
@@ -101,7 +102,7 @@ DISTRIBUTION_STAGE_MARKDOWN = "MARKDOWN_ACCELERATION"
 AUTO_ENTRY_MIN_SCORE = ENTRY_QUALITY_A_MIN_SCORE
 CORE_STRUCTURE_SCORE_CAP = AUTO_ENTRY_MIN_SCORE - 1
 MIN_ENTRY_REWARD_R = 1.2
-SCORE_MODEL_VERSION = 4
+SCORE_MODEL_VERSION = 5
 LEGACY_SCORE_MODEL_VERSION = 2
 DIRECTION_H4_BASE_SCORE = 6
 DIRECTION_DAILY_BACKGROUND_SCORE = 3
@@ -1705,15 +1706,13 @@ class PaperTradingEngine:
         for symbol, signal in self.latest_signals.items():
             if self._auto_universe and symbol not in live_symbols:
                 continue
-            score = int(signal.get("score") or 0)
-            if symbol not in self.account.positions and score < AUTO_ENTRY_MIN_SCORE:
-                continue
             price = self.latest_prices.get(symbol)
             if price is None:
                 continue
             _clear_transient_auto_entry_blocks(signal)
             signal["price"] = price
             self._apply_live_m15_overlay(symbol, signal)
+            _refresh_entry_quality_for_live_price(signal)
             _update_entry_position_fields(signal)
             self.account.latest_signals[symbol] = dict(signal)
 
@@ -2317,7 +2316,15 @@ class PaperTradingEngine:
             "score_evidence_families": dict(signal.score_evidence_families),
             "participant_flow_state": signal.participant_flow_state,
             "participant_flow_score": signal.participant_flow_score,
+            "participant_flow_confirmed_bars": (
+                signal.participant_flow_confirmed_bars
+            ),
             "participant_flow_reason": signal.participant_flow_reason,
+            "round_trip_cost_rate": 2
+            * (
+                self.settings.execution.taker_fee_rate
+                + self.settings.execution.slippage_rate
+            ),
         }
         self.latest_signals[symbol] = _apply_multi_timeframe_context(payload, mtf_context)
         self.account.latest_signals[symbol] = dict(self.latest_signals[symbol])
@@ -2410,6 +2417,8 @@ class PaperTradingEngine:
             for symbol, signal in baseline_signals.items()
         }
         for signal in evaluated_signals.values():
+            _clear_transient_auto_entry_blocks(signal)
+            _refresh_entry_quality_for_live_price(signal)
             _update_entry_position_fields(signal)
         if await self._btc_4h_extreme_volatility():
             self.last_error = "BTC 4h extreme volatility; pause new altcoin entries"
@@ -2499,6 +2508,7 @@ class PaperTradingEngine:
             status = self.status()
             equity = float(status["equity"])
             score = int(signal.get("score") or 0)
+            position_policy_score = _position_policy_score(signal)
             try:
                 indicators = self.latest_indicators.get(symbol, [])
                 precision = self.latest_timeframe_contexts.get(symbol, {}).get("m15_precision", {})
@@ -2520,7 +2530,7 @@ class PaperTradingEngine:
                 trend_stage = str(signal.get("trend_stage_phase") or _trend_stage_from_signal(signal, preferred_indicator))
                 initial_leverage = min(
                     _leverage_for_signal(
-                        score,
+                        position_policy_score,
                         self.settings.risk.leverage_max,
                         trend_state,
                         preferred_indicator,
@@ -2687,7 +2697,7 @@ class PaperTradingEngine:
                 signal["exit_plan_status"] = "NORMAL"
                 stop_pct = _entry_stop_pct(entry_price, stop_loss)
                 entry_quality = _entry_quality_grade(
-                    score=score,
+                    score=position_policy_score,
                 )
                 if entry_quality is None:
                     _record_auto_entry_block(
@@ -3917,7 +3927,22 @@ def _entry_context_from_signal(signal: dict[str, object]) -> dict[str, object]:
         "top_position_long_short_ratio",
         "participant_flow_state",
         "participant_flow_score",
+        "participant_flow_confirmed_bars",
         "participant_flow_reason",
+        "entry_quality_score",
+        "entry_quality_status",
+        "entry_quality_reason",
+        "entry_quality_in_zone",
+        "entry_quality_reference_price",
+        "effective_risk_reward",
+        "effective_risk_distance",
+        "effective_reward_distance",
+        "nearest_structure_target",
+        "preview_structure_stop",
+        "preview_structure_stop_basis",
+        "score_before_entry_quality",
+        "score_delta_vs_v4",
+        "v4_action",
         "daily_bias",
         "h4_direction",
         "h4_location",
@@ -4934,7 +4959,7 @@ def _pyramid_allowed(
         return False
     if int(position.metadata.get("adds", 0)) >= PYRAMID_MAX_ADDS:
         return False
-    if int(signal.get("score") or 0) < ENTRY_QUALITY_S_MIN_SCORE:
+    if _score_before_entry_quality(signal) < ENTRY_QUALITY_S_MIN_SCORE:
         return False
     if str(signal.get("risk_state") or "NORMAL") != "NORMAL":
         return False
@@ -5282,6 +5307,311 @@ def _late_stage_risk(
     return False
 
 
+def _entry_quality_assessment(
+    signal: dict[str, object],
+    side: PositionSide,
+) -> dict[str, object]:
+    """Preview the existing exit plan and score only executable entry zones."""
+
+    result: dict[str, object] = {
+        "entry_quality_score": 0,
+        "entry_quality_status": "UNAVAILABLE",
+        "entry_quality_reason": "真实盈亏比暂不可用",
+        "entry_quality_in_zone": False,
+        "entry_quality_reference_price": None,
+        "effective_risk_reward": None,
+        "effective_risk_distance": None,
+        "effective_reward_distance": None,
+        "nearest_structure_target": None,
+        "preview_structure_stop": None,
+        "preview_structure_stop_basis": "",
+        "entry_quality_blocks_entry": False,
+    }
+    current_price = _float_or_none(signal.get("price"))
+    if current_price is None:
+        result["entry_quality_reason"] = "缺少最新可执行价格，真实盈亏比不加分"
+        return result
+    if not _higher_timeframe_direction_established(signal, side):
+        result["entry_quality_status"] = "DIRECTION_PENDING"
+        result["entry_quality_reason"] = "4小时方向未建立，真实盈亏比仅作观察"
+        return result
+
+    timing, _ = _side_entry_timing(side, current_price, signal)
+    in_zone = timing == ENTRY_TIMING_GOOD
+    result["entry_quality_in_zone"] = in_zone
+    reference_price = (
+        current_price
+        if in_zone
+        else _nearest_entry_zone_reference(
+            signal,
+            side,
+            current_price,
+        )
+    )
+    result["entry_quality_reference_price"] = reference_price
+    if reference_price is None:
+        result["entry_quality_status"] = "ENTRY_ZONE_UNAVAILABLE"
+        result["entry_quality_reason"] = "缺少有效建议入场区，真实盈亏比不加分"
+        return result
+
+    timeframe = _entry_timeframe_for_signal(
+        signal,
+        side,
+        reference_price,
+    )
+    stop_price, stop_basis = _preview_structure_stop(
+        signal,
+        side,
+        reference_price,
+        timeframe=timeframe,
+    )
+    result["preview_structure_stop"] = stop_price
+    result["preview_structure_stop_basis"] = stop_basis
+    if stop_price is None:
+        result["entry_quality_status"] = "STOP_UNAVAILABLE"
+        result["entry_quality_reason"] = "缺少有效结构止损，真实盈亏比不加分"
+        return result
+
+    structure_target = _nearest_higher_timeframe_structure_target(
+        signal,
+        side,
+        reference_price,
+    )
+    result["nearest_structure_target"] = structure_target
+    if structure_target is None:
+        result["entry_quality_status"] = "TARGET_UNAVAILABLE"
+        result["entry_quality_reason"] = "缺少1小时/4小时有效结构目标，真实盈亏比不加分"
+        return result
+
+    round_trip_cost_rate = _float_or_none(
+        signal.get("round_trip_cost_rate")
+    )
+    if round_trip_cost_rate is None:
+        execution = AppSettings().execution
+        round_trip_cost_rate = 2 * (
+            execution.taker_fee_rate
+            + execution.slippage_rate
+        )
+    _, planned_tp2 = _take_profits_for_final_stop(
+        signal,
+        side,
+        reference_price,
+        stop_price,
+        timeframe=timeframe,
+        round_trip_cost_rate=round_trip_cost_rate,
+    )
+    profitable_targets = [
+        target
+        for target in (planned_tp2, structure_target)
+        if _target_is_profitable(side, reference_price, target)
+    ]
+    if not profitable_targets:
+        result["entry_quality_status"] = "TARGET_UNAVAILABLE"
+        result["entry_quality_reason"] = "止盈计划没有有效顺势目标，真实盈亏比不加分"
+        return result
+    effective_target = (
+        min(profitable_targets)
+        if side == PositionSide.LONG
+        else max(profitable_targets)
+    )
+    trading_cost = reference_price * max(
+        round_trip_cost_rate,
+        0.0,
+    )
+    risk_distance = (
+        abs(reference_price - stop_price)
+        + trading_cost
+    )
+    reward_distance = max(
+        0.0,
+        (
+            effective_target - reference_price
+            if side == PositionSide.LONG
+            else reference_price - effective_target
+        )
+        - trading_cost,
+    )
+    if risk_distance <= 0:
+        result["entry_quality_status"] = "STOP_UNAVAILABLE"
+        result["entry_quality_reason"] = "结构止损距离无效，真实盈亏比不加分"
+        return result
+    reward_r = reward_distance / risk_distance
+    result["effective_risk_reward"] = reward_r
+    result["effective_risk_distance"] = risk_distance
+    result["effective_reward_distance"] = reward_distance
+
+    if reward_r < 1.0:
+        result["entry_quality_status"] = "STRUCTURE_ROOM_BELOW_1R"
+        result["entry_quality_reason"] = (
+            f"最近结构目标仅提供 {reward_r:.2f}R，保持观察"
+        )
+        result["entry_quality_blocks_entry"] = in_zone
+        return result
+    if not in_zone:
+        result["entry_quality_status"] = "OUTSIDE_ENTRY_ZONE"
+        result["entry_quality_reason"] = (
+            f"预计真实盈亏比 {reward_r:.2f}R，但当前价格未进入建议区，不加分"
+        )
+        return result
+    if signal.get("vetoes"):
+        result["entry_quality_status"] = "VETOED"
+        result["entry_quality_reason"] = "存在有效否决，真实盈亏比不加分"
+        return result
+    if str(signal.get("risk_state") or "NORMAL") != "NORMAL":
+        result["entry_quality_status"] = "RISK_PENDING"
+        result["entry_quality_reason"] = "风险状态不正常，真实盈亏比不加分"
+        return result
+
+    points = (
+        12
+        if reward_r >= 2.0
+        else 8
+        if reward_r >= 1.6
+        else 4
+        if reward_r >= 1.3
+        else 0
+    )
+    result["entry_quality_score"] = points
+    result["entry_quality_status"] = (
+        "QUALIFIED"
+        if points > 0
+        else "BELOW_SCORE_BAND"
+    )
+    result["entry_quality_reason"] = (
+        f"已进入建议区，扣除手续费与滑点后的真实盈亏比为 {reward_r:.2f}R"
+        + (f"，入场质量加 {points} 分" if points else "，未达到1.30R加分线")
+    )
+    return result
+
+
+def _nearest_entry_zone_reference(
+    signal: dict[str, object],
+    side: PositionSide,
+    current_price: float,
+) -> float | None:
+    levels = (
+        signal.get("entry_levels")
+        if isinstance(signal.get("entry_levels"), dict)
+        else {}
+    )
+    side_key = "long" if side == PositionSide.LONG else "short"
+    side_levels = (
+        levels.get(side_key)
+        if isinstance(levels.get(side_key), dict)
+        else {}
+    )
+    candidates: list[float] = []
+    for level in side_levels.values():
+        if not isinstance(level, dict):
+            continue
+        values = [
+            value
+            for value in (
+                _float_or_none(level.get("low")),
+                _float_or_none(level.get("high")),
+                _float_or_none(level.get("price")),
+            )
+            if value is not None
+        ]
+        if values:
+            candidates.append((min(values) + max(values)) / 2)
+    if not candidates:
+        return None
+    return min(
+        candidates,
+        key=lambda value: abs(value - current_price),
+    )
+
+
+def _preview_structure_stop(
+    signal: dict[str, object],
+    side: PositionSide,
+    entry_price: float,
+    *,
+    timeframe: str,
+) -> tuple[float | None, str]:
+    fallback_stop = (
+        entry_price * 0.95
+        if side == PositionSide.LONG
+        else entry_price * 1.05
+    )
+    if timeframe == "15m":
+        precision = (
+            signal.get("m15_precision")
+            if isinstance(signal.get("m15_precision"), dict)
+            else {}
+        )
+        stop = _refine_stop_with_precision(
+            side,
+            fallback_stop,
+            precision,
+            entry_price,
+            None,
+        )
+        if stop != fallback_stop and _entry_stop_error(
+            side,
+            entry_price,
+            stop,
+        ) is None:
+            return stop, "15m_precision_structure"
+        return None, ""
+
+    stop, basis = _refine_stop_with_setup_structure(
+        side,
+        fallback_stop,
+        entry_price,
+        signal,
+        signal,
+        None,
+        timeframe=timeframe,
+    )
+    staged_stop = _refine_stop_with_distribution_stage(
+        side,
+        stop,
+        entry_price,
+        signal,
+        None,
+    )
+    if staged_stop != stop:
+        stop = staged_stop
+        basis = (
+            f"{signal.get('distribution_short_stage')}"
+            "_structure"
+        )
+    if basis == "volatility_fallback":
+        stop, basis = _refine_stop_with_entry_zone(
+            side,
+            stop,
+            entry_price,
+            signal,
+            None,
+        )
+    if (
+        basis == "volatility_fallback"
+        or _entry_stop_error(side, entry_price, stop) is not None
+    ):
+        return None, ""
+    return stop, basis
+
+
+def _nearest_higher_timeframe_structure_target(
+    signal: dict[str, object],
+    side: PositionSide,
+    price: float,
+) -> float | None:
+    candidates = [
+        *(_timeframe_target_candidates(signal, side, price, "1h")),
+        *(_timeframe_target_candidates(signal, side, price, "4h")),
+    ]
+    if not candidates:
+        return None
+    return (
+        min(candidates)
+        if side == PositionSide.LONG
+        else max(candidates)
+    )
+
+
 def _entry_reward_r(
     signal: dict[str, object],
     side: PositionSide,
@@ -5539,6 +5869,111 @@ def _record_auto_entry_block(signal: dict[str, object], reason: str) -> None:
     signal["vetoes"] = tuple(vetoes)
 
 
+def _score_before_entry_quality(signal: dict[str, object]) -> int:
+    value = signal.get("score_before_entry_quality")
+    if isinstance(value, (int, float)):
+        return max(0, int(value))
+    current_score = max(0, int(signal.get("score") or 0))
+    quality_score = (
+        max(0, int(signal.get("entry_quality_score") or 0))
+        if int(signal.get("score_model_version") or 0) >= 5
+        else 0
+    )
+    return max(0, current_score - quality_score)
+
+
+def _position_policy_score(signal: dict[str, object]) -> int:
+    """Keep V4 sizing bands; a newly promoted entry starts in A grade."""
+
+    return max(
+        AUTO_ENTRY_MIN_SCORE,
+        _score_before_entry_quality(signal),
+    )
+
+
+def _refresh_entry_quality_for_live_price(
+    signal: dict[str, object],
+) -> None:
+    """Reprice V5 entry quality without rerunning closed-candle evidence."""
+
+    if int(signal.get("score_model_version") or 0) < 5:
+        return
+    candidate_action = str(
+        signal.get("candidate_action")
+        or signal.get("action")
+        or ""
+    )
+    if candidate_action not in {
+        SignalAction.ENTRY_LONG.value,
+        SignalAction.ENTRY_SHORT.value,
+    }:
+        return
+    side = (
+        PositionSide.LONG
+        if candidate_action == SignalAction.ENTRY_LONG.value
+        else PositionSide.SHORT
+    )
+    previous_reason = str(
+        signal.get("entry_quality_reason") or ""
+    )
+    reasons = [
+        str(reason)
+        for reason in (signal.get("reasons") or ())
+        if str(reason) != previous_reason
+    ]
+    base_score = _score_before_entry_quality(signal)
+    signal["score_before_entry_quality"] = base_score
+    probe = {
+        **signal,
+        "action": candidate_action,
+        "candidate_action": candidate_action,
+        "score": base_score,
+    }
+    assessment = _entry_quality_assessment(probe, side)
+    quality_score = int(
+        assessment.get("entry_quality_score") or 0
+    )
+    signal.update(assessment)
+    signal.pop("entry_quality_blocks_entry", None)
+    signal["score"] = base_score + quality_score
+    signal["score_delta_vs_v4"] = quality_score
+    legacy_score = signal.get("legacy_score")
+    if isinstance(legacy_score, (int, float)):
+        signal["score_delta_vs_legacy"] = (
+            int(signal["score"]) - int(legacy_score)
+        )
+    families = (
+        dict(signal.get("score_evidence_families") or {})
+        if isinstance(signal.get("score_evidence_families"), dict)
+        else {}
+    )
+    if quality_score > 0:
+        families[SCORE_FAMILY_ENTRY_QUALITY] = quality_score
+    else:
+        families.pop(SCORE_FAMILY_ENTRY_QUALITY, None)
+    signal["score_evidence_families"] = dict(
+        sorted(families.items())
+    )
+    reason = str(assessment.get("entry_quality_reason") or "")
+    if reason:
+        reasons.append(reason)
+    signal["reasons"] = tuple(reasons)
+
+    v4_action = str(
+        signal.get("v4_action")
+        or SignalAction.WATCH.value
+    )
+    if bool(assessment.get("entry_quality_blocks_entry")):
+        signal["action"] = SignalAction.WATCH.value
+    elif (
+        quality_score > 0
+        and int(signal["score"]) >= AUTO_ENTRY_MIN_SCORE
+    ):
+        signal["action"] = candidate_action
+    else:
+        signal["action"] = v4_action
+
+
 def _update_entry_position_fields(signal: dict[str, object]) -> None:
     entry_position, reason = _signal_entry_timing(signal)
     signal["entry_timing"] = entry_position
@@ -5791,7 +6226,7 @@ def _assert_valid_exit_plan(
 
 
 def _rotation_candidate_allowed(signal: dict[str, object], indicator: IndicatorSnapshot | None) -> bool:
-    if int(signal.get("score") or 0) < ENTRY_QUALITY_S_MIN_SCORE:
+    if _score_before_entry_quality(signal) < ENTRY_QUALITY_S_MIN_SCORE:
         return False
     if str(signal.get("risk_state") or "NORMAL") != "NORMAL":
         return False
@@ -6901,11 +7336,11 @@ def _position_structure_failed(position: Position, signal: dict[str, object]) ->
     vetoes = tuple(signal.get("vetoes") or ())
     if position.side == PositionSide.LONG:
         opposite_signal = action == SignalAction.ENTRY_SHORT.value or trend == "ONE_WAY_DOWN"
-        trend_lost = trend not in {"TREND_LONG", "ONE_WAY_UP"} and int(signal.get("score") or 0) < 75
+        trend_lost = trend not in {"TREND_LONG", "ONE_WAY_UP"} and _score_before_entry_quality(signal) < 75
         risk_break = risk_state in {"LONG_CROWD", "OI_ABNORMAL", "FUNDING_HOT"}
     else:
         opposite_signal = action == SignalAction.ENTRY_LONG.value or trend == "ONE_WAY_UP"
-        trend_lost = trend not in {"TREND_SHORT", "ONE_WAY_DOWN"} and int(signal.get("score") or 0) < 75
+        trend_lost = trend not in {"TREND_SHORT", "ONE_WAY_DOWN"} and _score_before_entry_quality(signal) < 75
         risk_break = risk_state in {"SHORT_CROWD", "OI_ABNORMAL", "FUNDING_HOT"}
     return opposite_signal or trend_lost or risk_break or bool(vetoes)
 
@@ -6918,7 +7353,7 @@ def _rotation_candidate_strong(signal: dict[str, object]) -> bool:
     return (
         action in {SignalAction.ENTRY_LONG.value, SignalAction.ENTRY_SHORT.value}
         and trend in {"ONE_WAY_UP", "ONE_WAY_DOWN"}
-        and int(signal.get("score") or 0) >= ENTRY_QUALITY_S_MIN_SCORE
+        and _score_before_entry_quality(signal) >= ENTRY_QUALITY_S_MIN_SCORE
         and risk_state == "NORMAL"
         and entry_timing == ENTRY_TIMING_GOOD
         and not signal.get("vetoes")
@@ -9017,6 +9452,10 @@ def _apply_multi_timeframe_context(
             evidence_families[family] = target
         else:
             evidence_families.pop(family, None)
+    # Saved V4 signals may be restored with unknown future fields. Recompute
+    # entry quality from the current price and structure instead of trusting a
+    # stale cached contribution.
+    replace_family_score(SCORE_FAMILY_ENTRY_QUALITY, 0)
     action = str(out.get("candidate_action") or out.get("action") or "")
     daily_bias = str(context.get("daily_bias") or "NEUTRAL")
     h4 = context.get("h4_structure") if isinstance(context.get("h4_structure"), dict) else {}
@@ -9625,10 +10064,71 @@ def _apply_multi_timeframe_context(
             reasons.append(
                 "absolute long/short ratio remains crowded; reversal quality capped at A"
             )
+    score_before_entry_quality = max(0, score)
+    entry_quality: dict[str, object] = {
+        "entry_quality_score": 0,
+        "entry_quality_status": "LEGACY_MODEL",
+        "entry_quality_reason": "",
+        "entry_quality_in_zone": False,
+        "entry_quality_reference_price": None,
+        "effective_risk_reward": None,
+        "effective_risk_distance": None,
+        "effective_reward_distance": None,
+        "nearest_structure_target": None,
+        "preview_structure_stop": None,
+        "preview_structure_stop_basis": "",
+        "entry_quality_blocks_entry": False,
+    }
+    if (
+        _score_model == "hierarchical"
+        and action
+        in {
+            SignalAction.ENTRY_LONG.value,
+            SignalAction.ENTRY_SHORT.value,
+        }
+    ):
+        quality_side = (
+            PositionSide.LONG
+            if action == SignalAction.ENTRY_LONG.value
+            else PositionSide.SHORT
+        )
+        quality_probe = {
+            **stage_probe,
+            "action": action,
+            "candidate_action": action,
+            "score": score_before_entry_quality,
+            "vetoes": tuple(vetoes),
+            "entry_levels": selected_entry_levels,
+            "h4_direction": h4_direction,
+            "direction_gate": direction_gate,
+            "risk_state": risk_state,
+            "trend_stage_phase": trend_stage_phase,
+        }
+        if setup_type:
+            quality_probe["setup_type"] = setup_type
+        entry_quality = _entry_quality_assessment(
+            quality_probe,
+            quality_side,
+        )
+        entry_quality_score = int(
+            entry_quality.get("entry_quality_score") or 0
+        )
+        add_family_score(
+            SCORE_FAMILY_ENTRY_QUALITY,
+            entry_quality_score,
+        )
+        entry_quality_reason = str(
+            entry_quality.get("entry_quality_reason") or ""
+        )
+        if entry_quality_reason:
+            reasons.append(entry_quality_reason)
     final_score = max(0, score)
     out["score"] = final_score
     out["score_evidence_families"] = dict(sorted(evidence_families.items()))
-    if direction_blocked:
+    entry_quality_blocks_entry = bool(
+        entry_quality.get("entry_quality_blocks_entry")
+    )
+    if direction_blocked or entry_quality_blocks_entry:
         out["action"] = SignalAction.WATCH.value
     elif final_score < AUTO_MAIN_POOL_MIN_SCORE:
         out["action"] = SignalAction.NO_TRADE.value
@@ -9683,6 +10183,27 @@ def _apply_multi_timeframe_context(
     out["entry_levels"] = selected_entry_levels
     out["trend_stage_phase"] = trend_stage_phase
     out["entry_pipeline_version"] = 2
+    out.update(entry_quality)
+    out.pop("entry_quality_blocks_entry", None)
+    out["score_before_entry_quality"] = score_before_entry_quality
+    out["score_delta_vs_v4"] = (
+        final_score - score_before_entry_quality
+    )
+    out["v4_action"] = (
+        SignalAction.WATCH.value
+        if direction_blocked
+        else SignalAction.NO_TRADE.value
+        if score_before_entry_quality < AUTO_MAIN_POOL_MIN_SCORE
+        else SignalAction.WATCH.value
+        if score_before_entry_quality < AUTO_ENTRY_MIN_SCORE
+        else action
+        if action
+        in {
+            SignalAction.ENTRY_LONG.value,
+            SignalAction.ENTRY_SHORT.value,
+        }
+        else SignalAction.WATCH.value
+    )
     out["direction_score_breakdown"] = dict(
         direction_score_breakdown
     )
