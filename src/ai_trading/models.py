@@ -115,6 +115,9 @@ class StrategySignal:
     participant_flow_score: int = 0
     participant_flow_confirmed_bars: int = 0
     participant_flow_reason: str = ""
+    direction_decision: str = "UNSPECIFIED"
+    long_score: int | None = None
+    short_score: int | None = None
 
 
 @dataclass

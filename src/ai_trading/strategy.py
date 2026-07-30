@@ -88,7 +88,39 @@ class CompositeStrategy:
         regime = self._detect_regime(current)
         long_score, long_reasons, long_vetoes, long_setup_type = self._score_long(candles, indicators)
         short_score, short_reasons, short_vetoes, short_setup_type = self._score_short(candles, indicators)
-        best_is_long = long_score >= short_score
+        # A setup score is a rankable, closed-candle opportunity score. Keep
+        # the public scale bounded even when several legacy evidence paths
+        # contribute during the compatibility period.
+        long_score = min(100, max(0, int(long_score)))
+        short_score = min(100, max(0, int(short_score)))
+        signal_regime = (
+            MarketRegime.OVERCROWDED
+            if long_vetoes and short_vetoes
+            else regime
+        )
+        if long_score == short_score:
+            tie_reasons = ["long and short scores are tied; no directional edge"]
+            if long_score < self.settings.watch_threshold:
+                tie_reasons.append("score below trading threshold")
+            return StrategySignal(
+                symbol=symbol,
+                timestamp=current.timestamp,
+                action=(
+                    SignalAction.WATCH
+                    if long_score >= self.settings.watch_threshold
+                    else SignalAction.NO_TRADE
+                ),
+                regime=signal_regime,
+                score=long_score,
+                direction=None,
+                direction_decision="TIE",
+                long_score=long_score,
+                short_score=short_score,
+                reasons=tuple(tie_reasons),
+                indicators=current,
+            )
+
+        best_is_long = long_score > short_score
         best_score = long_score if best_is_long else short_score
         best_reasons = long_reasons if best_is_long else short_reasons
         best_vetoes = long_vetoes if best_is_long else short_vetoes
@@ -105,13 +137,9 @@ class CompositeStrategy:
         )
         frozen_evidence_families = tuple(sorted(best_evidence_families.items()))
         direction = PositionSide.LONG if best_is_long else PositionSide.SHORT
+        direction_decision = "LONG_WINS" if best_is_long else "SHORT_WINS"
         opposite_score = short_score if best_is_long else long_score
         direction_score_gap = best_score - opposite_score
-        signal_regime = (
-            MarketRegime.OVERCROWDED
-            if long_vetoes and short_vetoes
-            else regime
-        )
 
         if best_score >= self.settings.score_threshold:
             if direction_score_gap < DIRECTION_SCORE_GAP_FOR_DIRECT_ENTRY:
@@ -122,6 +150,9 @@ class CompositeStrategy:
                     regime=signal_regime,
                     score=best_score,
                     direction=direction,
+                    direction_decision=direction_decision,
+                    long_score=long_score,
+                    short_score=short_score,
                     vetoes=tuple(best_vetoes),
                     reasons=tuple(
                         best_reasons
@@ -152,6 +183,9 @@ class CompositeStrategy:
                 regime=signal_regime,
                 score=best_score,
                 direction=direction,
+                direction_decision=direction_decision,
+                long_score=long_score,
+                short_score=short_score,
                 vetoes=tuple(best_vetoes),
                 reasons=tuple(best_reasons),
                 indicators=current,
@@ -175,6 +209,9 @@ class CompositeStrategy:
                 regime=signal_regime,
                 score=best_score,
                 direction=direction,
+                direction_decision=direction_decision,
+                long_score=long_score,
+                short_score=short_score,
                 vetoes=tuple(best_vetoes),
                 reasons=tuple(best_reasons),
                 indicators=current,
@@ -197,6 +234,9 @@ class CompositeStrategy:
             regime=signal_regime,
             score=best_score,
             direction=direction,
+            direction_decision=direction_decision,
+            long_score=long_score,
+            short_score=short_score,
             vetoes=tuple(best_vetoes),
             reasons=tuple(
                 best_reasons + ["score below trading threshold"]

@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
+import math
 
 from ai_trading.config import RiskSettings
 from ai_trading.models import Candle, IndicatorSnapshot, Position, PositionSide, RiskDecision, SignalAction, StrategySignal
@@ -21,6 +22,9 @@ class TradePlan:
     leverage: int
     risk_factor: float = 1.0
     is_addition: bool = False
+    adverse_cost_rate: float = 0.0
+    # Compatibility field: this is now a maximum-margin cap after risk-based
+    # sizing, never an independent fixed-margin sizing path.
     requested_margin_usdt: float | None = None
 
 
@@ -119,31 +123,16 @@ class PortfolioRiskGate:
         if not plan.is_addition and len(account.open_positions) >= self.settings.max_open_positions:
             return _portfolio_blocked("MAX_POSITIONS", "max open positions reached", open_risk)
 
-        stop_pct = abs(plan.entry_price - plan.stop_price) / plan.entry_price
+        loss_distance = (
+            abs(plan.entry_price - plan.stop_price)
+            + plan.entry_price * max(plan.adverse_cost_rate, 0.0)
+        )
+        stop_pct = loss_distance / plan.entry_price
+        requested_margin: float | None = None
         if plan.requested_margin_usdt is not None:
             requested_margin = max(float(plan.requested_margin_usdt), 0.0)
-            remaining_margin = max(
-                account.equity * self.settings.total_margin_limit - account.used_margin,
-                0.0,
-            )
             if requested_margin <= 0:
                 return _portfolio_blocked("INVALID_TRADE_PLAN", "requested margin must be positive", open_risk)
-            if requested_margin > remaining_margin + 1e-9:
-                return _portfolio_blocked("MARGIN_LIMIT", "portfolio margin limit reached", open_risk)
-            if requested_margin > account.available_balance + 1e-9:
-                return _portfolio_blocked("MARGIN_LIMIT", "available balance is below requested margin", open_risk)
-            notional = requested_margin * plan.leverage
-            planned_risk = notional * stop_pct
-            return PortfolioRiskDecision(
-                allowed=True,
-                quantity=notional / plan.entry_price,
-                notional=notional,
-                margin_required=requested_margin,
-                planned_risk_usdt=planned_risk,
-                risk_budget_usdt=planned_risk,
-                open_risk_before_usdt=open_risk,
-                open_risk_after_usdt=open_risk + planned_risk,
-            )
 
         configured_risk = account.equity * max(self.settings.risk_per_trade, 0.0) * max(plan.risk_factor, 0.0)
         remaining_open_risk = max(
@@ -163,6 +152,8 @@ class PortfolioRiskGate:
             max(account.equity * self.settings.total_margin_limit - account.used_margin, 0.0),
             max(account.available_balance, 0.0),
         )
+        if requested_margin is not None:
+            margin = min(margin, requested_margin)
         if margin <= 0:
             return _portfolio_blocked("MARGIN_LIMIT", "margin limits leave no tradable size", open_risk)
 
@@ -188,6 +179,20 @@ def current_open_risk_usdt(positions: Sequence[Position]) -> float:
             max(position.entry_price - position.stop_price, 0.0)
             if position.side == PositionSide.LONG
             else max(position.stop_price - position.entry_price, 0.0)
+        )
+        entry_context = position.metadata.get("entry_context")
+        try:
+            adverse_cost_rate = (
+                float(entry_context.get("adverse_cost_rate") or 0.0)
+                if isinstance(entry_context, dict)
+                else 0.0
+            )
+        except (TypeError, ValueError):
+            adverse_cost_rate = 0.0
+        if not math.isfinite(adverse_cost_rate):
+            adverse_cost_rate = 0.0
+        loss_distance += (
+            position.entry_price * max(adverse_cost_rate, 0.0)
         )
         total += loss_distance * position.quantity * max(position.remaining_fraction, 0.0)
     return total
@@ -318,10 +323,23 @@ def _portfolio_blocked(
 
 
 def _trade_plan_error(plan: TradePlan) -> str | None:
+    numeric_values = (
+        plan.entry_price,
+        plan.stop_price,
+        plan.take_profit_1,
+        plan.take_profit_2,
+        float(plan.leverage),
+        plan.risk_factor,
+        plan.adverse_cost_rate,
+    )
+    if not all(math.isfinite(float(value)) for value in numeric_values):
+        return "trade plan values must be finite"
     if plan.entry_price <= 0:
         return "entry price must be positive"
     if plan.leverage <= 0:
         return "leverage must be positive"
+    if plan.adverse_cost_rate < 0:
+        return "adverse cost rate must not be negative"
     if plan.side == PositionSide.LONG and plan.stop_price >= plan.entry_price:
         return "long stop must be below entry"
     if plan.side == PositionSide.SHORT and plan.stop_price <= plan.entry_price:

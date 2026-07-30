@@ -17,7 +17,11 @@ from ai_trading.models import (
     PositionSide,
     SignalAction,
 )
-from ai_trading.risk import TradePlan
+from ai_trading.risk import (
+    AccountRiskSnapshot,
+    PortfolioRiskGate,
+    TradePlan,
+)
 from ai_trading.paper import (
     AUTO_ENTRY_MIN_SCORE,
     DISTRIBUTION_STAGE_DESCENDING,
@@ -58,11 +62,13 @@ from ai_trading.paper import (
     _fixed_margin_for_quality,
     _high_distribution_handoff,
     _high_distribution_handoff_exit_reason,
+    _higher_timeframe_direction_established,
     _leverage_for_signal,
     _leverage_for_entry_quality,
     _large_timeframe_wick_rejections,
     _merge_candles,
     _ma_cluster_signal_adjustment,
+    _net_plan_reward_r,
     _one_hour_ema_reliability,
     _paper_account_from_payload,
     _oi_valley_short_exit_reason,
@@ -122,6 +128,162 @@ def test_legacy_paper_state_loads_with_safe_risk_defaults() -> None:
     assert not account.drawdown_locked
     assert account.consecutive_losses == 0
     assert account.cooldown_until is None
+    assert account.market_context_state == {}
+
+
+def test_market_context_risk_states_block_entries_without_affecting_legacy_signals() -> None:
+    base_signal = {
+        "action": SignalAction.ENTRY_LONG.value,
+        "score": 90,
+    }
+
+    assert not _auto_entry_prerequisite_blocks(
+        base_signal,
+        include_entry_position=False,
+    )
+    liquidity_blocks = _auto_entry_prerequisite_blocks(
+        {
+            **base_signal,
+            "market_context": {
+                "liquidity_state": "THIN",
+                "system_risk_state": "NORMAL",
+            },
+        },
+        include_entry_position=False,
+    )
+    system_blocks = _auto_entry_prerequisite_blocks(
+        {
+            **base_signal,
+            "market_context": {
+                "liquidity_state": "NORMAL",
+                "system_risk_state": "STRESS",
+            },
+        },
+        include_entry_position=False,
+    )
+
+    assert (
+        "liquidity state THIN; new entries blocked"
+        in liquidity_blocks
+    )
+    assert (
+        "system risk state STRESS; new entries blocked"
+        in system_blocks
+    )
+    assert not _auto_entry_prerequisite_blocks(
+        {
+            **base_signal,
+            "market_context": {
+                "direction_state": "UNKNOWN",
+                "liquidity_state": "UNKNOWN",
+                "system_risk_state": "UNKNOWN",
+            },
+        },
+        include_entry_position=False,
+    )
+
+
+def test_range_context_keeps_confirmed_range_edge_direction_available() -> None:
+    signal = {
+        "market_context": {"direction_state": "RANGE"},
+        "h4_structure": {
+            "state": "BOX_LOWER_HALF",
+            "direction": "LONG",
+        },
+        "direction_gate": "LONG_ONLY",
+    }
+
+    assert _higher_timeframe_direction_established(
+        signal,
+        PositionSide.LONG,
+    )
+    assert not _higher_timeframe_direction_established(
+        signal,
+        PositionSide.SHORT,
+    )
+
+
+def test_default_risk_boundaries_match_the_conservative_rollout() -> None:
+    risk = AppSettings().risk
+
+    assert risk.risk_per_trade == pytest.approx(0.005)
+    assert risk.total_open_risk_limit == pytest.approx(0.02)
+    assert risk.max_open_positions == 3
+    assert risk.total_margin_limit == pytest.approx(0.50)
+    assert risk.leverage_max == 5
+    assert risk.daily_loss_limit == pytest.approx(0.015)
+    assert risk.max_drawdown_circuit_breaker == pytest.approx(0.08)
+
+
+def test_requested_margin_is_only_a_cap_after_risk_sizing() -> None:
+    settings = AppSettings()
+    decision = PortfolioRiskGate(settings.risk).evaluate(
+        TradePlan(
+            symbol="TESTUSDT",
+            side=PositionSide.LONG,
+            entry_price=100.0,
+            stop_price=99.0,
+            take_profit_1=103.0,
+            take_profit_2=105.0,
+            leverage=5,
+            adverse_cost_rate=0.0014,
+            requested_margin_usdt=500.0,
+        ),
+        AccountRiskSnapshot(
+            equity=1000.0,
+            available_balance=1000.0,
+            used_margin=0.0,
+        ),
+    )
+
+    assert decision.allowed
+    assert decision.margin_required < 500.0
+    assert decision.planned_risk_usdt <= 5.0 + 1e-9
+    assert decision.open_risk_after_usdt <= 20.0 + 1e-9
+
+
+def test_published_tie_signal_keeps_explicit_neutral_direction(
+    monkeypatch,
+) -> None:
+    from ai_trading.models import SETUP_H1_PULLBACK_SHORT
+    from ai_trading.strategy import CompositeStrategy
+
+    monkeypatch.setattr(
+        CompositeStrategy,
+        "_score_long",
+        lambda self, *_: (
+            90,
+            ["long direction"],
+            [],
+            SETUP_H1_PULLBACK_LONG,
+        ),
+    )
+    monkeypatch.setattr(
+        CompositeStrategy,
+        "_score_short",
+        lambda self, *_: (
+            90,
+            ["short direction"],
+            [],
+            SETUP_H1_PULLBACK_SHORT,
+        ),
+    )
+    engine = PaperTradingEngine(
+        AppSettings(),
+        starting_balance=1000,
+        symbols=["TESTUSDT"],
+        market_data=FakeMarketData(),
+    )
+
+    asyncio.run(engine.refresh_once())
+    signal = engine.latest_signals["TESTUSDT"]
+
+    assert signal["action"] == SignalAction.WATCH.value
+    assert signal["direction"] == "NONE"
+    assert signal["direction_decision"] == "TIE"
+    assert signal["candidate_action"] is None
+    assert signal["long_score"] == 90
+    assert signal["short_score"] == 90
 
 
 def test_account_risk_snapshot_latches_daily_loss_and_drawdown() -> None:
@@ -145,7 +307,9 @@ def test_account_risk_snapshot_latches_daily_loss_and_drawdown() -> None:
 
 def test_disabled_paper_loss_breakers_ignore_and_clear_persisted_locks() -> None:
     settings = AppSettings()
-    assert settings.risk.max_drawdown_circuit_breaker == 0.0
+    settings.risk.daily_loss_limit = 0.0
+    settings.risk.weekly_loss_limit = 0.0
+    settings.risk.max_drawdown_circuit_breaker = 0.0
     engine = PaperTradingEngine(
         settings,
         starting_balance=1000,
@@ -198,22 +362,24 @@ def test_status_marks_new_entries_blocked_by_active_weekly_lock() -> None:
     assert "WEEKLY_LOSS_LIMIT" in status["new_entry_block_codes"]
 
 
-def test_manual_risk_entry_rejects_margin_above_single_symbol_limit() -> None:
+def test_manual_risk_entry_caps_margin_at_risk_gated_maximum() -> None:
     engine = PaperTradingEngine(
         AppSettings(),
         starting_balance=1000,
         market_data=FakeMarketData(),
     )
 
-    with pytest.raises(ValueError, match="risk-gated maximum"):
-        asyncio.run(
-            engine.open_position_with_risk(
-                "BTCUSDT",
-                "LONG",
-                margin_usdt=200,
-                leverage=5,
-            )
+    position = asyncio.run(
+        engine.open_position_with_risk(
+            "BTCUSDT",
+            "LONG",
+            margin_usdt=200,
+            leverage=5,
         )
+    )
+
+    assert float(position.metadata["margin_usdt"]) < 200
+    assert float(position.metadata["initial_risk_usdt"]) <= 5.0 + 1e-9
 
 
 def test_three_losing_position_lifecycles_start_cooldown() -> None:
@@ -518,6 +684,50 @@ def test_take_profit_1_partially_closes_and_moves_stop_above_break_even() -> Non
     assert position.stop_price > position.entry_price
 
 
+def test_v2_exit_executes_only_one_stage_per_price_update() -> None:
+    engine = PaperTradingEngine(
+        AppSettings(),
+        starting_balance=1000,
+        market_data=FakeMarketData(),
+    )
+    position = asyncio.run(
+        engine.open_position(
+            "PLANV2USDT",
+            "LONG",
+            margin_usdt=50,
+            leverage=5,
+            stop_loss=98.0,
+            take_profit_1=102.0,
+            take_profit_2=104.0,
+            entry_context={
+                "plan_version": 2,
+                "primary_setup": SETUP_H1_PULLBACK_LONG,
+                "stop_timeframe": "1h",
+            },
+        )
+    )
+    engine.latest_prices[position.symbol] = 104.0
+    engine.latest_signals[position.symbol] = {
+        "trend_state": "CHOP",
+        "risk_state": "NORMAL",
+    }
+
+    engine._manage_open_positions()
+
+    assert position.symbol in engine.account.positions
+    assert position.first_tp_done
+    assert position.metadata["position_stage"] == "TP1_DONE"
+    assert position.remaining_fraction == pytest.approx(0.65)
+    assert engine.account.fills[-1].action == "PARTIAL_CLOSE"
+
+    engine._manage_open_positions()
+
+    assert position.symbol not in engine.account.positions
+    assert engine.account.fills[-1].reason == (
+        "take profit: target 2 reached"
+    )
+
+
 def test_planned_point_eight_r_partial_profit_does_not_wait_for_one_r() -> None:
     engine = PaperTradingEngine(
         AppSettings(),
@@ -797,6 +1007,41 @@ def test_paper_engine_persists_positions_and_fills(tmp_path: Path) -> None:
     )
 
 
+def test_paper_engine_persists_market_context_hysteresis(
+    tmp_path: Path,
+) -> None:
+    from ai_trading.market_context import StateMemory
+
+    state_path = tmp_path / "paper_state.json"
+    engine = PaperTradingEngine(
+        AppSettings(),
+        starting_balance=1000,
+        market_data=FakeMarketData(),
+        state_path=state_path,
+    )
+    observed_at = datetime(2026, 7, 1, tzinfo=UTC)
+    memory = engine.market_context_tracker.states.setdefault(
+        "TESTUSDT",
+        {},
+    ).setdefault("direction_state", StateMemory())
+    memory.update("TREND_LONG", observed_at)
+
+    engine._save_state_unlocked()
+    restored = PaperTradingEngine(
+        AppSettings(),
+        starting_balance=500,
+        market_data=FakeMarketData(),
+        state_path=state_path,
+    )
+    restored_memory = restored.market_context_tracker.states[
+        "TESTUSDT"
+    ]["direction_state"]
+
+    assert restored_memory.pending == "TREND_LONG"
+    assert restored_memory.confirm_count == 1
+    assert restored_memory.last_observed_at == observed_at
+
+
 def test_paper_engine_persists_last_mark_price_for_open_positions(tmp_path: Path) -> None:
     state_path = tmp_path / "paper_state.json"
     market = FakeMarketData()
@@ -883,6 +1128,8 @@ def test_transient_entry_blocks_are_removed_but_strategy_veto_remains() -> None:
             "等待 1H支撑回踩区",
             "已进入建议区，但未处于优势侧",
             "暂无有效建议入场区",
+            "liquidity state THIN; new entries blocked",
+            "system risk state STRESS; new entries blocked",
             "funding rate too hot for long entry",
         ),
         "entry_timing": "BLOCK",
@@ -1834,7 +2081,7 @@ def test_risk_exit_management_waits_until_position_reaches_one_r() -> None:
     assert not _position_profit_management_enabled(position, 99.0)
 
 
-def test_auto_top50_universe_refreshes_symbols() -> None:
+def test_auto_top80_universe_refreshes_symbols_in_turnover_order() -> None:
     engine = PaperTradingEngine(AppSettings(), starting_balance=1000, market_data=FakeMarketData())
     engine.latest_signals["STALEUSDT"] = {"score": 99}
     engine.account.latest_signals["STALEUSDT"] = {"score": 99}
@@ -1844,8 +2091,8 @@ def test_auto_top50_universe_refreshes_symbols() -> None:
     assert engine.symbols == ["AUTO_TOP50"]
     asyncio.run(engine.refresh_universe_if_needed())
 
-    assert len(engine.symbols) == 50
-    assert len(engine._candidate_symbols) == 30
+    assert len(engine.symbols) == 80
+    assert len(engine._candidate_symbols) == 0
     assert "BTCUSDT" not in engine.symbols
     assert "ETHUSDT" not in engine.symbols
     assert "SOLUSDT" not in engine.symbols
@@ -1965,7 +2212,7 @@ def test_periodic_universe_swap_keeps_eligible_old_pool_when_new_warmup_fails() 
     assert engine.symbols == [f"OLD{idx}USDT" for idx in range(30)]
 
 
-def test_auto_main_pool_uses_score_65_regardless_of_signal_action() -> None:
+def test_auto_main_pool_requires_score_strictly_above_65() -> None:
     engine = PaperTradingEngine(
         AppSettings(),
         starting_balance=1000,
@@ -1978,7 +2225,7 @@ def test_auto_main_pool_uses_score_65_regardless_of_signal_action() -> None:
         "BLOCKEDUSDT",
     ]
     engine.latest_signals = {
-        "ENTRYUSDT": {"action": "ENTRY_LONG", "score": 65},
+        "ENTRYUSDT": {"action": "ENTRY_LONG", "score": 66},
         "WATCHUSDT": {"action": "WATCH", "score": 65},
         "LOWUSDT": {"action": "WATCH", "score": 64},
         "BLOCKEDUSDT": {"action": "NO_TRADE", "score": 99},
@@ -1986,8 +2233,8 @@ def test_auto_main_pool_uses_score_65_regardless_of_signal_action() -> None:
 
     engine._rebalance_auto_signal_pools()
 
-    assert engine.symbols == ["BLOCKEDUSDT", "ENTRYUSDT", "WATCHUSDT"]
-    assert engine._candidate_symbols == ["LOWUSDT"]
+    assert engine.symbols == ["ENTRYUSDT", "BLOCKEDUSDT"]
+    assert engine._candidate_symbols == ["WATCHUSDT", "LOWUSDT"]
 
     engine.latest_signals["LOWUSDT"] = {
         "action": "ENTRY_SHORT",
@@ -1996,19 +2243,18 @@ def test_auto_main_pool_uses_score_65_regardless_of_signal_action() -> None:
     engine._rebalance_auto_signal_pools()
 
     assert engine.symbols == [
-        "BLOCKEDUSDT",
-        "LOWUSDT",
         "ENTRYUSDT",
-        "WATCHUSDT",
+        "LOWUSDT",
+        "BLOCKEDUSDT",
     ]
-    assert engine._candidate_symbols == []
+    assert engine._candidate_symbols == ["WATCHUSDT"]
 
 
 @pytest.mark.parametrize(
-    ("score", "expected_action"),
-    [
-        (64, SignalAction.NO_TRADE.value),
-        (65, SignalAction.WATCH.value),
+        ("score", "expected_action"),
+        [
+            (64, SignalAction.NO_TRADE.value),
+            (65, SignalAction.NO_TRADE.value),
         (79, SignalAction.WATCH.value),
         (80, SignalAction.ENTRY_LONG.value),
         (84, SignalAction.ENTRY_LONG.value),
@@ -2036,7 +2282,7 @@ def test_final_score_band_normalizes_signal_action(
     assert signal["action"] == expected_action
 
 
-def test_v5_entry_quality_can_promote_an_in_zone_v4_watch_signal() -> None:
+def test_entry_quality_cannot_promote_a_watch_setup_score() -> None:
     adjusted = _apply_multi_timeframe_context(
         {
             "action": SignalAction.WATCH.value,
@@ -2088,17 +2334,19 @@ def test_v5_entry_quality_can_promote_an_in_zone_v4_watch_signal() -> None:
     )
 
     assert adjusted["score_before_entry_quality"] == 71
-    assert adjusted["entry_quality_score"] == 12
-    assert adjusted["score"] == 83
-    assert adjusted["action"] == SignalAction.ENTRY_LONG.value
+    assert adjusted["entry_quality_score"] == 0
+    assert adjusted["score"] == 71
+    assert adjusted["setup_score"] == 71
+    assert adjusted["action"] == SignalAction.WATCH.value
     assert adjusted["v4_action"] == SignalAction.WATCH.value
-    assert adjusted["score_delta_vs_v4"] == 12
-    assert adjusted["score_model_version"] == 5
-    assert adjusted["score_evidence_families"][
+    assert adjusted["score_delta_vs_v4"] == 0
+    assert adjusted["score_model_version"] == 6
+    assert (
         SCORE_FAMILY_ENTRY_QUALITY
-    ] == 12
+        not in adjusted["score_evidence_families"]
+    )
     assert adjusted["effective_risk_reward"] >= 2.0
-    assert adjusted["entry_state"] == "READY"
+    assert adjusted["entry_state"] == "SCORE_PENDING"
 
 
 def test_entry_quality_estimates_outside_zone_without_scoring() -> None:
@@ -2199,7 +2447,7 @@ def test_known_structure_room_below_one_r_stays_observation() -> None:
     assert adjusted["score_before_entry_quality"] == 80
     assert adjusted["entry_quality_score"] == 0
     assert adjusted["effective_risk_reward"] < 1.0
-    assert adjusted["entry_quality_status"] == "STRUCTURE_ROOM_BELOW_1R"
+    assert adjusted["entry_quality_status"] == "BELOW_MIN_NET_R"
     assert adjusted["action"] == SignalAction.WATCH.value
 
 
@@ -2244,11 +2492,11 @@ def test_entry_quality_is_symmetric_for_short_structure() -> None:
     )
 
     assert assessment["entry_quality_status"] == "QUALIFIED"
-    assert assessment["entry_quality_score"] == 12
+    assert assessment["entry_quality_score"] == 0
     assert assessment["effective_risk_reward"] >= 2.0
 
 
-def test_live_price_refresh_removes_and_restores_entry_quality_score() -> None:
+def test_live_price_refresh_never_changes_setup_score() -> None:
     signal = _apply_multi_timeframe_context(
         {
             "action": SignalAction.WATCH.value,
@@ -2295,8 +2543,8 @@ def test_live_price_refresh_removes_and_restores_entry_quality_score() -> None:
             "summary": "live entry quality",
         },
     )
-    assert signal["score"] == 83
-    assert signal["action"] == SignalAction.ENTRY_LONG.value
+    assert signal["score"] == 71
+    assert signal["action"] == SignalAction.WATCH.value
 
     signal["price"] = 102.0
     _refresh_entry_quality_for_live_price(signal)
@@ -2312,9 +2560,9 @@ def test_live_price_refresh_removes_and_restores_entry_quality_score() -> None:
     signal["price"] = 100.0
     _refresh_entry_quality_for_live_price(signal)
 
-    assert signal["score"] == 83
-    assert signal["entry_quality_score"] == 12
-    assert signal["action"] == SignalAction.ENTRY_LONG.value
+    assert signal["score"] == 71
+    assert signal["entry_quality_score"] == 0
+    assert signal["action"] == SignalAction.WATCH.value
 
 
 def test_entry_quality_bonus_does_not_upgrade_position_size_band() -> None:
@@ -2545,7 +2793,7 @@ def test_ma_cluster_uses_strongest_location_evidence_only() -> None:
     assert not vetoes
 
 
-def test_auto_main_pool_never_exceeds_50_symbols() -> None:
+def test_auto_main_pool_never_exceeds_80_and_excludes_score_65() -> None:
     engine = PaperTradingEngine(
         AppSettings(),
         starting_balance=1000,
@@ -2565,8 +2813,10 @@ def test_auto_main_pool_never_exceeds_50_symbols() -> None:
 
     engine._rebalance_auto_signal_pools()
 
-    assert len(engine.symbols) == 50
-    assert len(engine._candidate_symbols) == 30
+    assert len(engine.symbols) == 79
+    assert engine.symbols[0] == "TEST1USDT"
+    assert engine.symbols[-1] == "TEST79USDT"
+    assert engine._candidate_symbols == ["TEST0USDT"]
     assert set(engine.symbols).isdisjoint(engine._candidate_symbols)
 
 
@@ -2674,8 +2924,8 @@ def test_pool_rotation_keeps_stale_symbols_in_their_existing_pool() -> None:
 
     assert "STALEMAINUSDT" not in engine.symbols
     assert engine.symbols == [
-        "STALECANDIDATEUSDT",
         "FRESHCANDIDATEUSDT",
+        "STALECANDIDATEUSDT",
     ]
 
 
@@ -4688,10 +4938,37 @@ def test_distribution_stages_switch_the_only_eligible_short_entry_zone() -> None
         },
         levels,
     )
-    assert set(stage_3["short"]) == {
-        "h1_boll_mid",
-        "h1_ema20_ema60",
+    assert set(stage_3["short"]) == {"h1_boll_mid"}
+
+
+def test_primary_entry_zone_stays_fixed_when_live_price_changes() -> None:
+    levels = {
+        "short": {
+            "h1_boll_mid": {
+                "low": 99.0,
+                "high": 100.0,
+                "price": 99.5,
+            },
+            "h1_ema20_ema60": {
+                "low": 102.0,
+                "high": 103.0,
+                "price": 102.5,
+            },
+        }
     }
+    signal = {
+        "action": SignalAction.ENTRY_SHORT.value,
+        "distribution_short_stage": DISTRIBUTION_STAGE_MARKDOWN,
+        "primary_entry_zone_key": "h1_boll_mid",
+        "price": 99.5,
+    }
+
+    first = _scored_entry_levels(signal, levels)
+    signal["price"] = 102.5
+    second = _scored_entry_levels(signal, levels)
+
+    assert set(first["short"]) == {"h1_boll_mid"}
+    assert set(second["short"]) == {"h1_boll_mid"}
 
 
 def test_distribution_stage_two_cannot_be_overridden_by_generic_four_hour_ema() -> None:
@@ -5013,7 +5290,7 @@ def test_entry_reward_r_uses_actual_planned_tp2_over_nearer_structure() -> None:
     ) == pytest.approx(1.2)
 
 
-def test_exit_plan_preserves_one_point_two_r_after_trading_costs() -> None:
+def test_exit_plan_never_synthesizes_a_farther_target() -> None:
     take_profit_1, take_profit_2 = _take_profits_for_final_stop(
         {"h1_structure": {"resistance": 100.1}},
         PositionSide.LONG,
@@ -5023,19 +5300,20 @@ def test_exit_plan_preserves_one_point_two_r_after_trading_costs() -> None:
         round_trip_cost_rate=0.001,
     )
 
-    assert take_profit_1 == pytest.approx(100.8)
-    assert _entry_reward_r(
-        {},
+    assert take_profit_1 == pytest.approx(100.1)
+    assert take_profit_2 == pytest.approx(100.1)
+    assert _net_plan_reward_r(
         PositionSide.LONG,
-        price=100.0,
-        stop=99.0,
-        timeframe="1h",
-        planned_target=take_profit_2,
+        100.0,
+        99.0,
+        take_profit_1,
+        take_profit_2,
         round_trip_cost_rate=0.001,
-    ) == pytest.approx(1.2)
+        first_fraction=0.35,
+    ) < 1.3
 
 
-def test_15m_take_profit_is_rebuilt_from_final_15m_stop() -> None:
+def test_15m_execution_uses_real_higher_timeframe_target() -> None:
     signal = {
         "h1_structure": {"resistance": 120.0},
     }
@@ -5048,8 +5326,8 @@ def test_15m_take_profit_is_rebuilt_from_final_15m_stop() -> None:
         timeframe="15m",
     )
 
-    assert take_profit_1 == 101.6
-    assert take_profit_2 == 104.0
+    assert take_profit_1 == 120.0
+    assert take_profit_2 == 120.0
     assert _entry_reward_r(
         signal,
         PositionSide.LONG,
@@ -5057,14 +5335,14 @@ def test_15m_take_profit_is_rebuilt_from_final_15m_stop() -> None:
         98.0,
         timeframe="15m",
         planned_target=take_profit_2,
-    ) == 2.0
+    ) == 10.0
 
 
 @pytest.mark.parametrize(
     ("side", "target", "expected_tp1", "expected_tp2"),
     (
-        (PositionSide.LONG, 100.01, 100.01, 101.2),
-        (PositionSide.SHORT, 99.99, 99.99, 98.8),
+        (PositionSide.LONG, 100.01, 100.01, 100.01),
+        (PositionSide.SHORT, 99.99, 99.99, 99.99),
     ),
 )
 def test_near_structure_target_becomes_partial_not_full_exit(
@@ -5101,7 +5379,7 @@ def test_near_structure_target_becomes_partial_not_full_exit(
     )
 
 
-def test_1h_take_profit_does_not_borrow_a_4h_structure_target() -> None:
+def test_1h_take_profit_can_use_a_real_4h_structure_target() -> None:
     signal = {
         "h4_structure": {"support": 95.0},
     }
@@ -5114,8 +5392,8 @@ def test_1h_take_profit_does_not_borrow_a_4h_structure_target() -> None:
         timeframe="1h",
     )
 
-    assert take_profit_1 == 99.2
-    assert take_profit_2 == 98.0
+    assert take_profit_1 == 95.0
+    assert take_profit_2 == 95.0
 
 
 def test_exit_plan_postcondition_validates_stop_and_take_profit_direction() -> None:
@@ -5349,11 +5627,7 @@ def test_unreliable_1h_long_promotes_entry_stop_and_target_to_4h() -> None:
     adjusted = _apply_multi_timeframe_context(signal, context)
 
     assert adjusted["entry_timeframe_override"] == "4h"
-    assert set(adjusted["entry_levels"]["long"]) == {
-        "h4_support",
-        "h4_boll_mid",
-        "h4_ema20_ema60",
-    }
+    assert set(adjusted["entry_levels"]["long"]) == {"h4_support"}
     assert (
         _entry_timeframe_for_signal(
             adjusted,
@@ -5422,9 +5696,7 @@ def test_unreliable_1h_short_promotes_entry_stop_and_target_to_4h() -> None:
 
     assert adjusted["entry_timeframe_override"] == "4h"
     assert set(adjusted["entry_levels"]["short"]) == {
-        "h4_resistance",
-        "h4_boll_mid",
-        "h4_ema20_ema60",
+        "h4_resistance"
     }
     assert (
         _entry_timeframe_for_signal(
@@ -5689,7 +5961,7 @@ def test_multi_timeframe_context_adjusts_score_and_veto() -> None:
     adjusted = _apply_multi_timeframe_context(signal, context)
     _update_entry_position_fields(adjusted)
 
-    assert adjusted["score"] == 64
+    assert adjusted["score"] == 76
     assert "1h trigger opposes long entry" in adjusted["vetoes"]
     assert "high area without pullback confirmation; wait for 1h/4h pullback before long" in adjusted["vetoes"]
 
@@ -6758,20 +7030,22 @@ def test_auto_trade_caps_positions_and_prefers_highest_scores() -> None:
 
     asyncio.run(engine._auto_trade_once())
 
-    assert len(engine.account.positions) == 4
+    assert len(engine.account.positions) == 3
     assert "TEST0USDT" not in engine.account.positions
     assert set(engine.account.positions) == {
         "TEST1USDT",
         "TEST3USDT",
-        "TEST4USDT",
         "TEST5USDT",
     }
     used_margin = sum(
         float(position.metadata["margin_usdt"])
         for position in engine.account.positions.values()
     )
-    assert used_margin == pytest.approx(950.0, rel=0.01)
-    assert float(engine.account.positions["TEST5USDT"].metadata["margin_usdt"]) == pytest.approx(380.0)
+    assert used_margin <= 1000 * engine.settings.risk.total_margin_limit
+    assert sum(
+        float(position.metadata["initial_risk_usdt"])
+        for position in engine.account.positions.values()
+    ) <= 1000 * engine.settings.risk.total_open_risk_limit + 1e-6
     assert {
         str(position.metadata["entry_context"]["entry_quality"])
         for position in engine.account.positions.values()
@@ -6779,7 +7053,7 @@ def test_auto_trade_caps_positions_and_prefers_highest_scores() -> None:
     assert used_margin <= 1000 * engine.settings.risk.total_margin_limit
 
 
-def test_auto_trade_turns_near_structure_target_into_partial_runner_plan() -> None:
+def test_auto_trade_skips_low_r_target_and_uses_next_valid_setup() -> None:
     settings = AppSettings()
     settings.risk.max_open_positions = 1
     engine = PaperTradingEngine(settings, starting_balance=1000, market_data=FakeMarketData())
@@ -6804,15 +7078,15 @@ def test_auto_trade_turns_near_structure_target_into_partial_runner_plan() -> No
 
     asyncio.run(engine._auto_trade_once())
 
-    assert set(engine.account.positions) == {"HIGHUSDT"}
-    opened = engine.latest_signals["HIGHUSDT"]
-    position = engine.account.positions["HIGHUSDT"]
-    assert opened["entry_timing"] == "GOOD"
-    assert not any("entry reward/risk" in reason for reason in opened.get("vetoes", ()))
-    assert "最近结构目标空间不足；先分批止盈，剩余仓位目标不低于 1.20R" in opened.get("reasons", ())
-    assert position.metadata["leverage"] <= 7
-    assert position.metadata["entry_context"]["entry_reward_r"] == pytest.approx(1.2)
-    assert position.metadata["entry_context"]["entry_structure_reward_r"] < 1.2
+    assert set(engine.account.positions) == {"NEXTUSDT"}
+    blocked = engine.latest_signals["HIGHUSDT"]
+    assert any(
+        "below minimum 1.30R" in reason
+        for reason in blocked.get("vetoes", ())
+    )
+    position = engine.account.positions["NEXTUSDT"]
+    assert position.metadata["leverage"] <= 5
+    assert position.metadata["entry_context"]["net_plan_r"] >= 1.3
 
 
 def test_auto_trade_waits_when_late_stage_structure_reward_is_too_low() -> None:
@@ -6849,13 +7123,13 @@ def test_auto_trade_waits_when_late_stage_structure_reward_is_too_low() -> None:
     asyncio.run(engine._auto_trade_once())
 
     assert not engine.account.positions
-    assert (
-        "trend late stage and structure reward below minimum; wait for a new pullback"
-        in engine.latest_signals["LATEUSDT"]["vetoes"]
+    assert any(
+        "below minimum 1.30R" in reason
+        for reason in engine.latest_signals["LATEUSDT"]["vetoes"]
     )
 
 
-def test_auto_trade_uses_generated_take_profit_when_structure_target_is_unavailable() -> None:
+def test_auto_trade_waits_when_real_structure_target_is_unavailable() -> None:
     engine = PaperTradingEngine(
         AppSettings(),
         starting_balance=1000,
@@ -6881,11 +7155,11 @@ def test_auto_trade_uses_generated_take_profit_when_structure_target_is_unavaila
 
     asyncio.run(engine._auto_trade_once())
 
-    position = engine.account.positions["TESTUSDT"]
-    assert position.take_profit_1 > position.entry_price
-    assert position.take_profit_2 > position.take_profit_1
-    assert position.metadata["entry_context"]["entry_quality"] != "S"
-    assert "entry reward/risk target unavailable" not in engine.latest_signals["TESTUSDT"]["vetoes"]
+    assert "TESTUSDT" not in engine.account.positions
+    assert (
+        "entry reward/risk unavailable: no real 1h/4h structure target"
+        in engine.latest_signals["TESTUSDT"]["vetoes"]
+    )
 
 
 def test_auto_trade_does_not_publish_partially_cleared_vetoes() -> None:
@@ -6927,8 +7201,8 @@ def test_auto_trade_does_not_publish_partially_cleared_vetoes() -> None:
                 }
             },
             "h1_structure": {
-                "resistance_zone_low": 100.5,
-                "resistance": 100.6,
+                "resistance_zone_low": 105.0,
+                "resistance": 106.0,
             },
         }
 
@@ -6994,7 +7268,7 @@ def test_auto_trade_pauses_altcoin_entries_when_btc_4h_is_extreme() -> None:
     assert "BTC 4h extreme volatility; pause new altcoin entries" in engine.latest_signals["TESTUSDT"]["vetoes"]
 
 
-def test_auto_trade_rotates_by_efficiency_instead_of_grade_hierarchy() -> None:
+def test_auto_trade_does_not_rotate_an_existing_position() -> None:
     engine = PaperTradingEngine(AppSettings(), starting_balance=1000, market_data=FakeMarketData())
     engine.latest_prices = {f"TEST{idx}USDT": 100.0 for idx in range(6)}
 
@@ -7029,10 +7303,15 @@ def test_auto_trade_rotates_by_efficiency_instead_of_grade_hierarchy() -> None:
 
     asyncio.run(engine._auto_trade_once())
 
-    assert "TEST0USDT" not in engine.account.positions
-    assert "TEST5USDT" in engine.account.positions
+    assert "TEST0USDT" in engine.account.positions
+    assert "TEST5USDT" not in engine.account.positions
     assert len(engine.account.positions) == 5
-    assert engine.account.fills[-2].reason == "rotation exit: efficiency rotation; symbol=TEST5USDT score=100 current_score=105"
+    assert not any(
+        fill.action == "CLOSE"
+        and fill.symbol == "TEST0USDT"
+        and "rotation" in fill.reason
+        for fill in engine.account.fills
+    )
 
 
 def test_auto_trade_does_not_rotate_for_ordinary_high_score_candidate() -> None:

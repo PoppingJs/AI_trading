@@ -35,6 +35,15 @@ class FuturesSymbol:
     open_price: float | None = None
 
 
+@dataclass(frozen=True)
+class FuturesLiquidity:
+    symbol: str
+    quote_volume: float
+    best_bid: float
+    best_ask: float
+    timestamp: datetime
+
+
 class BinanceFuturesMarketData:
     """Read-only helpers for Binance USDT-M market discovery.
 
@@ -339,6 +348,59 @@ class BinanceFuturesMarketData:
     async def ticker_prices(self, symbols: Iterable[str] | None = None) -> dict[str, float]:
         """Backward-compatible alias that now consistently returns mark prices."""
         return await self.mark_prices(symbols)
+
+    async def liquidity_snapshots(
+        self,
+        symbols: Iterable[str] | None = None,
+    ) -> dict[str, FuturesLiquidity]:
+        """Return 24h quote volume and current best bid/ask in two bulk calls."""
+
+        tickers, books = await asyncio.gather(
+            self._get_json("/fapi/v1/ticker/24hr"),
+            self._get_json("/fapi/v1/ticker/bookTicker"),
+        )
+        ticker_rows = tickers if isinstance(tickers, list) else [tickers]
+        book_rows = books if isinstance(books, list) else [books]
+        wanted = (
+            {str(symbol).upper() for symbol in symbols}
+            if symbols is not None
+            else None
+        )
+        volumes = {
+            str(row.get("symbol") or "").upper(): _optional_float(
+                row.get("quoteVolume")
+            )
+            for row in ticker_rows
+        }
+        books_by_symbol = {
+            str(row.get("symbol") or "").upper(): row
+            for row in book_rows
+        }
+        observed_at = datetime.now(UTC)
+        snapshots: dict[str, FuturesLiquidity] = {}
+        for symbol, row in books_by_symbol.items():
+            if (
+                not symbol
+                or (wanted is not None and symbol not in wanted)
+            ):
+                continue
+            quote_volume = volumes.get(symbol)
+            best_bid = _optional_float(row.get("bidPrice"))
+            best_ask = _optional_float(row.get("askPrice"))
+            if (
+                quote_volume is None
+                or best_bid is None
+                or best_ask is None
+            ):
+                continue
+            snapshots[symbol] = FuturesLiquidity(
+                symbol=symbol,
+                quote_volume=quote_volume,
+                best_bid=best_bid,
+                best_ask=best_ask,
+                timestamp=observed_at,
+            )
+        return snapshots
 
     async def derivatives_bundle(
         self,

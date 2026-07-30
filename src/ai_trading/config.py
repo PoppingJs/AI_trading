@@ -66,15 +66,15 @@ class StrategySettings:
 @dataclass
 class RiskSettings:
     leverage_default: int = 5
-    leverage_max: int = 10
-    risk_per_trade: float = 0.01
+    leverage_max: int = 5
+    risk_per_trade: float = 0.005
     single_symbol_margin_limit: float = 0.10
-    total_margin_limit: float = 0.95
-    total_open_risk_limit: float = 0.04
-    max_open_positions: int = 5
-    daily_loss_limit: float = 0.0
+    total_margin_limit: float = 0.50
+    total_open_risk_limit: float = 0.02
+    max_open_positions: int = 3
+    daily_loss_limit: float = 0.015
     weekly_loss_limit: float = 0.0
-    max_drawdown_circuit_breaker: float = 0.0
+    max_drawdown_circuit_breaker: float = 0.08
     max_consecutive_losses: int = 0
     cooldown_hours: int = 0
     atr_stop_buffer: float = 0.5

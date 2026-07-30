@@ -22,6 +22,19 @@ def test_api_health_and_removed_legacy_surfaces(tmp_path: Path) -> None:
     assert client.get("/review").status_code == 404
 
 
+def test_demo_signal_exposes_explicit_direction_decision(
+    tmp_path: Path,
+) -> None:
+    client = TestClient(create_app(state_path=tmp_path / "paper_state.json"))
+
+    payload = client.get("/api/signals/demo").json()
+
+    assert payload["direction"] in {"LONG", "SHORT", "NONE"}
+    assert "direction_decision" in payload
+    assert "long_score" in payload
+    assert "short_score" in payload
+
+
 def test_api_token_protects_mutating_endpoints(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setenv("AI_TRADING_API_TOKEN", "secret")
     client = TestClient(create_app(state_path=tmp_path / "paper_state.json"))
@@ -91,6 +104,21 @@ def test_realtime_dashboard_reserves_height_for_pnl_time_axis(tmp_path: Path) ->
     assert "const timeLabelY = plotBottom + 8 * dpr;" in page
     assert "data.new_entries_allowed ?? data.auto_trade" in page
     assert "MAX_DRAWDOWN: '最大回撤锁定'" in page
+
+
+def test_realtime_dashboard_reads_split_market_context_states(
+    tmp_path: Path,
+) -> None:
+    client = TestClient(create_app(state_path=tmp_path / "paper_state.json"))
+
+    page = client.get("/").text
+
+    assert "marketDirectionText(s)" in page
+    assert "marketRiskText(s)" in page
+    assert "context.direction_state" in page
+    assert "context.crowding_state" in page
+    assert "context.liquidity_state" in page
+    assert "context.system_risk_state" in page
 
 
 def test_trade_exit_reasons_are_rendered_with_chinese_only_fallbacks(tmp_path: Path) -> None:

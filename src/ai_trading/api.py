@@ -254,6 +254,14 @@ def _signal_payload(signal) -> dict[str, object]:
         "action": signal.action.value if isinstance(signal.action, SignalAction) else signal.action,
         "regime": signal.regime.value,
         "score": signal.score,
+        "direction": (
+            signal.direction.value
+            if signal.direction is not None
+            else "NONE"
+        ),
+        "direction_decision": signal.direction_decision,
+        "long_score": signal.long_score,
+        "short_score": signal.short_score,
         "vetoes": signal.vetoes,
         "reasons": signal.reasons,
         "setup_type": signal.setup_type,
@@ -654,7 +662,30 @@ PAPER_DASHBOARD_HTML = """
       OI_ABNORMAL: 'OI异常',
       FUNDING_HOT: '资金费率过热'
     };
+    const directionStateText = {
+      TREND_LONG: '多头趋势',
+      TREND_SHORT: '空头趋势',
+      RANGE: '震荡',
+      UNKNOWN: '未知'
+    };
+    const crowdingStateText = {
+      NORMAL: '正常',
+      LONG_CROWDED: '多头拥挤',
+      SHORT_CROWDED: '空头拥挤',
+      UNKNOWN: '未知'
+    };
+    const liquidityStateText = {
+      NORMAL: '正常',
+      THIN: '偏薄',
+      UNKNOWN: '未知'
+    };
+    const systemRiskStateText = {
+      NORMAL: '正常',
+      STRESS: '承压',
+      UNKNOWN: '未知'
+    };
     const reasonText = {
+      'long and short scores are tied; no directional edge': '多空评分完全相同，暂无方向优势',
       'score below trading threshold': '评分低于交易阈值',
       'both sides failed hard filters': '多空双方都未通过硬性过滤',
       'not enough candles for MA trend filter': 'K线数量不足，无法计算 MA 趋势过滤',
@@ -975,6 +1006,21 @@ PAPER_DASHBOARD_HTML = """
     function tSmartMoneyPhase(value) { return smartMoneyPhaseText[value] || value || '中性'; }
     function tTrendState(value) { return trendStateText[value] || value || '震荡'; }
     function tRiskState(value) { return riskStateText[value] || value || '正常'; }
+    function marketDirectionText(signal) {
+      const context = signal.market_context;
+      if (context && context.direction_state) {
+        return directionStateText[context.direction_state] || context.direction_state;
+      }
+      return tTrendState(signal.trend_state || signal.regime);
+    }
+    function marketRiskText(signal) {
+      const context = signal.market_context;
+      if (!context) return tRiskState(signal.risk_state);
+      const crowding = crowdingStateText[context.crowding_state] || context.crowding_state || '未知';
+      const liquidity = liquidityStateText[context.liquidity_state] || context.liquidity_state || '未知';
+      const system = systemRiskStateText[context.system_risk_state] || context.system_risk_state || '未知';
+      return `拥挤:${crowding}<br>流动:${liquidity}<br>系统:${system}`;
+    }
     function tReason(value) {
       if (!value) return '';
       const rawReason = String(value);
@@ -1182,6 +1228,8 @@ PAPER_DASHBOARD_HTML = """
       if (vetoText[reason]) return vetoText[reason];
       if (reason === 'directional entry signal not established') return '多/空方向未成立';
       if (reason.startsWith('final score ')) return '评分低于80';
+      if (reason.startsWith('liquidity state ')) return '流动性异常或未知，禁止新开仓';
+      if (reason.startsWith('system risk state ')) return '系统性风险异常或未知，禁止新增风险';
       if (reason.startsWith('等待 ') || reason.startsWith('已进入建议区') || reason === '暂无有效建议入场区') {
         return reason;
       }
@@ -1434,9 +1482,14 @@ PAPER_DASHBOARD_HTML = """
       const rawReasons = reasonList(reasons);
       const action = String(signal.action || '');
       const trend = String(signal.trend_state || signal.regime || '');
-      let direction = '震荡';
-      if (action.includes('SHORT') || trend.includes('SHORT') || trend.includes('DOWN')) direction = '空头';
-      if (action.includes('LONG') || trend.includes('LONG') || trend.includes('UP')) direction = '多头';
+      const explicitDirection = String(signal.direction || '');
+      let direction = explicitDirection === 'NONE' ? '中性' : '震荡';
+      if (explicitDirection === 'SHORT') direction = '空头';
+      else if (explicitDirection === 'LONG') direction = '多头';
+      else if (explicitDirection !== 'NONE') {
+        if (action.includes('SHORT') || trend.includes('SHORT') || trend.includes('DOWN')) direction = '空头';
+        if (action.includes('LONG') || trend.includes('LONG') || trend.includes('UP')) direction = '多头';
+      }
 
       const has1hHeld = reasonHas(rawReasons, ['1h BOLL/EMA pullback held', '1小时 BOLL/EMA 回踩不破']);
       const has1hRejected = reasonHas(rawReasons, ['1h BOLL/EMA pullback rejected', '1小时 BOLL/EMA 反抽失败']);
@@ -1777,12 +1830,12 @@ PAPER_DASHBOARD_HTML = """
         `<button class="neutral" onclick="closePosition('${displaySymbol(p.symbol)}')">平仓</button>`
       ]));
       const signalRows = Object.entries(data.latest_signals || {})
-        .map(([symbol, s]) => [displaySymbol(symbol), `<span class="pill">${tAction(s.action)}</span>`, tTrendState(s.trend_state || s.regime), tRiskState(s.risk_state), tSmartMoneyPhase(s.smart_money_phase), s.score, signalEntryPosition(s), flowReasonText(signalReasonText(s)), tVetoes(s.vetoes)]);
+        .map(([symbol, s]) => [displaySymbol(symbol), `<span class="pill">${tAction(s.action)}</span>`, marketDirectionText(s), marketRiskText(s), tSmartMoneyPhase(s.smart_money_phase), s.score, signalEntryPosition(s), flowReasonText(signalReasonText(s)), tVetoes(s.vetoes)]);
       const signalsTable = document.getElementById('signals');
       const signalsScrollAnchor = captureTableScrollAnchor(signalsTable);
       signalsTable.className = 'signals-table';
       signalsTable.innerHTML = table(
-        ['币种','动作','状态','风险','主力周期','分数','入场位置','原因','否决'],
+        ['币种','动作','行情方向','风险状态','主力周期','分数','入场位置','原因','否决'],
         signalRows,
         { 6: 'timing-col' },
       );

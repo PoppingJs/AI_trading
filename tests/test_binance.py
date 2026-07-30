@@ -80,3 +80,42 @@ def test_taker_buy_sell_volume_parses_participant_flow_fields() -> None:
     assert ratio == 1.12
     assert buy_volume == 112.0
     assert sell_volume == 100.0
+
+
+def test_liquidity_snapshots_join_volume_with_best_bid_and_ask() -> None:
+    class FakeMarket(BinanceFuturesMarketData):
+        async def _get_json(self, path: str, **kwargs):  # type: ignore[override]
+            if path == "/fapi/v1/ticker/24hr":
+                return [
+                    {
+                        "symbol": "BTCUSDT",
+                        "quoteVolume": "123456789",
+                    },
+                    {
+                        "symbol": "ETHUSDT",
+                        "quoteVolume": "987654321",
+                    },
+                ]
+            if path == "/fapi/v1/ticker/bookTicker":
+                return [
+                    {
+                        "symbol": "BTCUSDT",
+                        "bidPrice": "99999",
+                        "askPrice": "100001",
+                    },
+                    {
+                        "symbol": "ETHUSDT",
+                        "bidPrice": "3999",
+                        "askPrice": "4001",
+                    },
+                ]
+            raise AssertionError(path)
+
+    snapshots = asyncio.run(
+        FakeMarket().liquidity_snapshots(["BTCUSDT"])
+    )
+
+    assert set(snapshots) == {"BTCUSDT"}
+    assert snapshots["BTCUSDT"].quote_volume == 123456789.0
+    assert snapshots["BTCUSDT"].best_bid == 99999.0
+    assert snapshots["BTCUSDT"].best_ask == 100001.0

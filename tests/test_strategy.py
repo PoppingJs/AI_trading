@@ -7,11 +7,14 @@ from ai_trading.config import StrategySettings
 from ai_trading.indicators import build_indicators
 from ai_trading.models import (
     SETUP_H1_PULLBACK_LONG,
+    SETUP_H1_PULLBACK_SHORT,
     SETUP_H1_STRUCTURE_LONG,
     Candle,
     DerivativesSnapshot,
+    MarketRegime,
     PositionSide,
     SignalAction,
+    StrategySignal,
 )
 from ai_trading.strategy import (
     SCORE_FAMILY_DERIVATIVES,
@@ -121,6 +124,57 @@ def test_strategy_waits_when_long_short_score_gap_is_narrow() -> None:
     assert signal.direction == PositionSide.LONG
     assert signal.setup_type == SETUP_H1_PULLBACK_LONG
     assert "long/short score gap is narrow; wait for higher-timeframe structure confirmation" in signal.reasons
+
+
+def test_strategy_keeps_exact_score_tie_direction_neutral() -> None:
+    candles, derivatives = _trending_market()
+    indicators = build_indicators(candles, derivatives)
+    strategy = CompositeStrategy()
+    strategy._score_long = lambda *_: (90, ["long direction"], [], SETUP_H1_PULLBACK_LONG)  # type: ignore[method-assign]
+    strategy._score_short = lambda *_: (90, ["short direction"], [], SETUP_H1_PULLBACK_SHORT)  # type: ignore[method-assign]
+
+    signal = strategy.generate_signal("BTCUSDT", candles, indicators)
+
+    assert signal.action == SignalAction.WATCH
+    assert signal.direction is None
+    assert signal.direction_decision == "TIE"
+    assert signal.long_score == 90
+    assert signal.short_score == 90
+    assert signal.setup_type == ""
+    assert signal.score_evidence_families == ()
+    assert signal.reasons == (
+        "long and short scores are tied; no directional edge",
+    )
+
+
+def test_strategy_keeps_sub_watch_score_tie_as_no_trade() -> None:
+    candles, derivatives = _trending_market()
+    indicators = build_indicators(candles, derivatives)
+    strategy = CompositeStrategy()
+    strategy._score_long = lambda *_: (60, ["long direction"], [], "")  # type: ignore[method-assign]
+    strategy._score_short = lambda *_: (60, ["short direction"], [], "")  # type: ignore[method-assign]
+
+    signal = strategy.generate_signal("BTCUSDT", candles, indicators)
+
+    assert signal.action == SignalAction.NO_TRADE
+    assert signal.direction is None
+    assert signal.direction_decision == "TIE"
+    assert "score below trading threshold" in signal.reasons
+
+
+def test_strategy_signal_keeps_legacy_positional_argument_order() -> None:
+    signal = StrategySignal(
+        "TESTUSDT",
+        datetime(2026, 7, 1, tzinfo=UTC),
+        SignalAction.WATCH,
+        MarketRegime.CHOP,
+        70,
+        PositionSide.LONG,
+        ("legacy veto",),
+    )
+
+    assert signal.vetoes == ("legacy veto",)
+    assert signal.direction_decision == "UNSPECIFIED"
 
 
 def test_long_short_ratio_overcrowding_reduces_quality_without_common_veto() -> None:
