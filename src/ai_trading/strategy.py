@@ -424,11 +424,6 @@ class CompositeStrategy:
         reasons: list[str] = []
         vetoes = self._common_long_vetoes(current) + strict_vetoes
         setup_type = ""
-        sweep_warning = _upper_wick_chase_warning(candles[-1], current, self.settings)
-        if sweep_warning:
-            score -= 4
-            reasons.append(sweep_warning)
-
         if current.ema20 and current.ema50 and current.ma100:
             if current.close > current.ema50 and current.ema20 > current.ema50 and (current.ema50_slope or 0) > 0:
                 score = apply_positive_evidence_family(
@@ -558,11 +553,6 @@ class CompositeStrategy:
         reasons: list[str] = []
         vetoes = self._common_short_vetoes(current) + strict_vetoes
         setup_type = ""
-        sweep_warning = _lower_wick_chase_warning(candles[-1], current, self.settings)
-        if sweep_warning:
-            score -= 4
-            reasons.append(sweep_warning)
-
         if current.ema20 and current.ema50 and current.ma100:
             if current.close < current.ema50 and current.ema20 < current.ema50 and (current.ema50_slope or 0) < 0:
                 score = apply_positive_evidence_family(
@@ -673,10 +663,8 @@ class CompositeStrategy:
         return score, reasons, vetoes, setup_type
 
     def _common_long_vetoes(self, current: IndicatorSnapshot) -> list[str]:
-        vetoes: list[str] = []
-        if _atr_pct(current) >= self.settings.extreme_atr_pct:
-            vetoes.append("extreme volatility: skip new long entry")
-        return vetoes
+        del current
+        return []
 
     def _strict_long_vetoes(self, candles: Sequence[Candle], indicators: Sequence[IndicatorSnapshot]) -> list[str]:
         current = indicators[-1]
@@ -706,10 +694,8 @@ class CompositeStrategy:
         return vetoes
 
     def _common_short_vetoes(self, current: IndicatorSnapshot) -> list[str]:
-        vetoes: list[str] = []
-        if _atr_pct(current) >= self.settings.extreme_atr_pct:
-            vetoes.append("extreme volatility: skip new short entry")
-        return vetoes
+        del current
+        return []
 
     def _strict_short_vetoes(self, candles: Sequence[Candle], indicators: Sequence[IndicatorSnapshot]) -> list[str]:
         current = indicators[-1]

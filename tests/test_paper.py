@@ -8,7 +8,7 @@ from fastapi.testclient import TestClient
 import pytest
 
 from ai_trading.api import create_app
-from ai_trading.config import AppSettings
+from ai_trading.config import AppSettings, load_settings
 from ai_trading.models import (
     Candle,
     DerivativesSnapshot,
@@ -174,6 +174,17 @@ def test_market_context_risk_states_block_entries_without_affecting_legacy_signa
         {
             **base_signal,
             "market_context": {
+                "liquidity_state": "THIN",
+                "system_risk_state": "STRESS",
+            },
+        },
+        include_entry_position=False,
+        market_risk_blocks=False,
+    )
+    assert not _auto_entry_prerequisite_blocks(
+        {
+            **base_signal,
+            "market_context": {
                 "direction_state": "UNKNOWN",
                 "liquidity_state": "UNKNOWN",
                 "system_risk_state": "UNKNOWN",
@@ -213,6 +224,21 @@ def test_default_risk_boundaries_match_the_conservative_rollout() -> None:
     assert risk.leverage_max == 5
     assert risk.daily_loss_limit == pytest.approx(0.015)
     assert risk.max_drawdown_circuit_breaker == pytest.approx(0.08)
+
+
+def test_paper_config_uses_v9_thresholds_and_disables_cumulative_breakers() -> None:
+    settings = load_settings(
+        Path(__file__).parents[1] / "config" / "strategy.yaml"
+    )
+
+    assert settings.execution.paper_trading
+    assert settings.strategy.watch_threshold == 55
+    assert settings.strategy.score_threshold == 75
+    assert settings.risk.daily_loss_limit == 0
+    assert settings.risk.weekly_loss_limit == 0
+    assert settings.risk.max_drawdown_circuit_breaker == 0
+    assert settings.risk.max_consecutive_losses == 0
+    assert settings.risk.cooldown_hours == 0
 
 
 def test_requested_margin_is_only_a_cap_after_risk_sizing() -> None:
@@ -2212,7 +2238,7 @@ def test_periodic_universe_swap_keeps_eligible_old_pool_when_new_warmup_fails() 
     assert engine.symbols == [f"OLD{idx}USDT" for idx in range(30)]
 
 
-def test_auto_main_pool_requires_score_strictly_above_65() -> None:
+def test_auto_main_pool_includes_score_55_and_excludes_54() -> None:
     engine = PaperTradingEngine(
         AppSettings(),
         starting_balance=1000,
@@ -2225,37 +2251,40 @@ def test_auto_main_pool_requires_score_strictly_above_65() -> None:
         "BLOCKEDUSDT",
     ]
     engine.latest_signals = {
-        "ENTRYUSDT": {"action": "ENTRY_LONG", "score": 66},
-        "WATCHUSDT": {"action": "WATCH", "score": 65},
-        "LOWUSDT": {"action": "WATCH", "score": 64},
+        "ENTRYUSDT": {"action": "ENTRY_LONG", "score": 75},
+        "WATCHUSDT": {"action": "WATCH", "score": 55},
+        "LOWUSDT": {"action": "WATCH", "score": 54},
         "BLOCKEDUSDT": {"action": "NO_TRADE", "score": 99},
     }
 
     engine._rebalance_auto_signal_pools()
 
-    assert engine.symbols == ["ENTRYUSDT", "BLOCKEDUSDT"]
-    assert engine._candidate_symbols == ["WATCHUSDT", "LOWUSDT"]
+    assert engine.symbols == ["ENTRYUSDT", "WATCHUSDT", "BLOCKEDUSDT"]
+    assert engine._candidate_symbols == ["LOWUSDT"]
 
     engine.latest_signals["LOWUSDT"] = {
         "action": "ENTRY_SHORT",
-        "score": 70,
+        "score": 56,
     }
     engine._rebalance_auto_signal_pools()
 
     assert engine.symbols == [
         "ENTRYUSDT",
+        "WATCHUSDT",
         "LOWUSDT",
         "BLOCKEDUSDT",
     ]
-    assert engine._candidate_symbols == ["WATCHUSDT"]
+    assert engine._candidate_symbols == []
 
 
 @pytest.mark.parametrize(
         ("score", "expected_action"),
         [
-            (64, SignalAction.NO_TRADE.value),
-            (65, SignalAction.NO_TRADE.value),
-        (79, SignalAction.WATCH.value),
+        (54, SignalAction.NO_TRADE.value),
+        (55, SignalAction.WATCH.value),
+        (74, SignalAction.WATCH.value),
+        (75, SignalAction.ENTRY_LONG.value),
+        (79, SignalAction.ENTRY_LONG.value),
         (80, SignalAction.ENTRY_LONG.value),
         (84, SignalAction.ENTRY_LONG.value),
         (85, SignalAction.ENTRY_LONG.value),
@@ -2340,7 +2369,7 @@ def test_entry_quality_cannot_promote_a_watch_setup_score() -> None:
     assert adjusted["action"] == SignalAction.WATCH.value
     assert adjusted["v4_action"] == SignalAction.WATCH.value
     assert adjusted["score_delta_vs_v4"] == 0
-    assert adjusted["score_model_version"] == 6
+    assert adjusted["score_model_version"] == 7
     assert (
         SCORE_FAMILY_ENTRY_QUALITY
         not in adjusted["score_evidence_families"]
@@ -2579,10 +2608,10 @@ def test_entry_quality_bonus_does_not_upgrade_position_size_band() -> None:
     assert _entry_quality_grade(
         score=_position_policy_score(promoted)
     ) == "A"
-    assert _position_policy_score(newly_eligible) == 80
+    assert _position_policy_score(newly_eligible) == 75
     assert _entry_quality_grade(
         score=_position_policy_score(newly_eligible)
-    ) == "A"
+    ) == "B"
 
 
 def test_multi_timeframe_score_deduplicates_evidence_across_families() -> None:
@@ -2649,7 +2678,7 @@ def test_direction_score_uses_h4_as_primary_with_limited_daily_alignment() -> No
     assert adjusted["action"] == SignalAction.ENTRY_LONG.value
     assert adjusted["score_evidence_families"]["DIRECTION"] == 9
     assert adjusted["legacy_score"] == 77
-    assert adjusted["legacy_action"] == SignalAction.WATCH.value
+    assert adjusted["legacy_action"] == SignalAction.ENTRY_LONG.value
     assert adjusted["score_delta_vs_legacy"] == 3
     assert adjusted["direction_score_breakdown"] == {
         "candidate_direction": "LONG",
@@ -2692,7 +2721,7 @@ def test_direction_alignment_is_symmetric_for_short_entries() -> None:
     assert adjusted["action"] == SignalAction.ENTRY_SHORT.value
     assert adjusted["score_evidence_families"]["DIRECTION"] == 9
     assert adjusted["legacy_score"] == 77
-    assert adjusted["legacy_action"] == SignalAction.WATCH.value
+    assert adjusted["legacy_action"] == SignalAction.ENTRY_SHORT.value
     assert adjusted["score_delta_vs_legacy"] == 3
 
 
@@ -2793,7 +2822,7 @@ def test_ma_cluster_uses_strongest_location_evidence_only() -> None:
     assert not vetoes
 
 
-def test_auto_main_pool_never_exceeds_80_and_excludes_score_65() -> None:
+def test_auto_main_pool_never_exceeds_80_and_excludes_score_54() -> None:
     engine = PaperTradingEngine(
         AppSettings(),
         starting_balance=1000,
@@ -2806,7 +2835,7 @@ def test_auto_main_pool_never_exceeds_80_and_excludes_score_65() -> None:
     engine.latest_signals = {
         symbol: {
             "action": "WATCH",
-            "score": 65 + index,
+            "score": 54 + index,
         }
         for index, symbol in enumerate(engine._universe_symbols)
     }
@@ -3051,9 +3080,9 @@ def test_auto_signal_score_tiers_and_margins() -> None:
         "vetoes": ("long side overcrowded",),
     })
     assert _auto_signal_allowed({**base_signal, "score": 85, "risk_state": "NORMAL"})
-    assert not _auto_signal_allowed({**base_signal, "score": 78, "risk_state": "FUNDING_HOT"})
+    assert _auto_signal_allowed({**base_signal, "score": 78, "risk_state": "FUNDING_HOT"})
     assert _auto_signal_allowed({**base_signal, "score": 81, "risk_state": "NORMAL"})
-    assert not _auto_signal_allowed({**base_signal, "score": 79, "risk_state": "NORMAL"})
+    assert _auto_signal_allowed({**base_signal, "score": 79, "risk_state": "NORMAL"})
     assert not _auto_signal_allowed({**base_signal, "score": 74, "risk_state": "NORMAL"})
     assert not _auto_signal_allowed({**base_signal, "score": 90, "risk_state": "NORMAL", "vetoes": ("1h trigger opposes long entry",)})
     assert not _auto_signal_allowed({"score": 90, "risk_state": "NORMAL"})
@@ -3085,7 +3114,7 @@ def test_watch_signal_below_entry_threshold_is_score_pending_not_direction_pendi
         "entry_pipeline_version": 2,
         "action": SignalAction.WATCH.value,
         "candidate_action": SignalAction.ENTRY_LONG.value,
-        "score": 76,
+        "score": 74,
         "h4_direction": "LONG",
         "h1_trigger": {
             "direction": "LONG",
@@ -3099,11 +3128,11 @@ def test_watch_signal_below_entry_threshold_is_score_pending_not_direction_pendi
     assert signal["entry_state"] == "SCORE_PENDING"
     assert signal["entry_trigger"] == "1H_RETEST"
     assert signal["entry_timing_reason"] == (
-        "entry position blocked: final score 76 below "
-        "auto-entry minimum 80"
+        "entry position blocked: final score 74 below "
+        "auto-entry minimum 75"
     )
     assert _auto_entry_prerequisite_blocks(signal) == (
-        "final score 76 below auto-entry minimum 80",
+        "final score 74 below auto-entry minimum 75",
     )
 
 
@@ -3203,7 +3232,7 @@ def test_legacy_watch_signal_without_candidate_direction_remains_compatible() ->
     )
 
 
-def test_entry_quality_uses_only_a_and_s_score_bands() -> None:
+def test_entry_quality_uses_b_a_and_s_score_bands() -> None:
     assert _entry_quality_grade(
         score=100,
         reward_r=1.6,
@@ -3215,7 +3244,7 @@ def test_entry_quality_uses_only_a_and_s_score_bands() -> None:
         reward_r=1.6,
         stop_pct=0.03,
         setup_type=SETUP_H1_PULLBACK_LONG,
-    ) == "A"
+    ) == "S"
     assert _entry_quality_grade(
         score=90,
         reward_r=1.25,
@@ -3227,11 +3256,18 @@ def test_entry_quality_uses_only_a_and_s_score_bands() -> None:
         reward_r=1.25,
         stop_pct=0.08,
         setup_type=SETUP_H1_PULLBACK_LONG,
+    ) == "B"
+    assert _entry_quality_grade(
+        score=74,
+        reward_r=1.25,
+        stop_pct=0.08,
+        setup_type=SETUP_H1_PULLBACK_LONG,
     ) is None
 
     assert _leverage_for_entry_quality("S", stop_pct=0.03, leverage_max=10) == 10
     assert _leverage_for_entry_quality("A", stop_pct=0.04, leverage_max=10) == 10
     assert _leverage_for_entry_quality("A", stop_pct=0.05, leverage_max=10) == 7
+    assert _leverage_for_entry_quality("B", stop_pct=0.05, leverage_max=10) == 7
     assert _leverage_for_entry_quality(None, stop_pct=0.06, leverage_max=10) == 0
 
 
@@ -3258,7 +3294,7 @@ def test_s_quality_uses_only_the_one_remaining_capital_unit() -> None:
 def test_auto_entry_prerequisites_explain_score_direction_and_timing_blocks() -> None:
     wait_signal = {
         "action": SignalAction.ENTRY_LONG.value,
-        "score": 79,
+        "score": 74,
         "risk_state": "NORMAL",
         "price": 106.0,
         "entry_levels": {"long": {"h1_support": {"low": 99.0, "high": 101.0, "price": 100.0}}},
@@ -3266,12 +3302,12 @@ def test_auto_entry_prerequisites_explain_score_direction_and_timing_blocks() ->
 
     blocks = _auto_entry_prerequisite_blocks(wait_signal)
 
-    assert "final score 79 below auto-entry minimum 80" in blocks
+    assert "final score 74 below auto-entry minimum 75" in blocks
     assert "等待 1H支撑回踩区" in blocks
     assert _auto_entry_prerequisite_blocks(
         wait_signal,
         include_entry_position=False,
-    ) == ("final score 79 below auto-entry minimum 80",)
+    ) == ("final score 74 below auto-entry minimum 75",)
     assert _auto_entry_prerequisite_blocks({"action": SignalAction.WATCH.value, "score": 90}) == (
         "directional entry signal not established",
     )
@@ -3396,6 +3432,17 @@ def test_four_hour_short_entry_requires_upper_half_of_retest_zone() -> None:
         "risk_state": "NORMAL",
         "entry_timeframe_override": "4h",
         "h1_trigger": {"direction": "SHORT", "state": "FAKE_BREAKOUT"},
+            "wick_confirmation": {
+                "state": "SHORT_EMA_REJECTION",
+                "timeframe": "1h",
+                "ema_timeframe": "4h",
+                "ema_period": 20,
+                "entry_level_keys": (
+                    "h4_ema20",
+                    "h4_ema20_ema60",
+                ),
+                "stop_anchor": 7.82,
+            },
         "price": 7.75032,
         "entry_levels": {
             "short": {
@@ -3542,6 +3589,17 @@ def test_entry_position_rejects_aave_like_lower_single_indicator_zone() -> None:
     assert signal["entry_timing"] == "WAIT"
 
     signal["price"] = 94.5
+    signal["wick_confirmation"] = {
+        "state": "SHORT_EMA_REJECTION",
+        "timeframe": "1h",
+        "ema_timeframe": "1h",
+        "ema_period": 20,
+        "entry_level_keys": (
+            "h1_ema20",
+            "h1_ema20_ema60",
+        ),
+        "stop_anchor": 95.0,
+    }
     _update_entry_position_fields(signal)
     assert signal["entry_timing"] == "GOOD"
 
@@ -3576,6 +3634,17 @@ def test_correlated_indicator_zones_need_scored_pullback_confirmation() -> None:
     signal["reasons"] = (
         "1h BOLL/EMA pullback held with clean risk",
     )
+    signal["wick_confirmation"] = {
+        "state": "LONG_EMA_RECLAIM",
+        "timeframe": "1h",
+        "ema_timeframe": "1h",
+        "ema_period": 20,
+        "entry_level_keys": (
+            "h1_ema20",
+            "h1_ema20_ema60",
+        ),
+        "stop_anchor": 99.0,
+    }
     _update_entry_position_fields(signal)
     assert signal["entry_timing"] == "GOOD"
 
@@ -3606,6 +3675,17 @@ def test_four_hour_override_requires_price_rejection_confirmation() -> None:
     signal["h1_trigger"] = {
         "direction": "SHORT",
         "state": "FAKE_BREAKOUT",
+    }
+    signal["wick_confirmation"] = {
+        "state": "SHORT_EMA_REJECTION",
+        "timeframe": "1h",
+        "ema_timeframe": "4h",
+        "ema_period": 20,
+        "entry_level_keys": (
+            "h4_ema20",
+            "h4_ema20_ema60",
+        ),
+        "stop_anchor": 101.0,
     }
     _update_entry_position_fields(signal)
     assert signal["entry_timing"] == "GOOD"
@@ -3679,6 +3759,17 @@ def test_multi_timeframe_context_sets_h1_pullback_setup_from_source_without_reas
         "summary": "context",
         "daily_bias": "NEUTRAL",
         "h1_pullback": {"direction": "LONG", "state": "HEALTHY_PULLBACK"},
+            "wick_confirmation": {
+                "state": "LONG_EMA_RECLAIM",
+                "timeframe": "1h",
+                "ema_timeframe": "1h",
+                "ema_period": 60,
+                "entry_level_keys": (
+                    "h1_ema60",
+                    "h1_ema20_ema60",
+                ),
+                "stop_anchor": 90.8,
+            },
         "h1_trigger": {"direction": "NONE", "state": "WAIT"},
         "entry_levels": {
             "long": {
@@ -3733,7 +3824,7 @@ def test_multi_timeframe_context_sets_oi_valley_setup_from_source_without_reason
     assert adjusted["oi_valley_long_eligible"] is True
 
 
-def test_ema55_oi_valley_supports_long_only_after_h4_direction_is_long() -> None:
+def test_ema60_oi_valley_supports_long_only_after_h4_direction_is_long() -> None:
     adjusted = _apply_multi_timeframe_context(
         {
             "action": SignalAction.ENTRY_LONG.value,
@@ -3762,7 +3853,7 @@ def test_ema55_oi_valley_supports_long_only_after_h4_direction_is_long() -> None
             "h1_pullback": {"direction": "NONE", "state": "WAIT"},
             "entry_levels": {
                 "long": {
-                    "h4_ema55_reclaim": {
+                    "h4_ema60_oi_valley_reclaim": {
                         "low": 99.0,
                         "high": 101.0,
                         "price": 100.0,
@@ -3782,7 +3873,7 @@ def test_ema55_oi_valley_supports_long_only_after_h4_direction_is_long() -> None
     assert adjusted["setup_type"] == SETUP_OI_VALLEY_REVERSAL_LONG
     assert adjusted["entry_timeframe_override"] == "4h"
     assert set(adjusted["entry_levels"]["long"]) == {
-        "h4_ema55_reclaim"
+        "h4_ema60_oi_valley_reclaim"
     }
     assert adjusted["score_evidence_families"]["DERIVATIVES"] == 6
 
@@ -3828,7 +3919,7 @@ def test_oi_valley_does_not_take_over_other_long_setup_without_h4_long(
                         "high": 101.0,
                         "price": 100.0,
                     },
-                    "h4_ema55_reclaim": {
+                    "h4_ema60_oi_valley_reclaim": {
                         "low": 99.0,
                         "high": 101.0,
                         "price": 100.0,
@@ -3845,7 +3936,10 @@ def test_oi_valley_does_not_take_over_other_long_setup_without_h4_long(
         == "4h direction is not long"
     )
     assert adjusted["setup_type"] == SETUP_H1_PULLBACK_LONG
-    assert "h4_ema55_reclaim" not in adjusted["entry_levels"]["long"]
+    assert (
+        "h4_ema60_oi_valley_reclaim"
+        not in adjusted["entry_levels"]["long"]
+    )
     assert set(adjusted["entry_levels"]["long"]) == {"h1_support"}
     assert "DERIVATIVES" not in adjusted["score_evidence_families"]
     assert "entry_timeframe_override" not in adjusted
@@ -3886,7 +3980,7 @@ def test_h4_short_direction_blocks_long_and_oi_valley_cannot_override_it() -> No
                         "high": 101.0,
                         "price": 100.0,
                     },
-                    "h4_ema55_reclaim": {
+                    "h4_ema60_oi_valley_reclaim": {
                         "low": 99.0,
                         "high": 101.0,
                         "price": 100.0,
@@ -3901,7 +3995,10 @@ def test_h4_short_direction_blocks_long_and_oi_valley_cannot_override_it() -> No
     assert adjusted["oi_valley_long_eligible"] is False
     assert adjusted["setup_type"] != SETUP_OI_VALLEY_REVERSAL_LONG
     assert "DERIVATIVES" not in adjusted["score_evidence_families"]
-    assert "h4_ema55_reclaim" not in adjusted["entry_levels"]["long"]
+    assert (
+        "h4_ema60_oi_valley_reclaim"
+        not in adjusted["entry_levels"]["long"]
+    )
 
 
 def test_separated_ema20_and_ema60_do_not_create_a_bridge_entry_zone() -> None:
@@ -3926,6 +4023,17 @@ def test_h1_pullback_setup_allows_split_ema60_entry_without_reason_text() -> Non
         "price": 91.5,
         "setup_type": SETUP_H1_PULLBACK_LONG,
         "h1_pullback": {"direction": "LONG", "state": "HEALTHY_PULLBACK"},
+        "wick_confirmation": {
+            "state": "LONG_EMA_RECLAIM",
+            "timeframe": "1h",
+            "ema_timeframe": "1h",
+            "ema_period": 60,
+            "entry_level_keys": (
+                "h1_ema60",
+                "h1_ema20_ema60",
+            ),
+            "stop_anchor": 90.8,
+        },
         "entry_levels": {
             "long": {
                 "h1_ema60": {
@@ -4301,7 +4409,7 @@ def test_gradual_four_hour_oi_valley_blocks_short_without_single_bar_flush() -> 
     )
 
 
-def test_four_hour_oi_valley_absorption_builds_ema55_reversal_long() -> None:
+def test_four_hour_oi_valley_absorption_builds_ema60_reversal_long() -> None:
     start = datetime(2026, 7, 4, tzinfo=UTC)
     closes = [100.0] * 48 + [98.0, 96.0, 94.0, 92.0, 90.0, 88.0, 87.0, 88.0, 89.0, 91.0, 98.0, 100.0]
     lows = [close - 0.8 for close in closes]
@@ -4347,11 +4455,11 @@ def test_four_hour_oi_valley_absorption_builds_ema55_reversal_long() -> None:
     assert setup["lower_wick_count"] >= 2
     assert setup["oi_rebuilding"]
     assert setup["long_short_ratio_stable"]
-    assert setup["ema55_reclaimed"]
+    assert setup["ema60_reclaimed"]
     assert setup["stop_anchor"] < setup["floor_price"]
 
 
-def test_ema55_oi_valley_is_supporting_evidence_and_cannot_override_short() -> None:
+def test_ema60_oi_valley_is_supporting_evidence_and_cannot_override_short() -> None:
     adjusted = _apply_multi_timeframe_context(
         {
             "action": SignalAction.ENTRY_SHORT.value,
@@ -4376,7 +4484,7 @@ def test_ema55_oi_valley_is_supporting_evidence_and_cannot_override_short() -> N
             "h1_pullback": {"direction": "NONE", "state": "WAIT"},
             "entry_levels": {
                 "long": {
-                    "h4_ema55_reclaim": {
+                    "h4_ema60_oi_valley_reclaim": {
                         "low": 99.0,
                         "high": 101.0,
                         "price": 100.0,
@@ -4439,13 +4547,16 @@ def test_oi_valley_reversal_stop_and_early_invalidation_use_4h_structure() -> No
             "h4_oi_valley_long": {
                 "current_close": 97.0,
                 "floor_price": 94.5,
-                "ema55": 99.0,
-                "ema55_buffer": 1.0,
+                "ema60": 99.0,
+                "ema60_buffer": 1.0,
                 "current_oi_change_pct": 0.02,
             }
         },
     )
-    assert reason == "stop loss: 4h closed below EMA55 while OI increased; new shorts likely"
+    assert reason == (
+        "stop loss: 4h closed below EMA60 while OI increased; "
+        "new shorts likely"
+    )
 
 
 def test_confirmed_four_hour_oi_valley_exits_short_and_needs_wick_for_long() -> None:
@@ -5963,10 +6074,13 @@ def test_multi_timeframe_context_adjusts_score_and_veto() -> None:
 
     assert adjusted["score"] == 76
     assert "1h trigger opposes long entry" in adjusted["vetoes"]
-    assert "high area without pullback confirmation; wait for 1h/4h pullback before long" in adjusted["vetoes"]
+    assert not any(
+        "high area without pullback confirmation" in veto
+        for veto in adjusted["vetoes"]
+    )
 
 
-def test_large_timeframe_wick_rejections_use_close_ratio() -> None:
+def test_large_timeframe_wick_rejections_use_true_wick_ratios() -> None:
     timestamp = datetime.now(UTC)
     rejections = _large_timeframe_wick_rejections(
         {
@@ -5975,7 +6089,7 @@ def test_large_timeframe_wick_rejections_use_close_ratio() -> None:
                     timestamp=timestamp,
                     open=100.0,
                     high=102.0,
-                    low=99.0,
+                        low=99.5,
                     close=100.0,
                     volume=1_000.0,
                 )
@@ -5984,19 +6098,420 @@ def test_large_timeframe_wick_rejections_use_close_ratio() -> None:
                 Candle(
                     timestamp=timestamp,
                     open=100.0,
-                    high=101.0,
+                        high=100.5,
                     low=97.5,
                     close=100.0,
                     volume=1_000.0,
                 )
             ],
-        }
+        },
+        {
+            "1h": [
+                indicator_snapshot(
+                    close=100.0,
+                    atr=2.0,
+                    ema20=99.0,
+                    timestamp=timestamp,
+                )
+            ],
+            "4h": [
+                indicator_snapshot(
+                    close=100.0,
+                    atr=2.5,
+                    ema20=101.0,
+                    timestamp=timestamp,
+                )
+            ],
+        },
     )
 
     assert rejections["upper"]["timeframe"] == "1h"
-    assert rejections["upper"]["ratio"] == pytest.approx(0.02)
+    assert rejections["upper"]["range_ratio"] == pytest.approx(0.8)
+    assert rejections["upper"]["atr_ratio"] == pytest.approx(1.0)
     assert rejections["lower"]["timeframe"] == "4h"
-    assert rejections["lower"]["ratio"] == pytest.approx(0.025)
+    assert rejections["lower"]["range_ratio"] == pytest.approx(2.5 / 3.0)
+    assert rejections["lower"]["atr_ratio"] == pytest.approx(1.0)
+
+
+def test_uptrend_upper_wick_guardrail_persists_until_ema_lower_wick_reclaim() -> None:
+    timestamp = datetime(2026, 7, 1, tzinfo=UTC)
+    candles = [
+        Candle(
+            timestamp=timestamp,
+            open=100.0,
+            high=103.0,
+            low=99.9,
+            close=100.5,
+            volume=1_000.0,
+        ),
+        Candle(
+            timestamp=timestamp + timedelta(hours=1),
+            open=100.5,
+            high=101.0,
+            low=100.0,
+            close=100.4,
+            volume=1_000.0,
+        ),
+    ]
+    indicators = [
+        indicator_snapshot(
+            close=100.5,
+            atr=2.0,
+            ema20=100.0,
+            timestamp=candles[0].timestamp,
+        ),
+        indicator_snapshot(
+            close=100.4,
+            atr=2.0,
+            ema20=100.0,
+            timestamp=candles[1].timestamp,
+        ),
+    ]
+
+    blocked = _large_timeframe_wick_rejections(
+        {"1h": candles},
+        {"1h": indicators},
+        h4_direction="LONG",
+    )
+
+    assert blocked["guardrail"] == "BLOCK_LONG_CHASE"
+    assert blocked["confirmation"] == {}
+
+    breakout_without_flush = Candle(
+        timestamp=timestamp + timedelta(hours=2),
+        open=100.4,
+        high=104.0,
+        low=100.3,
+        close=103.6,
+        volume=1_000.0,
+    )
+    candles.append(breakout_without_flush)
+    indicators.append(
+        indicator_snapshot(
+            close=103.6,
+            atr=2.0,
+            ema20=100.0,
+            timestamp=breakout_without_flush.timestamp,
+        )
+    )
+
+    still_blocked = _large_timeframe_wick_rejections(
+        {"1h": candles},
+        {"1h": indicators},
+        h4_direction="LONG",
+    )
+
+    assert still_blocked["guardrail"] == "BLOCK_LONG_CHASE"
+    assert still_blocked["confirmation"] == {}
+
+    reclaim = Candle(
+        timestamp=timestamp + timedelta(hours=3),
+        open=100.0,
+        high=101.0,
+        low=97.5,
+        close=100.5,
+        volume=1_000.0,
+    )
+    candles.append(reclaim)
+    indicators.append(
+        indicator_snapshot(
+            close=100.5,
+            atr=2.0,
+            ema20=100.0,
+            oi_change=-0.02,
+            timestamp=reclaim.timestamp,
+        )
+    )
+
+    confirmed = _large_timeframe_wick_rejections(
+        {"1h": candles},
+        {"1h": indicators},
+        h4_direction="LONG",
+    )
+
+    assert confirmed["guardrail"] == "NONE"
+    assert confirmed["confirmation"]["state"] == "LONG_EMA_RECLAIM"
+    assert confirmed["confirmation"]["ema_timeframe"] == "1h"
+    assert confirmed["confirmation"]["ema_period"] == 20
+    assert "h1_ema20" in confirmed["confirmation"]["entry_level_keys"]
+    assert confirmed["confirmation"]["stop_anchor"] == pytest.approx(97.5)
+    assert (
+        confirmed["confirmation"]["continuation_state"]
+        == "LONG_CONTINUATION_ALLOWED"
+    )
+    assert confirmed["confirmation"]["participant_reduction_confirmed"]
+
+    favorable_continuation = Candle(
+        timestamp=timestamp + timedelta(hours=4),
+        open=100.5,
+        high=102.0,
+        low=100.2,
+        close=101.8,
+        volume=1_000.0,
+    )
+    candles.append(favorable_continuation)
+    indicators.append(
+        indicator_snapshot(
+            close=101.8,
+            atr=2.0,
+            ema20=100.0,
+            timestamp=favorable_continuation.timestamp,
+        )
+    )
+
+    persisted = _large_timeframe_wick_rejections(
+        {"1h": candles},
+        {"1h": indicators},
+        h4_direction="LONG",
+    )
+
+    assert persisted["guardrail"] == "NONE"
+    assert (
+        persisted["confirmation"]["state"]
+        == "LONG_EMA_RECLAIM"
+    )
+
+    structure_failure = Candle(
+        timestamp=timestamp + timedelta(hours=5),
+        open=101.8,
+        high=102.0,
+        low=96.8,
+        close=97.0,
+        volume=1_000.0,
+    )
+    candles.append(structure_failure)
+    indicators.append(
+        indicator_snapshot(
+            close=97.0,
+            atr=2.0,
+            ema20=100.0,
+            timestamp=structure_failure.timestamp,
+        )
+    )
+
+    invalidated = _large_timeframe_wick_rejections(
+        {"1h": candles},
+        {"1h": indicators},
+        h4_direction="LONG",
+    )
+
+    assert invalidated["confirmation"] == {}
+
+
+def test_h1_wick_can_confirm_h4_ema20_but_not_h4_ema60() -> None:
+    timestamp = datetime(2026, 7, 1, tzinfo=UTC)
+    h1_candle = Candle(
+        timestamp=timestamp + timedelta(hours=1),
+        open=96.0,
+        high=97.0,
+        low=94.0,
+        close=96.0,
+        volume=1_000.0,
+    )
+    h4_candle = Candle(
+        timestamp=timestamp,
+        open=95.0,
+        high=95.2,
+        low=94.8,
+        close=95.0,
+        volume=1_000.0,
+    )
+
+    confirmed = _large_timeframe_wick_rejections(
+        {"1h": [h1_candle], "4h": [h4_candle]},
+        {
+            "1h": [
+                indicator_snapshot(
+                    close=96.0,
+                    atr=2.0,
+                    ema20=100.0,
+                    timestamp=h1_candle.timestamp,
+                )
+            ],
+            "4h": [
+                indicator_snapshot(
+                    close=95.0,
+                    atr=2.0,
+                    ema20=95.0,
+                    timestamp=h4_candle.timestamp,
+                )
+            ],
+        },
+        h4_direction="LONG",
+    )
+
+    confirmation = confirmed["confirmation"]
+    assert confirmation["timeframe"] == "1h"
+    assert confirmation["ema_timeframe"] == "4h"
+    assert confirmation["ema_period"] == 20
+    assert confirmation["entry_level_keys"] == (
+        "h4_ema20",
+        "h4_ema20_ema60",
+    )
+    assert "h4_ema60" not in confirmation["entry_level_keys"]
+
+
+def test_h1_wick_confirmation_does_not_authorize_h4_ema60_entry() -> None:
+    signal = {
+        "action": SignalAction.ENTRY_LONG.value,
+        "score": 95,
+        "trend_state": "TREND_LONG",
+        "risk_state": "NORMAL",
+        "price": 99.7,
+        "wick_confirmation": {
+            "state": "LONG_EMA_RECLAIM",
+            "timeframe": "1h",
+            "ema_timeframe": "1h",
+            "ema_period": 20,
+            "entry_level_keys": (
+                "h1_ema20",
+                "h1_ema20_ema60",
+            ),
+            "stop_anchor": 98.5,
+        },
+        "entry_levels": {
+            "long": {
+                "h4_ema60": {
+                    "low": 99.5,
+                    "high": 100.5,
+                    "price": 100.0,
+                }
+            }
+        },
+    }
+
+    timing, _ = _signal_entry_timing(signal)
+    assert timing == "WAIT"
+
+    signal["wick_confirmation"] = {
+        "state": "LONG_EMA_RECLAIM",
+        "timeframe": "4h",
+        "ema_timeframe": "4h",
+        "ema_period": 60,
+        "entry_level_keys": (
+            "h4_ema60",
+            "h4_ema20_ema60",
+        ),
+        "stop_anchor": 98.5,
+    }
+    timing, _ = _signal_entry_timing(signal)
+    assert timing == "GOOD"
+
+
+def test_confirmed_ema_zone_is_selected_before_generic_support() -> None:
+    signal = {
+        "action": SignalAction.ENTRY_LONG.value,
+        "setup_type": SETUP_H1_PULLBACK_LONG,
+        "trend_state": "TREND_LONG",
+        "wick_confirmation": {
+            "state": "LONG_EMA_RECLAIM",
+            "timeframe": "1h",
+            "ema_timeframe": "1h",
+            "ema_period": 60,
+            "entry_level_keys": (
+                "h1_ema60",
+                "h1_ema20_ema60",
+            ),
+        },
+        "reasons": (),
+    }
+    all_levels = {
+        "long": {
+            "h1_support": {
+                "low": 90.0,
+                "high": 91.0,
+                "price": 90.5,
+            },
+            "h1_ema60": {
+                "low": 94.0,
+                "high": 95.0,
+                "price": 94.5,
+            },
+        }
+    }
+
+    selected = _scored_entry_levels(signal, all_levels)
+
+    assert tuple(selected["long"]) == ("h1_ema60",)
+
+
+@pytest.mark.parametrize(
+    ("side", "state", "continuation_state", "price"),
+    [
+        (
+            PositionSide.LONG,
+            "LONG_EMA_RECLAIM",
+            "LONG_CONTINUATION_ALLOWED",
+            104.2,
+        ),
+        (
+            PositionSide.SHORT,
+            "SHORT_EMA_REJECTION",
+            "SHORT_CONTINUATION_ALLOWED",
+            105.8,
+        ),
+    ],
+)
+def test_confirmed_ema_wick_adds_m15_continuation_without_replacing_primary(
+    side: PositionSide,
+    state: str,
+    continuation_state: str,
+    price: float,
+) -> None:
+    side_key = "long" if side == PositionSide.LONG else "short"
+    action = (
+        SignalAction.ENTRY_LONG.value
+        if side == PositionSide.LONG
+        else SignalAction.ENTRY_SHORT.value
+    )
+    ema_key = "h1_ema20"
+    signal = {
+        "action": action,
+        "score": 80,
+        "trend_state": (
+            "TREND_LONG"
+            if side == PositionSide.LONG
+            else "TREND_SHORT"
+        ),
+        "risk_state": "OI_ABNORMAL",
+        "price": price,
+        "wick_confirmation": {
+            "state": state,
+            "timeframe": "1h",
+            "ema_timeframe": "1h",
+            "ema_period": 20,
+            "entry_level_keys": (
+                ema_key,
+                "h1_ema20_ema60",
+            ),
+            "continuation_state": continuation_state,
+            "stop_anchor": 97.5 if side == PositionSide.LONG else 107.5,
+        },
+        "reasons": (),
+    }
+    all_levels = {
+        side_key: {
+            "h1_ema20": {
+                "low": 99.0,
+                "high": 101.0,
+                "price": 100.0,
+            },
+            "m15_ema20_ema60": {
+                "low": 104.0,
+                "high": 106.0,
+                "price": 105.0,
+            },
+        }
+    }
+
+    selected = _scored_entry_levels(signal, all_levels)
+    signal["entry_levels"] = selected
+
+    assert tuple(selected[side_key]) == (
+        "h1_ema20",
+        "m15_ema20_ema60",
+    )
+    assert _signal_entry_timing(signal)[0] == "GOOD"
 
 
 def test_large_timeframe_wick_rejection_is_hard_veto_for_chasing() -> None:
@@ -6010,14 +6525,18 @@ def test_large_timeframe_wick_rejection_is_hard_veto_for_chasing() -> None:
     long_context = {
         "daily_bias": "NEUTRAL",
         "large_wick_rejections": {
-            "upper": {"timeframe": "1h", "ratio": 0.021},
+            "guardrail": "BLOCK_LONG_CHASE",
+            "guardrail_event": {"timeframe": "1h"},
         },
         "summary": "MTF: test",
     }
 
     long_adjusted = _apply_multi_timeframe_context(long_signal, long_context)
 
-    assert "1H上插针收实2.1%，禁止追多" in long_adjusted["vetoes"]
+    assert (
+        "1H上涨延伸区出现有效上影，禁止高位追多"
+        in long_adjusted["vetoes"]
+    )
 
     short_signal = {
         "action": SignalAction.ENTRY_SHORT.value,
@@ -6029,14 +6548,18 @@ def test_large_timeframe_wick_rejection_is_hard_veto_for_chasing() -> None:
     short_context = {
         "daily_bias": "NEUTRAL",
         "large_wick_rejections": {
-            "lower": {"timeframe": "4h", "ratio": 0.025},
+            "guardrail": "BLOCK_SHORT_CHASE",
+            "guardrail_event": {"timeframe": "4h"},
         },
         "summary": "MTF: test",
     }
 
     short_adjusted = _apply_multi_timeframe_context(short_signal, short_context)
 
-    assert "4H下插针收实2.5%，禁止追空" in short_adjusted["vetoes"]
+    assert (
+        "4H下跌延伸区出现有效下影，禁止低位追空"
+        in short_adjusted["vetoes"]
+    )
 
 
 def test_multi_timeframe_healthy_pullback_adds_score() -> None:
@@ -6302,7 +6825,7 @@ def test_high_score_without_core_entry_structure_is_capped_below_auto_entry() ->
 
     adjusted = _apply_multi_timeframe_context(signal, context)
 
-    assert adjusted["score"] == 79
+    assert adjusted["score"] == 74
     assert adjusted["action"] == SignalAction.WATCH.value
     assert adjusted["entry_levels"] == {}
     assert (
@@ -6311,7 +6834,7 @@ def test_high_score_without_core_entry_structure_is_capped_below_auto_entry() ->
     )
 
 
-def test_high_area_long_waits_for_pullback_confirmation() -> None:
+def test_high_area_long_is_nonblocking_without_pullback_confirmation() -> None:
     signal = {
         "action": "ENTRY_LONG",
         "score": 90,
@@ -6329,7 +6852,12 @@ def test_high_area_long_waits_for_pullback_confirmation() -> None:
 
     adjusted = _apply_multi_timeframe_context(signal, context)
 
-    assert "high area without pullback confirmation; wait for 1h/4h pullback before long" in adjusted["vetoes"]
+    assert adjusted["vetoes"] == ()
+    assert (
+        "high area has no pullback confirmation; entry price quality, "
+        "structure stop, and reward/risk decide"
+        in adjusted["reasons"]
+    )
     assert not _auto_signal_allowed(adjusted)
 
 
@@ -6396,7 +6924,7 @@ def test_one_way_high_area_allows_15m_boll_ema9_pullback() -> None:
     assert _auto_signal_allowed(adjusted)
 
 
-def test_normal_rsi_overheated_waits_for_1h_4h_pullback() -> None:
+def test_normal_rsi_overheated_is_nonblocking_and_keeps_score() -> None:
     signal = {
         "action": "ENTRY_LONG",
         "score": 95,
@@ -6415,12 +6943,21 @@ def test_normal_rsi_overheated_waits_for_1h_4h_pullback() -> None:
     }
 
     adjusted = _apply_multi_timeframe_context(signal, context)
+    baseline = _apply_multi_timeframe_context(
+        {**signal, "rsi14": None},
+        context,
+    )
 
-    assert "normal/chop trend RSI overheated; wait for 1h/4h pullback before long" in adjusted["vetoes"]
-    assert not _auto_signal_allowed(adjusted)
+    assert adjusted["score"] == baseline["score"]
+    assert adjusted["vetoes"] == ()
+    assert (
+        "RSI is hot but remains below the 92 hard limit; "
+        "no score deduction or entry veto"
+        in adjusted["reasons"]
+    )
 
 
-def test_one_way_hot_rsi_requires_1h_or_15m_pullback() -> None:
+def test_one_way_hot_rsi_is_nonblocking_with_or_without_pullback() -> None:
     signal = {
         "action": "ENTRY_LONG",
         "score": 96,
@@ -6446,12 +6983,21 @@ def test_one_way_hot_rsi_requires_1h_or_15m_pullback() -> None:
     signal = {**signal, "price": 97.2}
 
     blocked = _apply_multi_timeframe_context(signal, no_pullback_context)
+    blocked_baseline = _apply_multi_timeframe_context(
+        {**signal, "rsi14": None},
+        no_pullback_context,
+    )
     allowed = _apply_multi_timeframe_context(signal, pullback_context)
     _update_entry_position_fields(allowed)
 
-    assert "one-way uptrend RSI hot without 1h/15m pullback; wait before long" in blocked["vetoes"]
+    assert blocked["score"] == blocked_baseline["score"]
+    assert blocked["vetoes"] == ()
     assert not _auto_signal_allowed(blocked)
-    assert "one-way uptrend RSI hot, but 1h/15m pullback confirmed" in allowed["reasons"]
+    assert (
+        "RSI is hot but remains below the 92 hard limit; "
+        "no score deduction or entry veto"
+        in allowed["reasons"]
+    )
     assert _auto_signal_allowed(allowed)
 
 
@@ -6475,7 +7021,7 @@ def test_one_way_extreme_rsi_blocks_fresh_continuation_entry() -> None:
 
     adjusted = _apply_multi_timeframe_context(signal, context)
 
-    assert "one-way downtrend RSI below 8; skip fresh short and protect existing profit" in adjusted["vetoes"]
+    assert "RSI at or below 8; skip fresh short and protect existing profit" in adjusted["vetoes"]
     assert not _auto_signal_allowed(adjusted)
 
 
@@ -6522,7 +7068,7 @@ def test_ma_cluster_refines_stop_and_take_profit() -> None:
     assert tp2 == 122.0
 
 
-def test_multi_timeframe_high_pullback_with_distribution_risk_vetoes_long() -> None:
+def test_multi_timeframe_high_pullback_with_distribution_risk_reduces_size() -> None:
     signal = {
         "action": "ENTRY_LONG",
         "score": 95,
@@ -6540,7 +7086,14 @@ def test_multi_timeframe_high_pullback_with_distribution_risk_vetoes_long() -> N
 
     adjusted = _apply_multi_timeframe_context(signal, context)
 
-    assert "high pullback with OI/funding/crowd risk; avoid long entry" in adjusted["vetoes"]
+    assert adjusted["vetoes"] == ()
+    assert adjusted["leverage_cap"] == 3
+    assert adjusted["margin_factor"] == 0.3
+    assert (
+        "high pullback has OI/funding/crowd risk; keep the long "
+        "eligible with reduced leverage and margin"
+        in adjusted["risk_warnings"]
+    )
     assert not _auto_signal_allowed(adjusted)
 
 
@@ -6571,7 +7124,7 @@ def test_oi_deleverage_hold_long_is_only_an_event_until_valley_rebuild() -> None
     )
 
 
-def test_oi_deleverage_with_long_short_ratio_rising_vetoes_long_during_retail_carry() -> None:
+def test_oi_deleverage_with_long_short_ratio_rising_reduces_long_size() -> None:
     signal = {
         "action": "ENTRY_LONG",
         "score": 95,
@@ -6593,13 +7146,14 @@ def test_oi_deleverage_with_long_short_ratio_rising_vetoes_long_during_retail_ca
     assert adjusted["leverage_cap"] == 3
     assert adjusted["margin_factor"] == 0.3
     assert (
-        "4h OI dropped while long/short ratio rose; retail longs are carrying the decline"
-        in adjusted["vetoes"]
+        "4h OI dropped while long/short ratio rose; retail longs are "
+        "carrying the decline, so leverage and margin are reduced"
+        in adjusted["risk_warnings"]
     )
     assert not _auto_signal_allowed(adjusted)
 
 
-def test_weak_oi_rebound_vetoes_long_pullback() -> None:
+def test_weak_oi_rebound_reduces_long_size_without_score_penalty() -> None:
     signal = {
         "action": "ENTRY_LONG",
         "score": 98,
@@ -6620,7 +7174,15 @@ def test_weak_oi_rebound_vetoes_long_pullback() -> None:
 
     adjusted = _apply_multi_timeframe_context(signal, context)
 
-    assert "4h OI drained and volume is weak; EMA/BOLL bounce is not a clean long pullback" in adjusted["vetoes"]
+    assert adjusted["score"] >= signal["score"]
+    assert adjusted["vetoes"] == ()
+    assert adjusted["leverage_cap"] == 3
+    assert adjusted["margin_factor"] == 0.3
+    assert (
+        "4h OI drained and volume is weak; keep the long eligible "
+        "with reduced leverage and margin"
+        in adjusted["risk_warnings"]
+    )
     assert not _auto_signal_allowed(adjusted)
 
 
@@ -6684,9 +7246,11 @@ def test_oi_deleverage_breakdown_vetoes_long_and_waits_for_short_retest() -> Non
     assert "4h OI deleverage with price breakdown; avoid long entry" in adjusted_long["vetoes"]
     assert not _auto_signal_allowed(adjusted_long)
     assert (
-        "low area without 1h/4h resistance retest; wait for higher-timeframe bounce before short"
-        in adjusted_short["vetoes"]
+        "low area has no resistance retest; entry price quality, "
+        "structure stop, and reward/risk decide"
+        in adjusted_short["reasons"]
     )
+    assert not adjusted_short["vetoes"]
     assert not _auto_signal_allowed(adjusted_short)
 
 
@@ -6900,6 +7464,17 @@ def test_confirmed_entry_zone_provides_structure_stop_when_swing_is_missing() ->
         "risk_state": "NORMAL",
         "price": 100.0,
         "h1_trigger": {"direction": "SHORT", "state": "FAKE_BREAKOUT"},
+            "wick_confirmation": {
+                "state": "SHORT_EMA_REJECTION",
+                "timeframe": "1h",
+                "ema_timeframe": "4h",
+                "ema_period": 20,
+                "entry_level_keys": (
+                    "h4_ema20",
+                    "h4_ema20_ema60",
+                ),
+                "stop_anchor": 101.0,
+            },
         "entry_levels": {
             "short": {
                 "h4_ema20_ema60": {
@@ -7000,7 +7575,7 @@ def test_rotation_candidate_requires_one_way_volatility_and_clean_risk() -> None
     }
 
     assert _rotation_candidate_allowed(good, indicator_snapshot(close=100.0, atr=1.0, volume_ratio=1.5))
-    assert not _rotation_candidate_allowed({**good, "score": 99}, indicator_snapshot())
+    assert not _rotation_candidate_allowed({**good, "score": 94}, indicator_snapshot())
     assert not _rotation_candidate_allowed({**good, "trend_state": "TREND_LONG"}, indicator_snapshot())
     assert not _rotation_candidate_allowed({**good, "risk_state": "LONG_CROWD"}, indicator_snapshot())
     assert not _rotation_candidate_allowed(good, indicator_snapshot(close=100.0, atr=0.5, volume_ratio=1.5))
@@ -7246,7 +7821,7 @@ def test_auto_trade_marks_ready_candidates_blocked_after_position_capacity_is_fi
     assert "position capacity full: 1 open positions" in engine.latest_signals["SECONDUSDT"]["vetoes"]
 
 
-def test_auto_trade_pauses_altcoin_entries_when_btc_4h_is_extreme() -> None:
+def test_paper_auto_trade_records_btc_extreme_as_warning_without_blocking() -> None:
     market = FakeMarketData()
     market.btc_4h_extreme = True
     engine = PaperTradingEngine(AppSettings(), starting_balance=1000, market_data=market)
@@ -7257,15 +7832,26 @@ def test_auto_trade_pauses_altcoin_entries_when_btc_4h_is_extreme() -> None:
         "trend_state": "ONE_WAY_UP",
         "price": 100.0,
         "entry_levels": {"long": {"h1_support": {"low": 99.0, "high": 101.0, "price": 100.0}}},
+        "h1_structure": {
+            "resistance_zone_low": 105.0,
+            "resistance": 106.0,
+        },
     }
 
     import asyncio
 
     asyncio.run(engine._auto_trade_once())
 
-    assert not engine.account.positions
+    assert set(engine.account.positions) == {"TESTUSDT"}
     assert engine.latest_signals["TESTUSDT"]["entry_timing"] == "GOOD"
-    assert "BTC 4h extreme volatility; pause new altcoin entries" in engine.latest_signals["TESTUSDT"]["vetoes"]
+    assert (
+        "BTC 4h extreme volatility; pause new altcoin entries"
+        in engine.latest_signals["TESTUSDT"]["risk_warnings"]
+    )
+    assert (
+        "BTC 4h extreme volatility; pause new altcoin entries"
+        not in engine.latest_signals["TESTUSDT"]["vetoes"]
+    )
 
 
 def test_auto_trade_does_not_rotate_an_existing_position() -> None:

@@ -104,11 +104,11 @@ def test_strategy_uses_score_bands_and_keeps_risk_conditions_as_vetoes() -> None
     assert signal.vetoes == ("funding extreme",)
     assert signal.setup_type == SETUP_H1_PULLBACK_LONG
 
-    strategy._score_long = lambda *_: (64, ["long direction"], [], "")  # type: ignore[method-assign]
+    strategy._score_long = lambda *_: (54, ["long direction"], [], "")  # type: ignore[method-assign]
     signal = strategy.generate_signal("BTCUSDT", candles, indicators)
 
     assert signal.action == SignalAction.NO_TRADE
-    assert signal.score == 64
+    assert signal.score == 54
 
 
 def test_strategy_waits_when_long_short_score_gap_is_narrow() -> None:
@@ -151,8 +151,8 @@ def test_strategy_keeps_sub_watch_score_tie_as_no_trade() -> None:
     candles, derivatives = _trending_market()
     indicators = build_indicators(candles, derivatives)
     strategy = CompositeStrategy()
-    strategy._score_long = lambda *_: (60, ["long direction"], [], "")  # type: ignore[method-assign]
-    strategy._score_short = lambda *_: (60, ["short direction"], [], "")  # type: ignore[method-assign]
+    strategy._score_long = lambda *_: (54, ["long direction"], [], "")  # type: ignore[method-assign]
+    strategy._score_short = lambda *_: (54, ["short direction"], [], "")  # type: ignore[method-assign]
 
     signal = strategy.generate_signal("BTCUSDT", candles, indicators)
 
@@ -234,7 +234,7 @@ def test_strategy_emits_long_when_score_is_strong() -> None:
     assert signal.participant_flow_confirmed_bars == 2
 
 
-def test_strategy_downgrades_but_does_not_block_after_upper_wick_sweep() -> None:
+def test_strategy_does_not_score_or_block_generic_upper_wick() -> None:
     candles, derivatives = _trending_market()
     indicators = build_indicators(candles, derivatives)
     latest = candles[-1]
@@ -260,10 +260,13 @@ def test_strategy_downgrades_but_does_not_block_after_upper_wick_sweep() -> None
     signal = CompositeStrategy(StrategySettings(score_threshold=60, strict_trend_entry=False)).generate_signal("BTCUSDT", candles, indicators)
 
     assert "upper wick sweep rejected; avoid chasing long" not in signal.vetoes
-    assert "upper wick rejected; wait for pullback or reclaim before adding long" in signal.reasons
+    assert (
+        "upper wick rejected; wait for pullback or reclaim before adding long"
+        not in signal.reasons
+    )
 
 
-def test_strategy_downgrades_but_does_not_block_after_lower_wick_sweep() -> None:
+def test_strategy_does_not_score_or_block_generic_lower_wick() -> None:
     candles, derivatives = _trending_market()
     indicators = build_indicators(candles, derivatives)
     latest = candles[-1]
@@ -289,7 +292,10 @@ def test_strategy_downgrades_but_does_not_block_after_lower_wick_sweep() -> None
     _, reasons, vetoes, _ = CompositeStrategy(StrategySettings(score_threshold=70, strict_trend_entry=False))._score_short(candles, indicators)
 
     assert "lower wick sweep reclaimed; avoid chasing short" not in vetoes
-    assert "lower wick reclaimed; wait for bounce or breakdown before adding short" in reasons
+    assert (
+        "lower wick reclaimed; wait for bounce or breakdown before adding short"
+        not in reasons
+    )
 
 
 def test_strategy_rewards_market_structure_breakout() -> None:

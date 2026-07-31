@@ -795,7 +795,7 @@ PAPER_DASHBOARD_HTML = """
       '4h direction is not long; OI valley remains observation-only': '4H方向尚未看多，OI洼地仅保留为观察证据，不支持做多',
       '4h OI-valley absorption overrides the lagging lower-timeframe short bias': '4H OI洼地吸筹确认，覆盖滞后的低周期空头方向',
       '1h direction still lags the confirmed 4h reversal; retain A-size only': '1H方向仍滞后于已确认的4H反转，仅按A级仓位',
-      '4h bottom absorbed repeated downside wicks; OI rebuilt with a stable long/short ratio and EMA55 was reclaimed': '4H底部多次下插针均被吸收，OI回升且多空比稳定，价格已收回EMA55',
+      '4h bottom absorbed repeated downside wicks; OI rebuilt with a stable long/short ratio and EMA60 was reclaimed': '4H底部多次下插针均被吸收，OI回升且多空比稳定，价格已收回EMA60',
       'absolute long/short ratio remains crowded; reversal quality capped at A': '多空比绝对值仍拥挤，反转机会最高按A级',
       '4h OI sharp drop is not an OI valley and does not confirm a short entry': '4H OI骤减不等于OI洼地，也不用于确认做空',
       '4h OI deleverage with price breakdown; avoid long entry': '4小时 OI 大幅去杠杆且价格破位，禁止做多',
@@ -847,7 +847,7 @@ PAPER_DASHBOARD_HTML = """
       'stop loss: ATR volatility hard stop': '止损：ATR波动硬止损',
       'stop loss: 15m entry structure stop': '止损：15分钟入场结构失效',
       'stop loss: 4h OI-valley absorption floor failed by close': '止损：4H实体收盘跌破OI洼地吸筹底部',
-      'stop loss: 4h closed below EMA55 while OI increased; new shorts likely': '止损：4H收盘跌破EMA55且OI继续增加，疑似新增空头',
+      'stop loss: 4h closed below EMA60 while OI increased; new shorts likely': '止损：4H收盘跌破EMA60且OI继续增加，疑似新增空头',
       'take profit: 1h/4h body closed below support or EMA/BOLL zone': '止盈：1小时/4小时实体跌破支撑或EMA/BOLL区域，保护利润',
       'stop loss: 1h/4h body closed below support or EMA/BOLL zone': '止损：1小时/4小时实体跌破支撑或EMA/BOLL区域',
       'take profit: 1h/4h body closed above resistance or EMA/BOLL zone': '止盈：1小时/4小时实体突破压力或EMA/BOLL区域，保护利润',
@@ -1069,7 +1069,7 @@ PAPER_DASHBOARD_HTML = """
         return values ? `实际盈亏比${values[1]}R，低于最低${values[2]}R` : '实际盈亏比低于最低要求';
       }
       if (reason.startsWith('final score ')) {
-        return '评分低于80';
+        return '评分低于75';
       }
       if (reason === 'directional entry signal not established') {
         return '多空方向信号尚未成立';
@@ -1184,7 +1184,7 @@ PAPER_DASHBOARD_HTML = """
         ['breakout protection stop', '突破保护止损触发'],
         ['short trend support protection stop', '空头趋势支撑保护止损触发'],
         ['oi-valley absorption floor failed by close', '4小时实体收盘跌破OI洼地吸筹底部'],
-        ['closed below ema55 while oi increased', '4小时收盘跌破EMA55且OI增加，疑似新增空头'],
+        ['closed below ema60 while oi increased', '4小时收盘跌破EMA60且OI增加，疑似新增空头'],
         ['body closed below support or ema/boll zone', '实体收盘跌破支撑或EMA/BOLL区域'],
         ['body closed above resistance or ema/boll zone', '实体收盘突破压力或EMA/BOLL区域'],
         ['strong trend ema50 structure invalidated', '强趋势EMA50结构失效'],
@@ -1227,7 +1227,7 @@ PAPER_DASHBOARD_HTML = """
       ) return '下插针收回，等待反抽或重新跌回';
       if (vetoText[reason]) return vetoText[reason];
       if (reason === 'directional entry signal not established') return '多/空方向未成立';
-      if (reason.startsWith('final score ')) return '评分低于80';
+      if (reason.startsWith('final score ')) return '评分低于75';
       if (reason.startsWith('liquidity state ')) return '流动性异常或未知，禁止新开仓';
       if (reason.startsWith('system risk state ')) return '系统性风险异常或未知，禁止新增风险';
       if (reason.startsWith('等待 ') || reason.startsWith('已进入建议区') || reason === '暂无有效建议入场区') {
@@ -1258,6 +1258,21 @@ PAPER_DASHBOARD_HTML = """
       }
       if (/[\u3400-\u9fff]/.test(reason)) return reason;
       return '其他风控条件未满足';
+    }
+    function tRiskWarning(value) {
+      const warning = String(value || '').trim();
+      const translations = {
+        'extreme volatility observed; paper entry remains eligible': '极端波动观察（模拟盘不阻断）',
+        'liquidity state THIN; paper entry remains eligible': '流动性偏薄（模拟盘不阻断）',
+        'system risk state STRESS; paper entry remains eligible': '系统性风险承压（模拟盘不阻断）',
+        'BTC 4h extreme volatility; pause new altcoin entries': 'BTC 4H极端波动（模拟盘不阻断）',
+        '4h OI drained and volume is weak; keep the long eligible with reduced leverage and margin': '4H OI去杠杆且量能偏弱，已降低杠杆和仓位（不阻断）',
+        'high pullback has OI/funding/crowd risk; keep the long eligible with reduced leverage and margin': '高位回踩伴随OI/资金费率/拥挤风险，已降低杠杆和仓位（不阻断）',
+        'low pullback has OI/funding/crowd risk; keep the short eligible with reduced leverage and margin': '低位反抽伴随OI/资金费率/拥挤风险，已降低杠杆和仓位（不阻断）',
+        '4h OI dropped while long/short ratio rose; retail longs are carrying the decline, so leverage and margin are reduced': '4H OI下降但多空比上升，散户多头承接下跌，已降低杠杆和仓位（不阻断）'
+      };
+      if (translations[warning]) return translations[warning];
+      return warning;
     }
     function tMtfSummary(value) {
       const text = String(value || '');
@@ -1644,8 +1659,11 @@ PAPER_DASHBOARD_HTML = """
       else if (reasonHas(rawReasons, ['long/short ratio is not overcrowded', '多空比未出现'])) riskBits.push('情绪未拥挤');
       const structureHeld = has1hHeld || has1hRejected || ['RETEST', 'BREAKOUT', 'BREAKDOWN', 'FAKE_BREAKOUT', 'FAKE_BREAKDOWN'].includes(h1State);
       if (structureHeld) riskBits.push('结构未失效');
+      reasonList(signal.risk_warnings || []).forEach(warning => {
+        riskBits.push(tRiskWarning(warning));
+      });
       if (!riskBits.length) riskBits.push('风险正常');
-      const riskLine = `指标与风险：${riskBits.join('；')}。`;
+      const riskLine = `指标与风险：${[...new Set(riskBits)].join('；')}。`;
 
       return `${structureLine}\n${entryLine}\n${riskLine}`;
     }

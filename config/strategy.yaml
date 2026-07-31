@@ -7,8 +7,8 @@ timeframes:
   - 1d
 
 strategy:
-  score_threshold: 80
-  watch_threshold: 65
+  score_threshold: 75
+  watch_threshold: 55
   strict_trend_entry: false
   volume_window: 20
   volume_min_ratio: 1.2
@@ -65,9 +65,9 @@ risk:
   total_margin_limit: 0.50
   total_open_risk_limit: 0.02
   max_open_positions: 3
-  daily_loss_limit: 0.015
+  daily_loss_limit: 0.0
   weekly_loss_limit: 0.0
-  max_drawdown_circuit_breaker: 0.08
+  max_drawdown_circuit_breaker: 0.0
   max_consecutive_losses: 0
   cooldown_hours: 0
   atr_stop_buffer: 0.5
