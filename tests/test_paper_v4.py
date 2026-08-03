@@ -27,9 +27,11 @@ from ai_trading.paper import (
     _clear_transient_auto_entry_blocks,
     _entry_context_from_signal,
     _entry_quality_grade,
+    _exit_timeframe_from_position,
     _latest_closed_slot,
     _promote_plan3_stop_after_structure,
     _record_auto_entry_block,
+    _side_entry_timing,
     _timeframe_seconds,
     _v3_runner_can_continue,
 )
@@ -65,9 +67,13 @@ def _position(
     )
 
 
-def _indicator(close: float = 110.0) -> IndicatorSnapshot:
+def _indicator(
+    close: float = 110.0,
+    *,
+    timestamp: datetime = NOW,
+) -> IndicatorSnapshot:
     return IndicatorSnapshot(
-        timestamp=NOW,
+        timestamp=timestamp,
         close=close,
         ema20=105.0,
         ema50=103.0,
@@ -82,6 +88,31 @@ def _indicator(close: float = 110.0) -> IndicatorSnapshot:
         volume_ratio=1.0,
         ema50_slope=0.1,
     )
+
+
+def _plan4_position(
+    *,
+    stop_timeframe: str = "1h",
+    disaster_stop: float = 80.0,
+) -> Position:
+    position = _position()
+    position.metadata.update(
+        {
+            "plan_version": 4,
+            "structure_stop_price": 90.0,
+            "soft_stop_price": 90.0,
+            "hard_stop_price": disaster_stop,
+            "disaster_stop_price": disaster_stop,
+            "stop_execution_mode": "HTF_CLOSE",
+            "entry_context": {
+                "entry_source": "AUTO_STRATEGY",
+                "score_model_version": 8,
+                "stop_timeframe": stop_timeframe,
+                "stop_execution_mode": "HTF_CLOSE",
+            },
+        }
+    )
+    return position
 
 
 def _closed_candle_series(
@@ -122,9 +153,9 @@ def _v8_ready_signal(
         "PRICE_PROGRESS": progress_score,
     }
     return {
-        "prd_version": "4.0",
+        "prd_version": "5.0",
         "score_model_version": 8,
-        "entry_pipeline_version": 4,
+        "entry_pipeline_version": 5,
         "timestamp": NOW.isoformat(),
         "action": SignalAction.ENTRY_LONG.value,
         "candidate_action": SignalAction.ENTRY_LONG.value,
@@ -143,18 +174,19 @@ def _v8_ready_signal(
         "risk_state": "NORMAL",
         "price": 100.8,
         "m15_atr14": 1.0,
-        "selected_level_key": "h1_support",
+        "selected_level_key": "h1_ema20",
         "selected_level_zone": {
             "low": 99.0,
             "high": 101.0,
             "price": 100.0,
         },
         "selected_level_structural": True,
+        "selected_level_eligible": True,
         "v8_structure_stop": 98.0,
         "v8_structure_target": 110.0,
         "entry_levels": {
             "long": {
-                "h1_support": {
+                "h1_ema20": {
                     "low": 99.0,
                     "high": 101.0,
                     "price": 100.0,
@@ -267,10 +299,155 @@ def test_v4_research_and_startup_scores_execute_real_open_orders(
     entry_context = position.metadata["entry_context"]
     assert entry_context["entry_mode"] == expected_mode
     assert entry_context["setup_score"] == score
-    assert entry_context["plan_version"] == 3
+    assert entry_context["plan_version"] == 4
     assert any(
         fill.action == "OPEN" and fill.symbol == "TESTUSDT"
         for fill in engine.account.fills
+    )
+
+
+@pytest.mark.parametrize(
+    (
+        "score",
+        "direction_score",
+        "structure_score",
+        "participation_score",
+        "expected_quality",
+        "expected_max_units",
+    ),
+    [
+        (75, 12, 25, 5, "B", 1),
+        (80, 12, 25, 10, "A", 1),
+        (95, 20, 27, 15, "S", 2),
+    ],
+)
+def test_paper_auto_entry_uses_one_initial_unit_for_every_quality(
+    score: int,
+    direction_score: int,
+    structure_score: int,
+    participation_score: int,
+    expected_quality: str,
+    expected_max_units: int,
+) -> None:
+    settings = AppSettings()
+    settings.execution.paper_trading = True
+    settings.risk.paper_fixed_unit_sizing = True
+    settings.risk.max_open_positions = 1
+    engine = PaperTradingEngine(
+        settings,
+        starting_balance=1_000.0,
+        symbols=["TESTUSDT"],
+        market_data=_FlatPaperMarket(),
+        clock=lambda: NOW,
+    )
+    engine._remember_mark_price("TESTUSDT", 100.8)
+    signal = _v8_ready_signal(
+        score=score,
+        direction_score=direction_score,
+        progress_score=8,
+    )
+    score_breakdown = dict(signal["score_breakdown"])
+    score_breakdown["STRUCTURE"] = structure_score
+    score_breakdown["PARTICIPATION"] = participation_score
+    assert sum(score_breakdown.values()) == score
+    signal["score_breakdown"] = score_breakdown
+    signal["score_evidence_families"] = dict(score_breakdown)
+    engine.latest_signals["TESTUSDT"] = signal
+
+    asyncio.run(engine._auto_trade_once())
+
+    position = engine.account.positions["TESTUSDT"]
+    context = position.metadata["entry_context"]
+    assert position.metadata["margin_usdt"] == pytest.approx(190.0)
+    assert engine.account.fills[-1].margin_usdt == pytest.approx(190.0)
+    assert context["entry_quality"] == expected_quality
+    assert context["capital_units"] == pytest.approx(1.0)
+    assert context["max_capital_units"] == expected_max_units
+    assert context["position_sizing_mode"] == "FIXED_CAPITAL_UNIT"
+    assert context["entry_source"] == "AUTO_STRATEGY"
+    assert context["risk_gate_status"] == "PAPER_FIXED_UNIT"
+    assert context["allocated_margin_usdt"] == pytest.approx(190.0)
+    assert context["risk_sized_margin_usdt"] < 190.0
+    assert context["planned_risk_usdt"] > context["risk_budget_usdt"]
+    assert context["open_risk_after_usdt"] == pytest.approx(
+        context["open_risk_before_usdt"]
+        + context["planned_risk_usdt"]
+    )
+    assert position.metadata["initial_risk_usdt"] == pytest.approx(
+        context["planned_risk_usdt"]
+    )
+
+
+@pytest.mark.parametrize(
+    ("paper_trading", "fixed_unit_sizing"),
+    [(True, False), (False, True)],
+)
+def test_fixed_unit_mode_falls_back_to_risk_sizing_when_disabled(
+    paper_trading: bool,
+    fixed_unit_sizing: bool,
+) -> None:
+    settings = AppSettings()
+    settings.execution.paper_trading = paper_trading
+    settings.risk.paper_fixed_unit_sizing = fixed_unit_sizing
+    settings.risk.max_open_positions = 1
+    engine = PaperTradingEngine(
+        settings,
+        starting_balance=1_000.0,
+        symbols=["TESTUSDT"],
+        market_data=_FlatPaperMarket(),
+        clock=lambda: NOW,
+    )
+    engine._remember_mark_price("TESTUSDT", 100.8)
+    engine.latest_signals["TESTUSDT"] = _v8_ready_signal(
+        score=95,
+        direction_score=12,
+        progress_score=8,
+    )
+
+    asyncio.run(engine._auto_trade_once())
+
+    position = engine.account.positions["TESTUSDT"]
+    context = position.metadata["entry_context"]
+    assert position.metadata["margin_usdt"] < 190.0
+    assert context["position_sizing_mode"] == "RISK_BASED"
+    assert context["risk_gate_status"] == "ALLOWED"
+
+
+def test_fixed_unit_mode_keeps_account_loss_gate_as_a_hard_block() -> None:
+    settings = AppSettings()
+    settings.execution.paper_trading = True
+    settings.risk.paper_fixed_unit_sizing = True
+    settings.risk.daily_loss_limit = 0.01
+    engine = PaperTradingEngine(
+        settings,
+        starting_balance=1_000.0,
+        symbols=["TESTUSDT"],
+        market_data=_FlatPaperMarket(),
+        clock=lambda: NOW,
+    )
+    engine._account_risk_snapshot(engine.status(), now=NOW)
+    engine.account.wallet_balance = 900.0
+    engine._remember_mark_price("TESTUSDT", 100.8)
+    signal = _v8_ready_signal(
+        score=75,
+        direction_score=12,
+        progress_score=8,
+    )
+    score_breakdown = dict(signal["score_breakdown"])
+    score_breakdown["PARTICIPATION"] = 5
+    signal["score_breakdown"] = score_breakdown
+    signal["score_evidence_families"] = dict(score_breakdown)
+    engine.latest_signals["TESTUSDT"] = signal
+
+    asyncio.run(engine._auto_trade_once())
+
+    assert "TESTUSDT" not in engine.account.positions
+    published = engine.latest_signals["TESTUSDT"]
+    assert published["risk_gate_status"] == "BLOCKED"
+    assert published["risk_gate_code"] == "DAILY_LOSS_LIMIT"
+    assert any(
+        "daily loss limit reached" in str(reason)
+        for reason in published["auto_entry_blocks"]
     )
 
 
@@ -551,3 +728,237 @@ def test_confirmed_crowding_tightens_runner_but_does_not_exit_it() -> None:
     assert normal.stop_price == 105.0
     assert crowded.stop_price == 107.5
     assert crowded.metadata["plan3_crowding_tightened"] is True
+
+
+def test_plan4_structure_stop_waits_for_new_h1_close() -> None:
+    engine = PaperTradingEngine(
+        AppSettings(),
+        starting_balance=1_000.0,
+        symbols=["TESTUSDT"],
+    )
+    position = _plan4_position(stop_timeframe="1h")
+    engine.account.positions[position.symbol] = position
+
+    # The live mark (or an intrabar wick) may cross the ordinary structure
+    # price, but plan 4 must wait for a newly closed H1 body.
+    engine._manage_open_position_v3(
+        position,
+        89.0,
+        {},
+        _indicator(100.0, timestamp=NOW),
+        strong_trend=False,
+    )
+
+    assert position.symbol in engine.account.positions
+
+    engine._manage_open_position_v3(
+        position,
+        89.0,
+        {},
+        _indicator(89.0, timestamp=NOW + timedelta(hours=1)),
+        strong_trend=False,
+    )
+
+    assert position.symbol not in engine.account.positions
+    assert "structure close confirmed" in engine.account.fills[-1].reason
+
+
+def test_plan4_h4_position_ignores_h1_failure_until_h4_close() -> None:
+    engine = PaperTradingEngine(
+        AppSettings(),
+        starting_balance=1_000.0,
+        symbols=["TESTUSDT"],
+    )
+    position = _plan4_position(stop_timeframe="4h")
+    engine.account.positions[position.symbol] = position
+    engine.latest_prices[position.symbol] = 89.0
+    engine.latest_timeframe_indicators[position.symbol] = {
+        "1h": [_indicator(89.0, timestamp=NOW + timedelta(hours=1))],
+        "4h": [_indicator(100.0, timestamp=NOW)],
+    }
+    engine.latest_signals[position.symbol] = {
+        "h1_trigger": {"direction": "SHORT", "state": "BREAKDOWN"},
+        "h4_structure": {"direction": "LONG", "state": "RANGE"},
+    }
+
+    engine._manage_open_positions()
+
+    assert position.symbol in engine.account.positions
+
+    engine.latest_timeframe_indicators[position.symbol]["4h"] = [
+        _indicator(89.0, timestamp=NOW + timedelta(hours=4))
+    ]
+    engine.latest_signals[position.symbol]["h4_structure"] = {
+        "direction": "SHORT",
+        "state": "BREAKDOWN_DOWN",
+    }
+    engine._manage_open_positions()
+
+    assert position.symbol not in engine.account.positions
+    assert "structure close confirmed" in engine.account.fills[-1].reason
+
+
+def test_plan4_m15_tactical_stop_confirmation_is_promoted_to_h1() -> None:
+    engine = PaperTradingEngine(
+        AppSettings(),
+        starting_balance=1_000.0,
+        symbols=["TESTUSDT"],
+    )
+    position = _plan4_position(stop_timeframe="15m")
+    engine.account.positions[position.symbol] = position
+    engine.latest_prices[position.symbol] = 89.0
+    engine.latest_timeframe_indicators[position.symbol] = {
+        "15m": [_indicator(100.0, timestamp=NOW)],
+        "1h": [_indicator(100.0, timestamp=NOW)],
+    }
+
+    assert _exit_timeframe_from_position(position) == "1h"
+    engine._manage_open_positions()
+    assert position.symbol in engine.account.positions
+
+    engine.latest_timeframe_indicators[position.symbol]["15m"] = [
+        _indicator(89.0, timestamp=NOW + timedelta(minutes=15))
+    ]
+    engine._manage_open_positions()
+    assert position.symbol in engine.account.positions
+
+    engine.latest_timeframe_indicators[position.symbol]["1h"] = [
+        _indicator(89.0, timestamp=NOW + timedelta(hours=1))
+    ]
+    engine._manage_open_positions()
+
+    assert position.symbol not in engine.account.positions
+    assert "structure close confirmed" in engine.account.fills[-1].reason
+
+
+def test_plan4_disaster_stop_executes_on_mark_without_atr_reason() -> None:
+    engine = PaperTradingEngine(
+        AppSettings(),
+        starting_balance=1_000.0,
+        symbols=["TESTUSDT"],
+    )
+    position = _plan4_position(disaster_stop=80.0)
+    engine.account.positions[position.symbol] = position
+
+    engine._manage_open_position_v3(
+        position,
+        79.0,
+        {},
+        _indicator(100.0),
+        strong_trend=False,
+    )
+
+    assert position.symbol not in engine.account.positions
+    assert "灾难保护触发" in engine.account.fills[-1].reason
+    assert "ATR" not in engine.account.fills[-1].reason
+
+
+def test_plan3_loaded_position_keeps_legacy_mark_stop() -> None:
+    engine = PaperTradingEngine(
+        AppSettings(),
+        starting_balance=1_000.0,
+        symbols=["TESTUSDT"],
+    )
+    position = _position()
+    engine.account.positions[position.symbol] = position
+
+    engine._manage_open_position_v3(
+        position,
+        89.0,
+        {},
+        _indicator(100.0),
+        strong_trend=False,
+    )
+
+    assert position.symbol not in engine.account.positions
+
+
+def test_qualified_suggested_zone_hit_still_means_good_entry_timing() -> None:
+    signal = _v8_ready_signal(
+        score=75,
+        direction_score=12,
+        progress_score=13,
+    )
+
+    timing, reason = _side_entry_timing(
+        PositionSide.LONG,
+        100.8,
+        signal,
+    )
+
+    assert timing == "GOOD"
+    assert reason == "已到优势入场区"
+
+
+def test_unclosed_live_m15_does_not_replace_v5_authorized_zone() -> None:
+    engine = PaperTradingEngine(
+        AppSettings(),
+        starting_balance=1_000.0,
+        symbols=["TESTUSDT"],
+    )
+    confirmed = [
+        Candle(
+            timestamp=NOW - timedelta(minutes=15 * (60 - index)),
+            open=100.0,
+            high=101.0,
+            low=99.0,
+            close=100.0,
+            volume=1_000.0,
+        )
+        for index in range(60)
+    ]
+    engine._timeframe_candles["TESTUSDT"] = {"15m": confirmed}
+    engine._live_m15_candles["TESTUSDT"] = Candle(
+        timestamp=NOW,
+        open=100.0,
+        high=103.0,
+        low=97.0,
+        close=102.0,
+        volume=0.0,
+    )
+    signal = _v8_ready_signal(
+        score=75,
+        direction_score=12,
+        progress_score=13,
+    )
+    original_precision = {
+        "trend": "UP",
+        "pullback": "WAIT",
+    }
+    signal["m15_precision"] = dict(original_precision)
+    original_levels = dict(signal["entry_levels"])
+
+    engine._apply_live_m15_overlay("TESTUSDT", signal)
+
+    assert signal["m15_precision"] == original_precision
+    assert signal["entry_levels"] == original_levels
+    assert "live_m15_precision" in signal
+
+
+def test_stale_v8_entry_zone_policy_waits_for_v5_rescore() -> None:
+    engine = PaperTradingEngine(
+        AppSettings(),
+        starting_balance=1_000.0,
+        symbols=["TESTUSDT"],
+        market_data=_FlatPaperMarket(),
+        clock=lambda: NOW,
+    )
+    engine._remember_mark_price("TESTUSDT", 100.8)
+    signal = _v8_ready_signal(
+        score=75,
+        direction_score=12,
+        progress_score=13,
+    )
+    signal["entry_pipeline_version"] = 4
+    engine.latest_signals["TESTUSDT"] = signal
+
+    asyncio.run(engine._auto_trade_once())
+
+    assert "TESTUSDT" not in engine.account.positions
+    assert any(
+        "entry-zone policy is stale" in str(reason)
+        for reason in engine.latest_signals["TESTUSDT"].get(
+            "auto_entry_blocks",
+            (),
+        )
+    )

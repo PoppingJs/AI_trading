@@ -92,10 +92,14 @@ ROTATION_MIN_VOLUME_RATIO = 1.2
 PYRAMID_MAX_ADDS = 1
 AUTO_PYRAMID_ENABLED = False
 AUTO_ROTATION_ENABLED = False
-CURRENT_TRADE_PLAN_VERSION = 3
+CURRENT_TRADE_PLAN_VERSION = 4
 PAPER_DEFAULT_BALANCE = 1200.0
 CAPITAL_DEPLOYMENT_FRACTION = 0.95
 CAPITAL_UNIT_COUNT = 5
+PAPER_FIXED_UNIT_RISK_STATUS = "PAPER_FIXED_UNIT"
+PAPER_FIXED_UNIT_ADVISORY_RISK_BLOCKS = frozenset(
+    {"OPEN_RISK_LIMIT", "MARGIN_LIMIT"}
+)
 ENTRY_QUALITY_A_MIN_SCORE = 80
 ENTRY_QUALITY_S_MIN_SCORE = 95
 ENTRY_ADVANTAGE_ZONE_FRACTION = 0.60
@@ -130,7 +134,7 @@ MIN_ENTRY_REWARD_R = 1.3
 SCORE_MODEL_VERSION = 8
 FROZEN_SCORE_MODEL_VERSION = 7
 LEGACY_SCORE_MODEL_VERSION = 2
-ENTRY_PIPELINE_VERSION = 4
+ENTRY_PIPELINE_VERSION = 5
 DIRECTION_H4_BASE_SCORE = 6
 DIRECTION_DAILY_BACKGROUND_SCORE = 3
 DIRECTION_ALIGNMENT_BONUS = 3
@@ -1026,7 +1030,13 @@ class PaperTradingEngine:
             take_profit_1 = take_profit_1 or _default_take_profit(side_enum, price, stop_loss, 1)
             take_profit_2 = take_profit_2 or _default_take_profit(side_enum, price, stop_loss, 2)
             normalized_entry_context = _normalize_entry_context(entry_context)
-            if normalized_entry_context.get("risk_gate_status") == "ALLOWED":
+            risk_gate_status = str(
+                normalized_entry_context.get("risk_gate_status") or ""
+            )
+            if risk_gate_status in {
+                "ALLOWED",
+                PAPER_FIXED_UNIT_RISK_STATUS,
+            }:
                 requested_margin = normalized_entry_context.get(
                     "requested_margin_usdt"
                 )
@@ -1060,10 +1070,55 @@ class PaperTradingEngine:
                     ),
                     self._account_risk_snapshot(self.status()),
                 )
-                if not final_decision.allowed:
+                fixed_unit_entry = bool(
+                    risk_gate_status == PAPER_FIXED_UNIT_RISK_STATUS
+                    and self.settings.execution.paper_trading
+                    and self.settings.risk.paper_fixed_unit_sizing
+                    and normalized_entry_context.get("entry_source")
+                    == "AUTO_STRATEGY"
+                    and normalized_entry_context.get("position_sizing_mode")
+                    == "FIXED_CAPITAL_UNIT"
+                )
+                if not final_decision.allowed and not (
+                    fixed_unit_entry
+                    and final_decision.blocked_code
+                    in PAPER_FIXED_UNIT_ADVISORY_RISK_BLOCKS
+                ):
                     detail = final_decision.reasons[0] if final_decision.reasons else final_decision.blocked_code
                     raise ValueError(f"risk gate blocked entry at execution: {detail}")
-                if margin_usdt > final_decision.margin_required + 1e-9:
+                if fixed_unit_entry:
+                    actual_planned_risk = _planned_entry_risk_usdt(
+                        margin_usdt=margin_usdt,
+                        leverage=leverage,
+                        entry_price=price,
+                        stop_price=stop_loss,
+                        adverse_cost_rate=float(
+                            normalized_entry_context.get(
+                                "adverse_cost_rate",
+                                0.0,
+                            )
+                            or 0.0
+                        ),
+                    )
+                    normalized_entry_context.update(
+                        {
+                            "risk_gate_status": PAPER_FIXED_UNIT_RISK_STATUS,
+                            "risk_gate_code": final_decision.blocked_code,
+                            "risk_sized_margin_usdt": (
+                                final_decision.margin_required
+                            ),
+                            "allocated_margin_usdt": margin_usdt,
+                            "planned_risk_usdt": actual_planned_risk,
+                            "open_risk_before_usdt": (
+                                final_decision.open_risk_before_usdt
+                            ),
+                            "open_risk_after_usdt": (
+                                final_decision.open_risk_before_usdt
+                                + actual_planned_risk
+                            ),
+                        }
+                    )
+                elif margin_usdt > final_decision.margin_required + 1e-9:
                     margin_usdt = final_decision.margin_required
                     if margin_usdt < 5:
                         raise ValueError(
@@ -1093,12 +1148,67 @@ class PaperTradingEngine:
                 normalized_entry_context,
                 side_enum,
             )
-            soft_stop_price = _soft_structure_stop_price(
-                side_enum,
-                price,
-                stop_loss,
-                normalized_entry_context,
+            requested_plan_version = int(
+                normalized_entry_context.get("plan_version") or 0
             )
+            plan4_auto_position = bool(
+                requested_plan_version >= 4
+                and self.settings.execution.paper_trading
+                and normalized_entry_context.get("entry_source")
+                == "AUTO_STRATEGY"
+                and int(
+                    normalized_entry_context.get("score_model_version") or 0
+                )
+                >= 8
+            )
+            plan_version = (
+                requested_plan_version
+                if requested_plan_version < 4 or plan4_auto_position
+                else 0
+            )
+            structure_stop_price = stop_loss
+            if plan4_auto_position:
+                disaster_stop_price = _float_or_none(
+                    normalized_entry_context.get("disaster_stop_price")
+                )
+                disaster_is_remote = bool(
+                    disaster_stop_price is not None
+                    and (
+                        disaster_stop_price < structure_stop_price
+                        if side_enum == PositionSide.LONG
+                        else disaster_stop_price > structure_stop_price
+                    )
+                )
+                if not disaster_is_remote:
+                    disaster_stop_price, disaster_basis = (
+                        _v4_disaster_stop_plan(
+                            side_enum,
+                            price,
+                            structure_stop_price,
+                            normalized_entry_context,
+                            leverage,
+                        )
+                    )
+                    normalized_entry_context["disaster_stop_basis"] = (
+                        disaster_basis
+                    )
+                normalized_entry_context.update(
+                    {
+                        "structure_stop_price": structure_stop_price,
+                        "disaster_stop_price": disaster_stop_price,
+                        "stop_execution_mode": "HTF_CLOSE",
+                    }
+                )
+                soft_stop_price = structure_stop_price
+                hard_stop_price = disaster_stop_price
+            else:
+                soft_stop_price = _soft_structure_stop_price(
+                    side_enum,
+                    price,
+                    stop_loss,
+                    normalized_entry_context,
+                )
+                hard_stop_price = stop_loss
             entry_position = _entry_position_text(side_enum, price, normalized_entry_context, reason)
             position = Position(
                 symbol=symbol,
@@ -1129,14 +1239,19 @@ class PaperTradingEngine:
                         normalized_entry_context.get("entry_trigger") or ""
                     ),
                     "validation_state": "UNVALIDATED",
+                    "structure_stop_price": structure_stop_price,
                     "soft_stop_price": soft_stop_price,
-                    "hard_stop_price": stop_loss,
+                    "hard_stop_price": hard_stop_price,
+                    "disaster_stop_price": (
+                        hard_stop_price if plan4_auto_position else 0.0
+                    ),
+                    "stop_execution_mode": (
+                        "HTF_CLOSE" if plan4_auto_position else "MARK_PRICE"
+                    ),
                     "adds": 0,
                     # 兼容旧调用：只有显式携带新版交易计划的自动开仓才启用
                     # 分段止盈/时间止损等 V2 仓位管理，手工开仓与历史仓位继续走旧逻辑。
-                    "plan_version": int(
-                        normalized_entry_context.get("plan_version") or 0
-                    ),
+                    "plan_version": plan_version,
                     "position_stage": "OPEN",
                     "initial_stop_distance": abs(price - stop_loss),
                     "initial_risk_usdt": float(
@@ -1449,6 +1564,16 @@ class PaperTradingEngine:
             - self.account.starting_balance
             + self.account.fees_paid
         )
+        completed_trade_pnls = _completed_trade_cycle_pnls(
+            self.account.fills
+        )
+        completed_trade_count = len(completed_trade_pnls)
+        win_rate = (
+            sum(pnl > 0 for pnl in completed_trade_pnls)
+            / completed_trade_count
+            if completed_trade_count
+            else 0.0
+        )
         now = self._now()
         entry_gate = self._new_entry_gate_status(equity, now=now)
         pnl_history = _pnl_history_payload(self.account.pnl_history, total_pnl, now=now)
@@ -1479,6 +1604,8 @@ class PaperTradingEngine:
             "total_pnl": total_pnl,
             "total_pnl_pct": total_pnl / self.account.starting_balance,
             "fees_paid": self.account.fees_paid,
+            "completed_trade_count": completed_trade_count,
+            "win_rate": win_rate,
             "latest_prices": latest_prices,
             "latest_signals": latest_signals,
             "latest_timeframe_contexts": latest_timeframe_contexts,
@@ -1832,8 +1959,15 @@ class PaperTradingEngine:
         candles = _merge_candles(confirmed, [live_candle], max_length=max(240, self.settings.strategy.ma_trend + 40))
         indicators = _build_price_only_indicators(candles, self.settings)
         precision = _fifteen_minute_precision(candles, indicators, self.settings)
-        signal["m15_precision"] = precision
+        # The unfinished 15m candle is useful for live diagnostics, but V8/V5
+        # entry-zone authorization is based only on the last closed candle.
+        # Otherwise a moving mark could manufacture or replace the qualified
+        # suggested zone while the candle is still forming.
+        signal["live_m15_precision"] = precision
         signal["live_rsi14"] = indicators[-1].rsi14 if indicators else None
+        if int(signal.get("score_model_version") or 0) >= 8:
+            return
+        signal["m15_precision"] = precision
         levels = signal.get("entry_levels")
         if not isinstance(levels, dict):
             return
@@ -2746,6 +2880,16 @@ class PaperTradingEngine:
             _clear_transient_auto_entry_blocks(signal)
             if symbol in self.account.positions:
                 continue
+            if (
+                int(signal.get("score_model_version") or 0) >= 8
+                and int(signal.get("entry_pipeline_version") or 0)
+                < ENTRY_PIPELINE_VERSION
+            ):
+                _record_auto_entry_block(
+                    signal,
+                    "entry-zone policy is stale; wait for a closed-candle V5 rescore",
+                )
+                continue
             if system_risk_state == "STRESS":
                 reason = (
                     "BTC 4h extreme volatility; pause new altcoin entries"
@@ -3059,7 +3203,15 @@ class PaperTradingEngine:
                     self._account_risk_snapshot(status),
                 )
                 self._remember_risk_decision(signal, risk_decision)
-                if not risk_decision.allowed:
+                fixed_unit_sizing = bool(
+                    self.settings.execution.paper_trading
+                    and self.settings.risk.paper_fixed_unit_sizing
+                )
+                if not risk_decision.allowed and not (
+                    fixed_unit_sizing
+                    and risk_decision.blocked_code
+                    in PAPER_FIXED_UNIT_ADVISORY_RISK_BLOCKS
+                ):
                     _record_auto_entry_block(
                         signal,
                         risk_decision.reasons[0]
@@ -3067,11 +3219,55 @@ class PaperTradingEngine:
                         else risk_decision.blocked_code,
                     )
                     continue
-                margin = risk_decision.margin_required
-                planned_risk_usdt = risk_decision.planned_risk_usdt
+                if fixed_unit_sizing:
+                    margin = _initial_fixed_margin_for_quality(
+                        entry_quality,
+                        equity=equity,
+                        used_margin=float(status["used_margin"]),
+                        available_balance=float(status["available_balance"]),
+                    )
+                    if margin < 5:
+                        _record_auto_entry_block(
+                            signal,
+                            (
+                                f"available entry margin {margin:.2f} USDT "
+                                "below minimum 5.00 USDT"
+                            ),
+                        )
+                        continue
+                    planned_risk_usdt = _planned_entry_risk_usdt(
+                        margin_usdt=margin,
+                        leverage=leverage,
+                        entry_price=entry_price,
+                        stop_price=stop_loss,
+                        adverse_cost_rate=round_trip_cost_rate,
+                    )
+                    signal.update(
+                        {
+                            "risk_gate_status": (
+                                PAPER_FIXED_UNIT_RISK_STATUS
+                            ),
+                            "risk_gate_code": risk_decision.blocked_code,
+                            "risk_sized_margin_usdt": (
+                                risk_decision.margin_required
+                            ),
+                            "allocated_margin_usdt": margin,
+                            "planned_risk_usdt": planned_risk_usdt,
+                            "open_risk_after_usdt": (
+                                risk_decision.open_risk_before_usdt
+                                + planned_risk_usdt
+                            ),
+                        }
+                    )
+                else:
+                    margin = risk_decision.margin_required
+                    planned_risk_usdt = risk_decision.planned_risk_usdt
                 entry_context = _entry_context_from_signal(signal)
                 entry_context["stop_basis"] = stop_basis
-                entry_context["stop_timeframe"] = entry_timeframe
+                stop_timeframe = (
+                    "1h" if entry_timeframe == "15m" else entry_timeframe
+                )
+                entry_context["stop_timeframe"] = stop_timeframe
                 entry_context["entry_setup"] = f"{entry_timeframe}_entry"
                 if signal.get("setup_type"):
                     entry_context["setup_type"] = signal["setup_type"]
@@ -3082,8 +3278,31 @@ class PaperTradingEngine:
                 entry_context["planned_risk_usdt"] = planned_risk_usdt
                 entry_context["risk_budget_usdt"] = risk_decision.risk_budget_usdt
                 entry_context["open_risk_before_usdt"] = risk_decision.open_risk_before_usdt
-                entry_context["open_risk_after_usdt"] = risk_decision.open_risk_after_usdt
-                entry_context["risk_gate_status"] = "ALLOWED"
+                entry_context["open_risk_after_usdt"] = (
+                    risk_decision.open_risk_before_usdt
+                    + planned_risk_usdt
+                )
+                entry_context["risk_gate_status"] = (
+                    PAPER_FIXED_UNIT_RISK_STATUS
+                    if fixed_unit_sizing
+                    else "ALLOWED"
+                )
+                entry_context["risk_gate_code"] = (
+                    risk_decision.blocked_code
+                )
+                entry_context["risk_sized_margin_usdt"] = (
+                    risk_decision.margin_required
+                )
+                entry_context["allocated_margin_usdt"] = margin
+                entry_context["paper_fixed_unit_sizing"] = (
+                    fixed_unit_sizing
+                )
+                entry_context["entry_source"] = "AUTO_STRATEGY"
+                entry_context["position_sizing_mode"] = (
+                    "FIXED_CAPITAL_UNIT"
+                    if fixed_unit_sizing
+                    else "RISK_BASED"
+                )
                 entry_context["entry_quality"] = entry_quality
                 entry_context["entry_risk_factor"] = 1.0
                 entry_context["entry_stop_pct"] = stop_pct
@@ -3097,11 +3316,32 @@ class PaperTradingEngine:
                     if capital_unit_margin > 0
                     else 0.0
                 )
+                entry_context["max_capital_units"] = (
+                    _capital_units_for_quality(entry_quality)
+                )
                 entry_context["plan_version"] = (
                     CURRENT_TRADE_PLAN_VERSION
                     if int(signal.get("score_model_version") or 0) >= 8
                     else 2
                 )
+                if int(signal.get("score_model_version") or 0) >= 8:
+                    h4_indicators = timeframe_indicators.get("4h") or []
+                    disaster_stop, disaster_basis = _v4_disaster_stop_plan(
+                        side_enum,
+                        entry_price,
+                        stop_loss,
+                        entry_context,
+                        leverage,
+                        h4_indicators[-1] if h4_indicators else None,
+                    )
+                    entry_context.update(
+                        {
+                            "structure_stop_price": stop_loss,
+                            "disaster_stop_price": disaster_stop,
+                            "disaster_stop_basis": disaster_basis,
+                            "stop_execution_mode": "HTF_CLOSE",
+                        }
+                    )
                 await self.open_position(
                     symbol,
                     side,
@@ -3669,14 +3909,42 @@ class PaperTradingEngine:
         *,
         strong_trend: bool,
     ) -> None:
-        """Manage a plan-3 trend position without legacy early-profit exits."""
+        """Manage plan-3/4 trend positions without legacy early-profit exits."""
 
         _update_position_excursions(position, price)
         _increment_position_bars_held(position, exit_indicator)
         _update_position_validation(position)
 
-        # Disaster protection remains executable on every mark update.
-        if _stop_hit(position, price):
+        plan_version = int(position.metadata.get("plan_version") or 0)
+        if plan_version >= 4:
+            # A stop that has already been promoted into net profit remains an
+            # executable mark-price protection.  The original structure stop
+            # is not eligible for this path.
+            if _plan4_profit_protection_stop_hit(
+                position,
+                price,
+                self.settings.execution.taker_fee_rate,
+            ):
+                self._close_position_unlocked(
+                    position,
+                    price,
+                    _stop_exit_reason(
+                        position,
+                        signal,
+                        price,
+                        self.settings.execution.taker_fee_rate,
+                    ),
+                )
+                return
+            if _plan4_disaster_stop_hit(position, price):
+                self._close_position_unlocked(
+                    position,
+                    price,
+                    "stop loss: 灾难保护触发",
+                )
+                return
+        # Plan <=3 retains the historical mark-price stop behavior exactly.
+        elif _stop_hit(position, price):
             self._close_position_unlocked(
                 position,
                 price,
@@ -3743,6 +4011,8 @@ class PaperTradingEngine:
             return
 
         if (
+            plan_version < 4
+            and
             not position.first_tp_done
             and position.bars_held >= self.settings.risk.time_stop_bars
             and not _position_reached_initial_r(position, price, 0.5)
@@ -3920,13 +4190,50 @@ class PaperTradingEngine:
                 entry_context["capital_units"] = (
                     float(position.metadata["margin_usdt"]) / capital_unit_margin
                 )
-                position.metadata["soft_stop_price"] = _soft_structure_stop_price(
-                    position.side,
-                    position.entry_price,
-                    final_stop,
-                    entry_context,
+                entry_context["max_capital_units"] = (
+                    _capital_units_for_quality(ENTRY_QUALITY_S)
                 )
-            position.metadata["hard_stop_price"] = final_stop
+                if int(position.metadata.get("plan_version") or 0) >= 4:
+                    h4_indicators = (
+                        self.latest_timeframe_indicators
+                        .get(position.symbol, {})
+                        .get("4h", [])
+                    )
+                    disaster_stop, disaster_basis = _v4_disaster_stop_plan(
+                        position.side,
+                        position.entry_price,
+                        final_stop,
+                        entry_context,
+                        leverage,
+                        h4_indicators[-1] if h4_indicators else None,
+                    )
+                    entry_context.update(
+                        {
+                            "structure_stop_price": final_stop,
+                            "disaster_stop_price": disaster_stop,
+                            "disaster_stop_basis": disaster_basis,
+                        }
+                    )
+                    position.metadata.update(
+                        {
+                            "structure_stop_price": final_stop,
+                            "soft_stop_price": final_stop,
+                            "hard_stop_price": disaster_stop,
+                            "disaster_stop_price": disaster_stop,
+                        }
+                    )
+                else:
+                    position.metadata["soft_stop_price"] = (
+                        _soft_structure_stop_price(
+                            position.side,
+                            position.entry_price,
+                            final_stop,
+                            entry_context,
+                        )
+                    )
+                    position.metadata["hard_stop_price"] = final_stop
+            elif int(position.metadata.get("plan_version") or 0) < 4:
+                position.metadata["hard_stop_price"] = final_stop
             self.account.fills.append(
                 PaperFill(
                     timestamp=self._now(),
@@ -4456,6 +4763,88 @@ def _soft_structure_stop_price(
     return max(candidates) if side == PositionSide.LONG else min(candidates)
 
 
+def _v4_disaster_stop_plan(
+    side: PositionSide,
+    entry_price: float,
+    structure_stop_price: float,
+    context: dict[str, object],
+    leverage: int,
+    h4_indicator: IndicatorSnapshot | None = None,
+) -> tuple[float, str]:
+    """Place an independent remote safety boundary outside ordinary structure.
+
+    The ordinary stop remains a 1h/4h close-confirmed structure boundary.  This
+    price exists only for an extreme mark move, so it is deliberately derived
+    from the outer H4 structure and a leverage safety envelope rather than an
+    ATR-only stop.
+    """
+
+    h4 = (
+        context.get("h4_structure")
+        if isinstance(context.get("h4_structure"), dict)
+        else {}
+    )
+    h4_cluster = (
+        context.get("h4_ma_cluster")
+        if isinstance(context.get("h4_ma_cluster"), dict)
+        else {}
+    )
+    h4_candidates = (
+        _long_structure_stop_candidates(
+            entry_price,
+            {},
+            h4,
+            {},
+            h4_cluster,
+        )
+        if side == PositionSide.LONG
+        else _short_structure_stop_candidates(
+            entry_price,
+            {},
+            h4,
+            {},
+            h4_cluster,
+        )
+    )
+    buffer = _structure_stop_buffer(entry_price, h4_indicator)
+    structure_distance = abs(entry_price - structure_stop_price)
+    leverage_distance = entry_price * min(
+        0.25,
+        max(0.05, 0.55 / max(int(leverage), 1)),
+    )
+    remote_distance = max(
+        leverage_distance,
+        structure_distance * 2.0,
+        buffer * 2.0,
+    )
+    if side == PositionSide.LONG:
+        envelope_stop = max(entry_price - remote_distance, entry_price * 0.01)
+        candidates = [
+            envelope_stop,
+            max(structure_stop_price - buffer, entry_price * 0.01),
+        ]
+        if h4_candidates:
+            candidates.append(
+                max(min(h4_candidates) - buffer, entry_price * 0.01)
+            )
+        stop = min(candidates)
+    else:
+        envelope_stop = entry_price + remote_distance
+        candidates = [
+            envelope_stop,
+            structure_stop_price + buffer,
+        ]
+        if h4_candidates:
+            candidates.append(max(h4_candidates) + buffer)
+        stop = max(candidates)
+    basis = (
+        "h4_structure_and_leverage_safety"
+        if h4_candidates
+        else "leverage_safety_envelope"
+    )
+    return stop, basis
+
+
 def _entry_position_text(
     side: PositionSide,
     entry_price: float,
@@ -4720,6 +5109,7 @@ def _entry_context_from_signal(signal: dict[str, object]) -> dict[str, object]:
         "crowding_state",
         "score_model_version",
         "entry_pipeline_version",
+        "entry_zone_policy_version",
         "legacy_score",
         "legacy_action",
         "legacy_vetoes",
@@ -4734,6 +5124,7 @@ def _entry_context_from_signal(signal: dict[str, object]) -> dict[str, object]:
         "selected_level_zone",
         "selected_level_structural",
         "selected_level_state",
+        "selected_level_eligible",
         "v8_structure_stop",
         "v8_structure_target",
         "data_confidence",
@@ -5074,6 +5465,59 @@ def _trade_cycle_id(symbol: str, opened_at: datetime) -> str:
     return f"{symbol.upper()}:{opened_at.isoformat()}"
 
 
+def _completed_trade_cycle_pnls(
+    fills: Iterable[PaperFill],
+) -> list[float]:
+    """Return net PnL once for each fully closed open-to-close cycle.
+
+    This mirrors historical replay: additions and partial exits stay in the
+    original cycle, open cycles are excluded, funding is included, and entry
+    fees are deducted because close-fill realized PnL already includes exit
+    fees.
+    """
+
+    return [
+        pnl
+        for cycle_fills in _fill_lifecycle_groups(fills).values()
+        if (pnl := _completed_trade_cycle_pnl(cycle_fills)) is not None
+    ]
+
+
+def _fill_lifecycle_groups(
+    fills: Iterable[PaperFill],
+) -> dict[str, list[PaperFill]]:
+    groups: dict[str, list[PaperFill]] = {}
+    for fill in fills:
+        cycle_id = (
+            fill.trade_cycle_id
+            or f"{fill.symbol}:{fill.opened_at.isoformat()}"
+        )
+        groups.setdefault(cycle_id, []).append(fill)
+    return groups
+
+
+def _completed_trade_cycle_pnl(
+    fills: Iterable[PaperFill],
+) -> float | None:
+    cycle_fills = list(fills)
+    entries = [
+        fill
+        for fill in cycle_fills
+        if fill.action in {"OPEN", "ADD"}
+    ]
+    if not any(fill.action == "OPEN" for fill in entries):
+        return None
+    if not any(fill.action == "CLOSE" for fill in cycle_fills):
+        return None
+    realized = sum(
+        fill.realized_pnl
+        for fill in cycle_fills
+        if fill.action in {"PARTIAL_CLOSE", "CLOSE", "FUNDING"}
+    )
+    entry_fees = sum(fill.fee for fill in entries)
+    return realized - entry_fees
+
+
 def _structure_signature(
     context: dict[str, object],
     side: PositionSide,
@@ -5164,6 +5608,29 @@ def _stop_hit(position: Position, price: float) -> bool:
     if position.side == PositionSide.LONG:
         return price <= position.stop_price
     return price >= position.stop_price
+
+
+def _plan4_disaster_stop_hit(position: Position, price: float) -> bool:
+    disaster_stop = _float_or_none(
+        position.metadata.get("disaster_stop_price")
+    )
+    if disaster_stop is None or disaster_stop <= 0:
+        return False
+    if position.side == PositionSide.LONG:
+        return price <= disaster_stop
+    return price >= disaster_stop
+
+
+def _plan4_profit_protection_stop_hit(
+    position: Position,
+    price: float,
+    fee_rate: float,
+) -> bool:
+    if not position.first_tp_done:
+        return False
+    if _estimated_exit_net_pnl(position, position.stop_price, fee_rate) <= 0:
+        return False
+    return _stop_hit(position, price)
 
 
 def _take_profit_hit(position: Position, price: float) -> bool:
@@ -5564,6 +6031,9 @@ def _promote_plan3_stop_after_structure(
     )
     position.metadata["plan3_stop_structure_event_id"] = event_id
     position.metadata["plan3_stop_basis"] = "new_favourable_1h_structure"
+    if int(position.metadata.get("plan_version") or 0) >= 4:
+        position.metadata["structure_stop_price"] = position.stop_price
+        position.metadata["soft_stop_price"] = position.stop_price
     return True
 
 
@@ -5706,6 +6176,9 @@ def _activate_plan3_runner_stop(
     if position.stop_price == previous_stop:
         return False
     position.metadata["plan3_stop_basis"] = "latest_confirmed_1h_structure"
+    if int(position.metadata.get("plan_version") or 0) >= 4:
+        position.metadata["structure_stop_price"] = position.stop_price
+        position.metadata["soft_stop_price"] = position.stop_price
     if same_side_crowded:
         position.metadata["plan3_crowding_tightened"] = True
     return True
@@ -5745,15 +6218,19 @@ def _soft_stop_close_exit_reason(
     except (TypeError, ValueError):
         pass
     position.metadata["soft_stop_last_checked_at"] = timestamp.isoformat()
+    plan_version = int(position.metadata.get("plan_version") or 0)
     soft_stop = float(
-        position.metadata.get("soft_stop_price")
+        position.metadata.get("structure_stop_price")
+        or position.metadata.get("soft_stop_price")
         or position.metadata.get("hard_stop_price")
         or position.stop_price
     )
     hard_stop = float(
         position.metadata.get("hard_stop_price") or position.stop_price
     )
-    if soft_stop <= 0 or math.isclose(soft_stop, hard_stop):
+    if soft_stop <= 0 or (
+        plan_version < 4 and math.isclose(soft_stop, hard_stop)
+    ):
         return None
     crossed = (
         indicator.close <= soft_stop
@@ -8226,6 +8703,11 @@ def _entry_zone_bounds(
     if not side_levels:
         return None
     if int(signal.get("score_model_version") or 0) >= 8:
+        if (
+            int(signal.get("entry_pipeline_version") or 0) >= 5
+            and signal.get("selected_level_eligible") is not True
+        ):
+            return None
         breakdown = (
             signal.get("score_breakdown")
             if isinstance(signal.get("score_breakdown"), dict)
@@ -9704,6 +10186,7 @@ def _build_multi_timeframe_context(
     entry_levels = _entry_level_context(
         h1_structure,
         h4,
+        h1,
         h1_ma_cluster,
         h4_ma_cluster,
         timeframe_indicators,
@@ -11367,7 +11850,6 @@ def _fifteen_minute_precision(
     ema9_value = ema9_values[-1] if ema9_values else None
     ema60_value = ema60_values[-1] if ema60_values else None
     current = candles[-1]
-    mid = indicator.boll_mid
     strong_up = (
         ema9_value is not None
         and indicator.ema20 is not None
@@ -11385,23 +11867,49 @@ def _fifteen_minute_precision(
         and sum(1 for candle in recent[-5:] if candle.close <= ema60_value) >= 4
     )
     m15_trend = "UP" if strong_up else "DOWN" if strong_down else "CHOP"
-    long_ref = max(value for value in (ema9_value, mid) if value is not None) if ema9_value is not None or mid is not None else None
-    short_ref = min(value for value in (ema9_value, mid) if value is not None) if ema9_value is not None or mid is not None else None
+    ema20_zone = _range_around_values([indicator.ema20], buffer)
+    ema60_zone = _range_around_values([ema60_value], buffer)
+    long_zone: dict[str, float] | None = None
+    short_zone: dict[str, float] | None = None
+    selected_ema_period: int | None = None
     pullback = "WAIT"
-    if strong_up and long_ref is not None and current.low <= long_ref + buffer and current.close >= long_ref - buffer * 0.25:
-        pullback = "M15_LONG_PULLBACK"
-    elif strong_down and short_ref is not None and current.high >= short_ref - buffer and current.close <= short_ref + buffer * 0.25:
-        pullback = "M15_SHORT_PULLBACK"
+    if strong_up:
+        for period, zone in ((20, ema20_zone), (60, ema60_zone)):
+            anchor = _float_or_none((zone or {}).get("price"))
+            if (
+                zone is not None
+                and anchor is not None
+                and _candle_touches_zone(current, zone)
+                and current.close >= anchor
+            ):
+                long_zone = zone
+                selected_ema_period = period
+                pullback = "M15_LONG_PULLBACK"
+                break
+    elif strong_down:
+        for period, zone in ((20, ema20_zone), (60, ema60_zone)):
+            anchor = _float_or_none((zone or {}).get("price"))
+            if (
+                zone is not None
+                and anchor is not None
+                and _candle_touches_zone(current, zone)
+                and current.close <= anchor
+            ):
+                short_zone = zone
+                selected_ema_period = period
+                pullback = "M15_SHORT_PULLBACK"
+                break
     return {
         "long_stop_anchor": min(candle.low for candle in recent) - buffer,
         "short_stop_anchor": max(candle.high for candle in recent) + buffer,
         "ema9": ema9_value,
         "ema20": indicator.ema20,
         "ema60": ema60_value,
-        "boll_mid": mid,
+        "boll_mid": indicator.boll_mid,
         "trend": m15_trend,
-        "long_pullback_zone": _range_around_values([indicator.ema20, ema60_value, mid], buffer),
-        "short_retest_zone": _range_around_values([indicator.ema20, ema60_value, mid], buffer),
+        "long_pullback_zone": long_zone,
+        "short_retest_zone": short_zone,
+        "selected_ema_period": selected_ema_period,
         "pullback": pullback,
     }
 
@@ -11409,6 +11917,7 @@ def _fifteen_minute_precision(
 def _entry_level_context(
     h1_structure: dict[str, object],
     h4_structure: dict[str, object],
+    h1_trigger: dict[str, object],
     h1_ma_cluster: dict[str, object],
     h4_ma_cluster: dict[str, object],
     timeframe_indicators: dict[str, list[IndicatorSnapshot]],
@@ -11438,7 +11947,10 @@ def _entry_level_context(
             "sweep_reclaim_support": _zone_from_mapping(h1_structure, "support") or _zone_from_mapping(h4_structure, "support"),
             "ma_cluster_breakout": _cluster_band(h1_ma_cluster) or _cluster_band(h4_ma_cluster),
             "ma20_retest": _ma20_band(h1_ma_cluster, h1_indicator) or _ma20_band(h4_ma_cluster, h4_indicator),
-            "breakout_retest": _zone_from_mapping(h1_structure, "resistance") or _zone_from_mapping(h4_structure, "resistance"),
+            "breakout_retest": _confirmed_role_retest_zone(
+                h1_trigger,
+                PositionSide.LONG,
+            ),
             "vwap_pullback": _indicator_band(h1_indicator, h1_indicator.vwap if h1_indicator else None),
         },
         "short": {
@@ -11465,7 +11977,10 @@ def _entry_level_context(
             "sweep_reject_resistance": _zone_from_mapping(h1_structure, "resistance") or _zone_from_mapping(h4_structure, "resistance"),
             "ma_cluster_breakdown": _cluster_band(h1_ma_cluster) or _cluster_band(h4_ma_cluster),
             "ma20_retest": _ma20_band(h1_ma_cluster, h1_indicator) or _ma20_band(h4_ma_cluster, h4_indicator),
-            "breakdown_retest": _zone_from_mapping(h1_structure, "support") or _zone_from_mapping(h4_structure, "support"),
+            "breakdown_retest": _confirmed_role_retest_zone(
+                h1_trigger,
+                PositionSide.SHORT,
+            ),
             "vwap_retest": _indicator_band(h1_indicator, h1_indicator.vwap if h1_indicator else None),
         },
         "chop": {
@@ -11474,6 +11989,19 @@ def _entry_level_context(
             "mid": _indicator_band(h1_indicator, h1_indicator.boll_mid if h1_indicator else None),
         },
     }
+
+
+def _confirmed_role_retest_zone(
+    trigger: dict[str, object],
+    side: PositionSide,
+) -> dict[str, float] | None:
+    if (
+        str(trigger.get("direction") or "NONE").upper() != side.value
+        or str(trigger.get("state") or "UNKNOWN").upper() != "RETEST"
+    ):
+        return None
+    role = "resistance" if side is PositionSide.LONG else "support"
+    return _zone_from_mapping(trigger, role)
 
 
 def _latest_indicator(indicators: list[IndicatorSnapshot]) -> IndicatorSnapshot | None:
@@ -12260,7 +12788,10 @@ def _apply_multi_timeframe_context(
                     setup_type,
                     SETUP_M15_SQUEEZE_TACTICAL_LONG,
                 )
-                reasons.append("one-way uptrend 15m BOLL/EMA9 pullback confirmed; allow tactical long")
+                reasons.append(
+                    "one-way uptrend 15m EMA20/EMA60 pullback confirmed; "
+                    "allow tactical long"
+                )
             else:
                 reasons.append(
                     "high area has no pullback confirmation; entry price "
@@ -12746,12 +13277,16 @@ def _apply_score_model_v8(
     price = _float_or_none(out.get("price"))
     if price is None or price <= 0:
         return out
+    score_context = dict(context)
+    score_context["trend_state"] = str(
+        out.get("trend_state") or out.get("regime") or ""
+    )
     dual = evaluate_dual_score_v8(
         symbol=symbol,
         price=price,
         timeframe_candles=timeframe_candles,
         timeframe_indicators=timeframe_indicators,
-        context=context,
+        context=score_context,
         long_ratio_extreme=(
             settings.strategy.long_short_overcrowded_long
         ),
@@ -12795,9 +13330,10 @@ def _apply_score_model_v8(
         else None
     )
     score_result = selected_result or display_result
-    out["prd_version"] = "4.0"
+    out["prd_version"] = "5.0"
     out["score_model_version"] = SCORE_MODEL_VERSION
     out["entry_pipeline_version"] = ENTRY_PIPELINE_VERSION
+    out["entry_zone_policy_version"] = 5
     out["candidate_action"] = candidate_action
     out["direction"] = selected_side.value if selected_side else "NONE"
     out["direction_decision"] = (
@@ -12885,6 +13421,11 @@ def _apply_score_model_v8(
         score_result.selected_level.structural if selected_result else False
     )
     out["selected_level_state"] = score_result.selected_level.state
+    out["selected_level_eligible"] = bool(
+        selected_result is not None
+        and score_result.selected_level.key
+        and score_result.selected_level.zone
+    )
     out["v8_structure_stop"] = (
         score_result.structure_stop if selected_result else None
     )
@@ -13329,18 +13870,26 @@ def _strong_m15_pullback_allowed(
     precision: dict[str, object],
     smart_money_phase: str = "",
 ) -> bool:
-    if side != PositionSide.LONG:
-        return False
-    if score < 85 or smart_money_phase != "SHORT_SQUEEZE_MARKUP":
-        return False
-    if risk_state not in {"NORMAL", "SHORT_CROWD"}:
-        return False
+    # V5 authorizes M15 EMA execution by price structure, not by stacking a
+    # score, crowding label, or smart-money phase.  Those remain independent
+    # risk/participation evidence and cannot open this timeframe by themselves.
+    del risk_state, score, smart_money_phase
     pullback = str(precision.get("pullback") or "")
     m15_trend = str(precision.get("trend") or "")
+    if side is PositionSide.LONG:
+        return (
+            trend_state == "ONE_WAY_UP"
+            and m15_trend == "UP"
+            and pullback == "M15_LONG_PULLBACK"
+            and _float_or_none(precision.get("selected_ema_period"))
+            in {20.0, 60.0}
+        )
     return (
-        trend_state == "ONE_WAY_UP"
-        and m15_trend == "UP"
-        and pullback == "M15_LONG_PULLBACK"
+        trend_state == "ONE_WAY_DOWN"
+        and m15_trend == "DOWN"
+        and pullback == "M15_SHORT_PULLBACK"
+        and _float_or_none(precision.get("selected_ema_period"))
+        in {20.0, 60.0}
     )
 
 
@@ -13389,6 +13938,11 @@ def _exit_timeframe_from_position(position: Position | None) -> str | None:
         return None
     timeframe = str(context.get("stop_timeframe") or "").lower()
     if timeframe in {"15m", "1h", "4h", "1d"}:
+        if (
+            timeframe == "15m"
+            and int(position.metadata.get("plan_version") or 0) >= 4
+        ):
+            return "1h"
         if timeframe == "15m" and position.side == PositionSide.SHORT:
             return "1h"
         return timeframe
@@ -14061,8 +14615,44 @@ def _fixed_margin_for_quality(
     four units even though the configured 95% margin target still has room.
     """
 
+    return _fixed_margin_for_unit_limit(
+        _capital_units_for_quality(quality),
+        equity=equity,
+        used_margin=used_margin,
+        available_balance=available_balance,
+    )
+
+
+def _initial_fixed_margin_for_quality(
+    quality: str | None,
+    *,
+    equity: float,
+    used_margin: float,
+    available_balance: float,
+) -> float:
+    """Return exactly one initial unit for every deployable B/A/S setup.
+
+    S quality keeps its two-unit *maximum* through the existing quality map,
+    but never receives two units on the first fill.
+    """
+
+    max_units = 1 if _capital_units_for_quality(quality) > 0 else 0
+    return _fixed_margin_for_unit_limit(
+        max_units,
+        equity=equity,
+        used_margin=used_margin,
+        available_balance=available_balance,
+    )
+
+
+def _fixed_margin_for_unit_limit(
+    max_units: int,
+    *,
+    equity: float,
+    used_margin: float,
+    available_balance: float,
+) -> float:
     unit = _capital_unit_margin(equity)
-    max_units = _capital_units_for_quality(quality)
     if unit <= 0 or max_units <= 0:
         return 0.0
     remaining_target = max(
@@ -14076,6 +14666,23 @@ def _fixed_margin_for_quality(
     if whole_units <= 0:
         return 0.0
     return min(unit * whole_units, spendable)
+
+
+def _planned_entry_risk_usdt(
+    *,
+    margin_usdt: float,
+    leverage: int,
+    entry_price: float,
+    stop_price: float,
+    adverse_cost_rate: float,
+) -> float:
+    if entry_price <= 0 or margin_usdt <= 0 or leverage <= 0:
+        return 0.0
+    loss_distance = (
+        abs(entry_price - stop_price)
+        + entry_price * max(adverse_cost_rate, 0.0)
+    )
+    return margin_usdt * leverage * loss_distance / entry_price
 
 
 def _max_safe_leverage_for_stop(

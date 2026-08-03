@@ -70,6 +70,10 @@ class StrategySettings:
 class RiskSettings:
     leverage_default: int = 5
     leverage_max: int = 5
+    # Paper auto entries temporarily use one fixed capital unit so strategy
+    # samples are comparable.  The risk-based sizing path remains available
+    # by switching this off; manual/API orders always keep risk sizing.
+    paper_fixed_unit_sizing: bool = False
     risk_per_trade: float = 0.005
     single_symbol_margin_limit: float = 0.10
     total_margin_limit: float = 0.50

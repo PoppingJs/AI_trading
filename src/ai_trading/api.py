@@ -314,7 +314,7 @@ PAPER_DASHBOARD_HTML = """
     .top-nav a.active { color: #1d4ed8; border-bottom-color: #2563eb; }
     main { height: calc(100vh - 98px); padding: 6px 16px; width: 100%; box-sizing: border-box; margin: 0; overflow: hidden; display: flex; flex-direction: column; gap: 6px; }
     .grid { display: grid; gap: 10px; }
-    .metrics { grid-template-columns: repeat(7, minmax(0, 1fr)); flex: 0 0 auto; }
+    .metrics { grid-template-columns: repeat(8, minmax(0, 1fr)); flex: 0 0 auto; }
     .layout { grid-template-columns: 460px minmax(0, 1fr); align-items: stretch; flex: 1 1 auto; min-height: 0; margin-top: 0 !important; }
     .layout > .card { min-height: 0; overflow: hidden; display: flex; flex-direction: column; }
     .layout > .grid { display: grid; grid-template-rows: 230px 405px minmax(210px, 1fr); min-height: 0; }
@@ -1953,16 +1953,18 @@ PAPER_DASHBOARD_HTML = """
         ? '允许'
         : `禁止${entryBlockCodes.length ? `（${entryBlockCodes.map(code => entryBlockText[code] || code).join('、')}）` : ''}`;
       document.getElementById('updated').textContent = `${data.running ? '行情与持仓管理运行中' : '后台服务已停止'} | 新开仓 ${entryState} | ${marketState} | ${timeText(data.market_updated_at || data.updated_at)}`;
+      const completedTrades = Number(data.completed_trade_count || 0);
       const metrics = [
-        ['资金', money(data.equity) + ' U'],
-        ['可用', money(data.available_balance) + ' U'],
-        ['占用保证金', money(data.used_margin) + ' U'],
-        ['已实现', money(data.realized_pnl) + ' U'],
-        ['未实现', money(data.unrealized_pnl) + ' U'],
-        ['手续费', '-' + money(data.fees_paid) + ' U'],
-        ['总收益', money(data.total_pnl) + ' U / ' + pct(data.total_pnl_pct)]
+        ['资金', money(data.equity) + ' U', ''],
+        ['可用', money(data.available_balance) + ' U', ''],
+        ['占用保证金', money(data.used_margin) + ' U', ''],
+        ['已实现', money(data.realized_pnl) + ' U', pnlClass(data.realized_pnl)],
+        ['未实现', money(data.unrealized_pnl) + ' U', pnlClass(data.unrealized_pnl)],
+        ['手续费', '-' + money(data.fees_paid) + ' U', pnlClass(-Number(data.fees_paid || 0))],
+        ['胜率', completedTrades ? pct(data.win_rate) : '--', completedTrades ? pnlClass(data.win_rate) : ''],
+        ['总收益', money(data.total_pnl) + ' U / ' + pct(data.total_pnl_pct), pnlClass(data.total_pnl)]
       ];
-      document.getElementById('metrics').innerHTML = metrics.map(([k,v]) => `<div class="card metric"><span>${k}</span><strong class="${k.includes('收益') || k.includes('实现') || k.includes('手续费') ? pnlClass(String(v).split(' ')[0]) : ''}">${v}</strong></div>`).join('');
+      document.getElementById('metrics').innerHTML = metrics.map(([k,v,c]) => `<div class="card metric"><span>${k}</span><strong class="${c}">${v}</strong></div>`).join('');
       document.getElementById('positions').className = 'center-table';
       document.getElementById('positions').innerHTML = table(['币种','方向','杠杆','入场','现价','数量','保证金','浮盈亏','收益率','止损','止盈','入场原因','操作'], data.positions.map(p => [
         displaySymbol(p.symbol),

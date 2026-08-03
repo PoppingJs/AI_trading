@@ -60,6 +60,7 @@ from ai_trading.paper import (
     _four_hour_oi_valley_long_setup,
     _four_hour_structure,
     _fixed_margin_for_quality,
+    _initial_fixed_margin_for_quality,
     _high_distribution_handoff,
     _high_distribution_handoff_exit_reason,
     _higher_timeframe_direction_established,
@@ -217,6 +218,7 @@ def test_range_context_keeps_confirmed_range_edge_direction_available() -> None:
 def test_default_risk_boundaries_match_the_conservative_rollout() -> None:
     risk = AppSettings().risk
 
+    assert risk.paper_fixed_unit_sizing is False
     assert risk.risk_per_trade == pytest.approx(0.005)
     assert risk.total_open_risk_limit == pytest.approx(0.02)
     assert risk.max_open_positions == 3
@@ -239,6 +241,7 @@ def test_paper_config_uses_v9_thresholds_and_disables_cumulative_breakers() -> N
     assert settings.risk.max_drawdown_circuit_breaker == 0
     assert settings.risk.max_consecutive_losses == 0
     assert settings.risk.cooldown_hours == 0
+    assert settings.risk.paper_fixed_unit_sizing is True
 
 
 def test_requested_margin_is_only_a_cap_after_risk_sizing() -> None:
@@ -391,8 +394,12 @@ def test_status_marks_new_entries_blocked_by_active_weekly_lock() -> None:
 
 
 def test_manual_risk_entry_caps_margin_at_risk_gated_maximum() -> None:
+    settings = AppSettings()
+    # Even when the deployment enables fixed units for automatic paper
+    # entries, manual/API orders must keep the risk-sized contract.
+    settings.risk.paper_fixed_unit_sizing = True
     engine = PaperTradingEngine(
-        AppSettings(),
+        settings,
         starting_balance=1000,
         market_data=FakeMarketData(),
     )
@@ -738,6 +745,61 @@ def test_open_partial_and_close_share_one_trade_cycle_id() -> None:
         "CLOSE",
     ]
     assert engine.account.fills[-1].exit_category == "TAKE_PROFIT"
+
+
+def test_realtime_win_rate_uses_completed_trade_cycle_net_pnl() -> None:
+    engine = PaperTradingEngine(
+        AppSettings(),
+        starting_balance=1000,
+        market_data=FakeMarketData(),
+    )
+    winner = asyncio.run(
+        engine.open_position(
+            "TESTUSDT",
+            "LONG",
+            margin_usdt=100,
+            leverage=5,
+            stop_loss=98.0,
+            take_profit_1=102.0,
+            take_profit_2=104.0,
+        )
+    )
+    engine._close_position_fraction_unlocked(
+        winner,
+        102.0,
+        0.35,
+        "take profit: target 1 reached",
+    )
+
+    open_status = engine.status()
+    assert open_status["completed_trade_count"] == 0
+    assert open_status["win_rate"] == 0.0
+
+    engine._close_position_unlocked(
+        winner,
+        103.0,
+        "take profit: target 2 reached",
+    )
+    loser = asyncio.run(
+        engine.open_position(
+            "LOSSUSDT",
+            "LONG",
+            margin_usdt=100,
+            leverage=5,
+            stop_loss=98.0,
+            take_profit_1=102.0,
+            take_profit_2=104.0,
+        )
+    )
+    engine._close_position_unlocked(
+        loser,
+        95.0,
+        "stop loss: structure invalidated",
+    )
+
+    status = engine.status()
+    assert status["completed_trade_count"] == 2
+    assert status["win_rate"] == pytest.approx(0.5)
 
 
 def test_take_profit_1_partially_closes_and_moves_stop_above_break_even() -> None:
@@ -2075,16 +2137,28 @@ def test_breakout_protection_waits_for_real_profit_before_tightening_stop() -> N
 
 
 def test_precision_stop_only_allowed_for_strong_m15_tactical_pullback() -> None:
-    precision = {"pullback": "M15_LONG_PULLBACK", "long_stop_anchor": 97.2, "trend": "UP"}
+    precision = {
+        "pullback": "M15_LONG_PULLBACK",
+        "long_stop_anchor": 97.2,
+        "trend": "UP",
+        "selected_ema_period": 20,
+    }
     squeeze = "SHORT_SQUEEZE_MARKUP"
 
     assert _precision_stop_allowed(PositionSide.LONG, "ONE_WAY_UP", "NORMAL", 90, precision, squeeze)
     assert _precision_stop_allowed(PositionSide.LONG, "ONE_WAY_UP", "SHORT_CROWD", 90, precision, squeeze)
-    assert not _precision_stop_allowed(PositionSide.SHORT, "ONE_WAY_DOWN", "NORMAL", 90, precision, squeeze)
-    assert not _precision_stop_allowed(PositionSide.LONG, "ONE_WAY_UP", "NORMAL", 90, precision)
+    short_precision = {
+        "pullback": "M15_SHORT_PULLBACK",
+        "short_stop_anchor": 102.8,
+        "trend": "DOWN",
+        "selected_ema_period": 60,
+    }
+    assert _precision_stop_allowed(PositionSide.SHORT, "ONE_WAY_DOWN", "NORMAL", 90, short_precision, squeeze)
+    assert _precision_stop_allowed(PositionSide.LONG, "ONE_WAY_UP", "NORMAL", 90, precision)
     assert not _precision_stop_allowed(PositionSide.LONG, "TREND_LONG", "NORMAL", 90, precision, squeeze)
-    assert not _precision_stop_allowed(PositionSide.LONG, "ONE_WAY_UP", "LONG_CROWD", 90, precision, squeeze)
-    assert not _precision_stop_allowed(PositionSide.LONG, "ONE_WAY_UP", "NORMAL", 80, precision, squeeze)
+    assert _precision_stop_allowed(PositionSide.LONG, "ONE_WAY_UP", "LONG_CROWD", 90, precision, squeeze)
+    assert _precision_stop_allowed(PositionSide.LONG, "ONE_WAY_UP", "NORMAL", 80, precision, squeeze)
+    assert not _precision_stop_allowed(PositionSide.LONG, "ONE_WAY_UP", "NORMAL", 90, {**precision, "selected_ema_period": None}, squeeze)
     assert not _precision_stop_allowed(PositionSide.LONG, "ONE_WAY_UP", "NORMAL", 90, {**precision, "trend": "CHOP"}, squeeze)
 
 
@@ -3351,6 +3425,14 @@ def test_s_quality_uses_only_the_one_remaining_capital_unit() -> None:
         used_margin=760.0,
         available_balance=240.0,
     ) == pytest.approx(190.0)
+    for quality in ("B", "A", "S"):
+        assert _initial_fixed_margin_for_quality(
+            quality,
+            equity=1200.0,
+            used_margin=0.0,
+            available_balance=1200.0,
+        ) == pytest.approx(228.0)
+
 
 def test_auto_entry_prerequisites_explain_score_direction_and_timing_blocks() -> None:
     wait_signal = {
@@ -5609,6 +5691,7 @@ def test_entry_timeframe_follows_zone_actually_hit() -> None:
             "pullback": "M15_LONG_PULLBACK",
             "long_stop_anchor": 98.0,
             "trend": "UP",
+            "selected_ema_period": 20,
         },
         "entry_levels": {
             "long": {
@@ -5906,6 +5989,7 @@ def test_short_squeeze_long_keeps_the_15m_tactical_exception() -> None:
             "pullback": "M15_LONG_PULLBACK",
             "trend": "UP",
             "long_stop_anchor": 98.5,
+            "selected_ema_period": 20,
         },
         "entry_levels": {
             "long": {
@@ -6023,7 +6107,7 @@ def test_entry_position_does_not_duplicate_m15_stop_validation() -> None:
         "risk_state": "NORMAL",
         "smart_money_phase": "SHORT_SQUEEZE_MARKUP",
         "price": 100.0,
-        "m15_precision": {"pullback": "M15_LONG_PULLBACK", "long_stop_anchor": 99.6, "trend": "UP"},
+        "m15_precision": {"pullback": "M15_LONG_PULLBACK", "long_stop_anchor": 99.6, "trend": "UP", "selected_ema_period": 20},
         "entry_levels": {
             "long": {
                 "m15_ema20_ema60": {"low": 99.5, "high": 100.5, "price": 100.0},
@@ -6045,7 +6129,7 @@ def test_auto_trade_skips_m15_entry_when_stop_would_fall_back_to_wider_timeframe
     engine.latest_indicators[symbol] = [indicator_snapshot(close=100.0, atr=3.0)]
     engine.latest_timeframe_indicators[symbol] = {"1h": [indicator_snapshot(close=100.0, atr=3.0)]}
     engine.latest_timeframe_contexts[symbol] = {
-        "m15_precision": {"pullback": "M15_LONG_PULLBACK", "long_stop_anchor": 98.5, "trend": "UP"}
+        "m15_precision": {"pullback": "M15_LONG_PULLBACK", "long_stop_anchor": 98.5, "trend": "UP", "selected_ema_period": 20}
     }
     engine.latest_signals[symbol] = {
         "action": "ENTRY_LONG",
@@ -6054,7 +6138,7 @@ def test_auto_trade_skips_m15_entry_when_stop_would_fall_back_to_wider_timeframe
         "risk_state": "NORMAL",
         "smart_money_phase": "SHORT_SQUEEZE_MARKUP",
         "price": 100.0,
-        "m15_precision": {"pullback": "M15_LONG_PULLBACK", "long_stop_anchor": 98.5, "trend": "UP"},
+        "m15_precision": {"pullback": "M15_LONG_PULLBACK", "long_stop_anchor": 98.5, "trend": "UP", "selected_ema_period": 20},
         "entry_levels": {
             "long": {
                 "m15_ema20_ema60": {"low": 99.5, "high": 100.5, "price": 100.0},
@@ -6087,6 +6171,7 @@ def test_auto_trade_uses_15m_only_for_short_squeeze_long() -> None:
         "pullback": "M15_LONG_PULLBACK",
         "long_stop_anchor": 98.5,
         "trend": "UP",
+        "selected_ema_period": 20,
     }
     engine.latest_timeframe_contexts[symbol] = {"m15_precision": precision}
     engine.latest_signals[symbol] = {
@@ -6112,7 +6197,7 @@ def test_auto_trade_uses_15m_only_for_short_squeeze_long() -> None:
     asyncio.run(engine._auto_trade_once())
 
     position = engine.account.positions[symbol]
-    assert position.metadata["entry_context"]["stop_timeframe"] == "15m"
+    assert position.metadata["entry_context"]["stop_timeframe"] == "1h"
     assert position.stop_price == 98.5
 
 
@@ -6955,7 +7040,7 @@ def test_high_area_long_allows_retest_confirmation() -> None:
     assert _auto_signal_allowed(adjusted)
 
 
-def test_one_way_high_area_allows_15m_boll_ema9_pullback() -> None:
+def test_one_way_high_area_allows_15m_ema20_ema60_pullback() -> None:
     signal = {
         "action": "ENTRY_LONG",
         "score": 90,
@@ -6971,7 +7056,7 @@ def test_one_way_high_area_allows_15m_boll_ema9_pullback() -> None:
         "h4_structure": {"state": "BOX_UPPER_HALF"},
         "h1_trigger": {"direction": "NONE", "state": "WAIT"},
         "h1_pullback": {"direction": "NONE", "state": "WAIT"},
-        "m15_precision": {"pullback": "M15_LONG_PULLBACK", "long_stop_anchor": 95.8, "trend": "UP"},
+        "m15_precision": {"pullback": "M15_LONG_PULLBACK", "long_stop_anchor": 95.8, "trend": "UP", "selected_ema_period": 20},
         "entry_levels": {"long": {"m15_ema20_ema60": {"low": 96.8, "high": 97.6, "price": 97.2}}},
         "summary": "MTF: test",
     }
@@ -6980,7 +7065,7 @@ def test_one_way_high_area_allows_15m_boll_ema9_pullback() -> None:
     _update_entry_position_fields(adjusted)
 
     assert "high area without pullback confirmation; wait for 1h/4h pullback before long" not in adjusted["vetoes"]
-    assert "one-way uptrend 15m BOLL/EMA9 pullback confirmed; allow tactical long" in adjusted["reasons"]
+    assert "one-way uptrend 15m EMA20/EMA60 pullback confirmed; allow tactical long" in adjusted["reasons"]
     assert adjusted["m15_precision"]["long_stop_anchor"] == 95.8
     assert _auto_signal_allowed(adjusted)
 
@@ -7038,7 +7123,7 @@ def test_one_way_hot_rsi_is_nonblocking_with_or_without_pullback() -> None:
     }
     pullback_context = {
         **no_pullback_context,
-        "m15_precision": {"pullback": "M15_LONG_PULLBACK", "long_stop_anchor": 95.8, "trend": "UP"},
+        "m15_precision": {"pullback": "M15_LONG_PULLBACK", "long_stop_anchor": 95.8, "trend": "UP", "selected_ema_period": 20},
         "entry_levels": {"long": {"m15_ema20_ema60": {"low": 96.8, "high": 97.6, "price": 97.2}}},
     }
     signal = {**signal, "price": 97.2}

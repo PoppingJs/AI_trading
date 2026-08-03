@@ -17,6 +17,16 @@ from ai_trading.score_v8 import (
 
 DIRECTION_SCORE_GAP = 8
 
+_HTF_EMA_LEVEL_KEYS = (
+    "h4_ema20_ema60",
+    "h4_ema20",
+    "h4_ema60",
+    "h1_ema20_ema60",
+    "h1_ema20",
+    "h1_ema60",
+)
+_M15_EMA_LEVEL_KEY = "m15_ema20_ema60"
+
 
 @dataclass(frozen=True)
 class LevelSelectionV8:
@@ -264,9 +274,11 @@ def _evaluate_side(
         structure,
         progress,
     )
+    # Location is scored only after the suggested zone itself has passed the
+    # v5 eligibility rules.  Fifteen-minute micro structure may still score as
+    # structure/trigger evidence, but it must not manufacture a standalone
+    # location outside a confirmed one-way EMA pullback.
     levels = _side_levels(context, side)
-    if micro.zone and micro.level_key:
-        levels[micro.level_key] = dict(micro.zone)
     location = _select_location(
         side=side,
         price=price,
@@ -942,28 +954,6 @@ def _select_location(
     atr14: float | None,
     direction_score: int,
 ) -> LevelSelectionV8:
-    structural_keys = (
-        {
-            "v8_breakout_retest",
-            "h1_support",
-            "h4_support",
-            "sweep_reclaim_support",
-            "breakout_retest",
-            "ma_cluster_breakout",
-        }
-        if side is PositionSide.LONG
-        else {
-            "v8_breakdown_retest",
-            "h1_resistance",
-            "h4_resistance",
-            "h4_descending_resistance",
-            "sweep_reject_resistance",
-            "breakdown_retest",
-            "ma_cluster_breakdown",
-            "distribution_range_high",
-            "descending_high_trendline",
-        }
-    )
     candidates: list[tuple[int, float, str, Mapping[str, float], bool]] = []
     for key, raw_zone in levels.items():
         zone = _normalized_zone(raw_zone)
@@ -971,7 +961,7 @@ def _select_location(
             continue
         low, high = zone["low"], zone["high"]
         distance = 0.0 if low <= price <= high else min(abs(price - low), abs(price - high))
-        structural = key in structural_keys
+        structural = bool(raw_zone.get("_v5_structural"))
         priority = 2 if structural else 1
         candidates.append((priority, distance, key, zone, structural))
     if not candidates:
@@ -1053,11 +1043,177 @@ def _side_levels(
     all_levels = _mapping(context.get("entry_levels"))
     side_key = "long" if side is PositionSide.LONG else "short"
     raw = _mapping(all_levels.get(side_key))
-    return {
-        str(key): value
-        for key, value in raw.items()
-        if isinstance(value, Mapping)
-    }
+    eligible: dict[str, Mapping[str, object]] = {}
+
+    # Ordinary trend/channel entries may use only 1h/4h EMA20 or EMA60.
+    # Combined EMA bands are accepted only when the independently generated
+    # EMA20 and EMA60 bands genuinely overlap; a min/max bridge is ineligible.
+    for key in _HTF_EMA_LEVEL_KEYS:
+        value = raw.get(key)
+        if not isinstance(value, Mapping):
+            continue
+        if key.endswith("ema20_ema60") and not _merged_ema_zone_is_valid(
+            raw,
+            key,
+        ):
+            continue
+        zone = dict(value)
+        zone["_v5_structural"] = _ema_zone_has_structure_confluence(
+            raw,
+            key,
+            zone,
+            side,
+        )
+        eligible[key] = zone
+
+    # The existing OI-valley setup remains compatible, but its location is an
+    # H4 EMA60 location and is eligible only after the H4 long direction gate.
+    oi_key = "h4_ema60_oi_valley_reclaim"
+    oi_zone = raw.get(oi_key)
+    h4 = _mapping(context.get("h4_structure"))
+    if (
+        side is PositionSide.LONG
+        and isinstance(oi_zone, Mapping)
+        and _normalized_structure_direction(h4) == PositionSide.LONG.value
+    ):
+        eligible[oi_key] = {
+            **dict(oi_zone),
+            "_v5_structural": True,
+        }
+
+    # A role-reversal area is not created from an old support/resistance band.
+    # It becomes a suggested zone only after the already-closed H1 RETEST event
+    # and only where that role-reversal area overlaps an eligible HTF EMA zone.
+    role_key = (
+        "breakout_retest"
+        if side is PositionSide.LONG
+        else "breakdown_retest"
+    )
+    role_zone = raw.get(role_key)
+    if (
+        isinstance(role_zone, Mapping)
+        and _confirmed_h1_role_retest(context, side)
+    ):
+        for ema_key in _HTF_EMA_LEVEL_KEYS:
+            ema_zone = eligible.get(ema_key)
+            intersection = _zone_intersection(role_zone, ema_zone)
+            if intersection is None:
+                continue
+            eligible[role_key] = {
+                **intersection,
+                "_v5_structural": True,
+            }
+            break
+
+    # M15 EMA20/EMA60 remains a tactical exception only for a confirmed
+    # one-way trend in the same direction.  The precision builder supplies one
+    # actually touched EMA zone, never a bridged EMA/BOLL band.
+    m15_zone = raw.get(_M15_EMA_LEVEL_KEY)
+    if (
+        isinstance(m15_zone, Mapping)
+        and _m15_ema_level_authorized(context, side)
+    ):
+        eligible[_M15_EMA_LEVEL_KEY] = {
+            **dict(m15_zone),
+            "_v5_structural": False,
+        }
+    return eligible
+
+
+def _merged_ema_zone_is_valid(
+    levels: Mapping[str, object],
+    merged_key: str,
+) -> bool:
+    prefix = merged_key.removesuffix("_ema20_ema60")
+    ema20 = levels.get(f"{prefix}_ema20")
+    ema60 = levels.get(f"{prefix}_ema60")
+    return _zone_intersection(ema20, ema60) is not None
+
+
+def _ema_zone_has_structure_confluence(
+    levels: Mapping[str, object],
+    key: str,
+    zone: Mapping[str, object],
+    side: PositionSide,
+) -> bool:
+    timeframe = "h4" if key.startswith("h4_") else "h1"
+    structure_key = (
+        f"{timeframe}_support"
+        if side is PositionSide.LONG
+        else f"{timeframe}_resistance"
+    )
+    return _zone_intersection(zone, levels.get(structure_key)) is not None
+
+
+def _confirmed_h1_role_retest(
+    context: Mapping[str, object],
+    side: PositionSide,
+) -> bool:
+    trigger = _mapping(context.get("h1_trigger"))
+    return (
+        str(trigger.get("direction") or "NONE").upper() == side.value
+        and str(trigger.get("state") or "UNKNOWN").upper() == "RETEST"
+    )
+
+
+def _m15_ema_level_authorized(
+    context: Mapping[str, object],
+    side: PositionSide,
+) -> bool:
+    expected_trend = (
+        "ONE_WAY_UP"
+        if side is PositionSide.LONG
+        else "ONE_WAY_DOWN"
+    )
+    expected_precision_trend = (
+        "UP" if side is PositionSide.LONG else "DOWN"
+    )
+    expected_pullback = (
+        "M15_LONG_PULLBACK"
+        if side is PositionSide.LONG
+        else "M15_SHORT_PULLBACK"
+    )
+    if str(context.get("trend_state") or "").upper() != expected_trend:
+        return False
+    h4_direction = _normalized_structure_direction(
+        _mapping(context.get("h4_structure"))
+    )
+    h1_direction = _normalized_structure_direction(
+        _mapping(context.get("h1_structure"))
+    )
+    opposite = (
+        PositionSide.SHORT.value
+        if side is PositionSide.LONG
+        else PositionSide.LONG.value
+    )
+    if h4_direction == opposite or h1_direction == opposite:
+        return False
+    precision = _mapping(context.get("m15_precision"))
+    return (
+        str(precision.get("trend") or "UNKNOWN").upper()
+        == expected_precision_trend
+        and str(precision.get("pullback") or "UNKNOWN").upper()
+        == expected_pullback
+        and _float_or_none(precision.get("selected_ema_period"))
+        in {20.0, 60.0}
+    )
+
+
+def _zone_intersection(
+    left: object,
+    right: object,
+) -> dict[str, float] | None:
+    if not isinstance(left, Mapping) or not isinstance(right, Mapping):
+        return None
+    left_zone = _normalized_zone(left)
+    right_zone = _normalized_zone(right)
+    if left_zone is None or right_zone is None:
+        return None
+    low = max(left_zone["low"], right_zone["low"])
+    high = min(left_zone["high"], right_zone["high"])
+    if low > high:
+        return None
+    return {"low": low, "high": high, "price": (low + high) / 2.0}
 
 
 def _normalized_structure_direction(structure: Mapping[str, object]) -> str:

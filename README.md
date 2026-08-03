@@ -39,7 +39,8 @@ Hard vetoes remain visible on the signal and are enforced by automatic entry:
 - No short chase when RSI is oversold, price closes below lower BOLL, funding is very negative, short side is crowded, or OI spikes.
 - Choppy EMA/BOLL/RSI conditions are treated as low-quality environments.
 
-Risk is sized by maximum acceptable loss, not by leverage:
+Manual/API orders continue to size risk by maximum acceptable loss, not by
+leverage:
 
 ```text
 risk_amount = equity * risk_per_trade
@@ -50,16 +51,21 @@ margin_required = notional / leverage
 Automatic trading capital allocation:
 
 - Deployable margin: `95%` of current equity, split into five units.
-- `A` entry: score `80-99`, at most one unit.
-- `S` entry: score `100+`, at most two units; it uses one unit when only one remains.
-- Scores below `80` do not open automatically.
-- Default leverage: `5x`; maximum leverage: `10x`, further capped by stop distance.
-- Maximum open positions: `5`.
+- In paper fixed-unit mode, `B`, `A`, and `S` entries all open with exactly one
+  unit initially.
+- `S` keeps a two-unit maximum eligibility, but automatic adding is currently
+  disabled, so its first fill is never two units.
+- Standard auto-entry grades are `B: 75-79`, `A: 80-94`, and `S: 95+`;
+  approved trend-start/research channels keep their separate policy threshold.
+- Default and maximum leverage: `5x`.
+- Maximum open positions: `3`.
 - Daily/weekly loss limits, maximum drawdown and consecutive-loss cooldown are disabled by default during paper-strategy testing. Setting their limits above zero restores the corresponding hard entry gates.
 
-The risk-per-trade sizing branch remains available only for legacy/manual
-`RiskManager` callers. Production automatic trading and historical replay use
-the fixed A/S capital-unit allocation above.
+The deployment config enables fixed-unit sizing only for automatic paper
+entries. Risk-gate validation and audit metadata remain active, while the
+risk-sized margin is recorded separately instead of shrinking the one-unit
+paper sample. Turning `risk.paper_fixed_unit_sizing` off, using a non-paper
+execution mode, or placing a manual/API order restores risk-based sizing.
 
 ## Project Layout
 

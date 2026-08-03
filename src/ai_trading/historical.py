@@ -25,6 +25,8 @@ from ai_trading.paper import (
     PaperFill,
     PaperTradingEngine,
     SUPPORTED_TIMEFRAMES,
+    _completed_trade_cycle_pnl,
+    _fill_lifecycle_groups,
 )
 
 
@@ -871,16 +873,6 @@ def analyze_replay_failures(
     }
 
 
-def _fill_lifecycle_groups(
-    fills: Iterable[PaperFill],
-) -> dict[str, list[PaperFill]]:
-    groups: dict[str, list[PaperFill]] = {}
-    for fill in fills:
-        cycle_id = fill.trade_cycle_id or f"{fill.symbol}:{fill.opened_at.isoformat()}"
-        groups.setdefault(cycle_id, []).append(fill)
-    return groups
-
-
 def _completed_trade_payloads(
     fills: Iterable[PaperFill],
 ) -> list[dict[str, object]]:
@@ -902,18 +894,12 @@ def _completed_trade_payload(
     entries = [fill for fill in fills if fill.action in {"OPEN", "ADD"}]
     closes = [fill for fill in fills if fill.action in {"PARTIAL_CLOSE", "CLOSE"}]
     opens = [fill for fill in entries if fill.action == "OPEN"]
-    if not opens or not any(fill.action == "CLOSE" for fill in closes):
+    pnl = _completed_trade_cycle_pnl(fills)
+    if not opens or pnl is None:
         return None
 
     opening = opens[0]
     closing = next(fill for fill in reversed(closes) if fill.action == "CLOSE")
-    realized = sum(
-        fill.realized_pnl
-        for fill in fills
-        if fill.action in {"PARTIAL_CLOSE", "CLOSE", "FUNDING"}
-    )
-    entry_fees = sum(fill.fee for fill in entries)
-    pnl = realized - entry_fees
     entry_quantity = sum(fill.quantity for fill in entries)
     closed_quantity = sum(fill.quantity for fill in closes)
     entry_notional = sum(fill.price * fill.quantity for fill in entries)

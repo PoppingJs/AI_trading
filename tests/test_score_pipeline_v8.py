@@ -345,3 +345,198 @@ def test_indicator_only_location_cannot_manufacture_a_structure_stop() -> None:
     assert result.selected_level.structural is False
     assert result.score_breakdown["LOCATION"] == 15
     assert result.structure_stop is None
+
+
+def test_bare_support_and_old_resistance_are_not_suggested_entry_levels() -> None:
+    candles = _flat_candles()
+    context = _context()
+    context["entry_levels"] = {
+        "long": {
+            "h1_support": {
+                "low": 99.0,
+                "high": 101.0,
+                "price": 100.0,
+            },
+            "breakout_retest": {
+                "low": 99.0,
+                "high": 101.0,
+                "price": 100.0,
+            },
+        },
+        "short": {},
+    }
+
+    result = _evaluate(
+        candles=candles,
+        context=context,
+        flow_ratio=1.2,
+        price=100.0,
+    ).long
+
+    assert result.selected_level.key == ""
+    assert result.selected_level.state == "UNAVAILABLE"
+    assert result.score_breakdown["LOCATION"] == 0
+
+
+def test_m15_ema_zone_is_ineligible_outside_a_one_way_market() -> None:
+    candles = _flat_candles()
+    context = _context()
+    context["trend_state"] = "TREND_LONG"
+    context["m15_precision"] = {
+        "trend": "UP",
+        "pullback": "M15_LONG_PULLBACK",
+        "selected_ema_period": 20,
+    }
+    context["entry_levels"] = {
+        "long": {
+            "m15_ema20_ema60": {
+                "low": 99.0,
+                "high": 101.0,
+                "price": 100.0,
+            },
+        },
+        "short": {},
+    }
+
+    result = _evaluate(
+        candles=candles,
+        context=context,
+        flow_ratio=1.2,
+        price=100.0,
+    ).long
+
+    assert result.selected_level.key == ""
+    assert result.score_breakdown["LOCATION"] == 0
+
+
+def test_one_way_up_authorizes_long_m15_ema_pullback() -> None:
+    candles = _flat_candles()
+    context = _context(h4_direction="LONG")
+    context["trend_state"] = "ONE_WAY_UP"
+    context["m15_precision"] = {
+        "trend": "UP",
+        "pullback": "M15_LONG_PULLBACK",
+        "selected_ema_period": 20,
+    }
+    context["entry_levels"] = {
+        "long": {
+            "m15_ema20_ema60": {
+                "low": 99.0,
+                "high": 101.0,
+                "price": 100.0,
+            },
+        },
+        "short": {},
+    }
+
+    result = _evaluate(
+        candles=candles,
+        context=context,
+        flow_ratio=1.2,
+        price=100.0,
+    ).long
+
+    assert result.selected_level.key == "m15_ema20_ema60"
+    assert result.selected_level.state == "IN_VALID_ZONE"
+    assert result.score_breakdown["LOCATION"] == 15
+
+
+def test_one_way_down_authorizes_short_m15_ema_retest() -> None:
+    candles = _flat_candles()
+    context = _context(h4_direction="SHORT")
+    context["trend_state"] = "ONE_WAY_DOWN"
+    context["m15_precision"] = {
+        "trend": "DOWN",
+        "pullback": "M15_SHORT_PULLBACK",
+        "selected_ema_period": 60,
+    }
+    context["entry_levels"] = {
+        "long": {},
+        "short": {
+            "m15_ema20_ema60": {
+                "low": 99.0,
+                "high": 101.0,
+                "price": 100.0,
+            },
+        },
+    }
+
+    result = _evaluate(
+        candles=candles,
+        context=context,
+        flow_ratio=0.8,
+        price=100.0,
+    ).short
+
+    assert result.selected_level.key == "m15_ema20_ema60"
+    assert result.selected_level.state == "IN_VALID_ZONE"
+    assert result.score_breakdown["LOCATION"] == 15
+
+
+def test_separated_ema20_and_ema60_do_not_form_a_wide_location_band() -> None:
+    candles = _flat_candles()
+    context = _context()
+    context["entry_levels"] = {
+        "long": {
+            "h1_ema20_ema60": {
+                "low": 99.0,
+                "high": 110.0,
+                "price": 104.5,
+            },
+            "h1_ema20": {
+                "low": 99.0,
+                "high": 100.0,
+                "price": 99.5,
+            },
+            "h1_ema60": {
+                "low": 109.0,
+                "high": 110.0,
+                "price": 109.5,
+            },
+        },
+        "short": {},
+    }
+
+    result = _evaluate(
+        candles=candles,
+        context=context,
+        flow_ratio=1.2,
+        price=104.0,
+    ).long
+
+    assert result.selected_level.key == "h1_ema20"
+    assert result.selected_level.key != "h1_ema20_ema60"
+    assert result.selected_level.zone["high"] - result.selected_level.zone["low"] == 1.0
+    assert result.score_breakdown["LOCATION"] == 8
+
+
+def test_price_inside_qualified_htf_location_is_immediately_structural_advantage() -> None:
+    candles = _flat_candles()
+    context = _context()
+    context["entry_levels"] = {
+        "long": {
+            "h1_ema20": {
+                "low": 99.0,
+                "high": 101.0,
+                "price": 100.0,
+            },
+            "h1_support": {
+                "low": 99.0,
+                "high": 101.0,
+                "price": 100.0,
+            },
+        },
+        "short": {},
+    }
+
+    result = _evaluate(
+        candles=candles,
+        context=context,
+        flow_ratio=1.2,
+        price=99.2,
+    ).long
+
+    assert result.selected_level.key == "h1_ema20"
+    assert result.selected_level.structural is True
+    assert result.selected_level.state == "STRUCTURAL_ADVANTAGE"
+    assert result.score_breakdown["LOCATION"] == 20

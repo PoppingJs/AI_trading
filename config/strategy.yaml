@@ -62,6 +62,8 @@ strategy:
 risk:
   leverage_default: 5
   leverage_max: 5
+  # 模拟盘策略首仓：B/A/S均开1个资金单位；S仅保留累计最高2单位资格
+  paper_fixed_unit_sizing: true
   risk_per_trade: 0.005
   single_symbol_margin_limit: 0.10
   total_margin_limit: 0.50

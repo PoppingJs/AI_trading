@@ -104,6 +104,10 @@ def test_realtime_dashboard_reserves_height_for_pnl_time_axis(tmp_path: Path) ->
     client = TestClient(create_app(state_path=tmp_path / "paper_state.json"))
     page = client.get("/").text
     assert ".metric { min-width: 0; padding: 2px 10px; }" in page
+    assert ".metrics { grid-template-columns: repeat(8, minmax(0, 1fr));" in page
+    assert "const completedTrades = Number(data.completed_trade_count || 0);" in page
+    assert "['胜率', completedTrades ? pct(data.win_rate) : '--'" in page
+    assert page.index("['手续费'") < page.index("['胜率'") < page.index("['总收益'")
     assert "main { height: calc(100vh - 98px); padding: 6px 16px;" in page
     assert "#pnlChart { width: 100%; height: auto; min-height: 0; flex: 1 1 auto;" in page
     assert "const timeLabelY = plotBottom + 8 * dpr;" in page
