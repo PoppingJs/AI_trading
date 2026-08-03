@@ -373,12 +373,12 @@ PAPER_DASHBOARD_HTML = """
     .side-col, .action-col { min-width: 56px; }
     .signals-table { width: 100%; table-layout: fixed; }
     .signals-table th, .signals-table td { vertical-align: middle; }
-    .signals-table th:nth-child(-n+7), .signals-table td:nth-child(-n+7) { width: 78px; min-width: 0; max-width: 78px; text-align: center; }
+    .signals-table th:nth-child(-n+6), .signals-table td:nth-child(-n+6) { width: 78px; min-width: 0; max-width: 78px; text-align: center; }
     .signals-table .symbol-col, .signals-table .side-col, .signals-table .num-col { min-width: 0; }
     .signals-table .timing-col { white-space: normal; line-height: 1.15; padding-left: 2px; padding-right: 2px; }
     .signals-table .reason-col { width: auto; min-width: 0; max-width: none; text-align: left; }
     .signals-table .veto-col { width: 190px; text-align: center; white-space: normal; line-height: 1.2; }
-    .signals-table th:nth-child(9), .signals-table td:nth-child(9) { width: 190px; min-width: 0; max-width: 190px; }
+    .signals-table th:nth-child(8), .signals-table td:nth-child(8) { width: 190px; min-width: 0; max-width: 190px; }
     .signals-table th.reason-col { text-align: center; }
     .signals-table th.veto-col { text-align: center; }
     .signals-table th:not(.reason-col), .signals-table td:not(.reason-col):not(.veto-col) { text-align: center; }
@@ -1007,48 +1007,18 @@ PAPER_DASHBOARD_HTML = """
     function tTrendState(value) { return trendStateText[value] || value || '震荡'; }
     function tRiskState(value) { return riskStateText[value] || value || '正常'; }
     function marketDirectionText(signal) {
-      if (Number(signal.score_model_version || 0) >= 8) {
-        const state = String(signal.direction_state_v8 || signal.direction_confirmation_state || 'UNKNOWN');
-        const v8DirectionText = {
-          D1_H4_ALIGNED: '日线与4小时同向',
-          H4_ALIGNED: '4小时方向成立',
-          H4_ALIGNED_D1_HEADWIND: '4小时成立、日线逆风',
-          PROVISIONAL_STARTUP: '趋势启动临时方向',
-          PROVISIONAL_D1_HEADWIND: '趋势启动、日线逆风',
-          D1_BACKGROUND_ONLY: '仅日线背景',
-          H4_OPPOSED: '4小时方向相反',
-          NO_DIRECTION: '方向尚未建立',
-          H4_CONFIRMED: '4小时方向确认',
-          TEMPORARY_CONFIRMED: '临时启动方向确认',
-          DIRECTION_PENDING: '方向等待'
-        };
-        return v8DirectionText[state] || state;
-      }
-      const context = signal.market_context;
-      if (context && context.direction_state) {
-        return directionStateText[context.direction_state] || context.direction_state;
-      }
-      return tTrendState(signal.trend_state || signal.regime);
-    }
-    function marketRiskText(signal) {
-      if (Number(signal.score_model_version || 0) >= 8) {
-        const crowdingText = {
-          NORMAL: '正常',
-          LONG_CROWD_SUSPECTED: '多头拥挤观察（不扣分）',
-          SHORT_CROWD_SUSPECTED: '空头拥挤观察（不扣分）',
-          LONG_CROWD_CONFIRMED: '多头拥挤已确认',
-          SHORT_CROWD_CONFIRMED: '空头拥挤已确认'
-        };
-        const crowding = crowdingText[signal.crowding_state] || signal.crowding_state || '正常';
-        const dataWarning = signal.data_warning ? '<br>衍生品数据降级' : '';
-        return `拥挤:${crowding}${dataWarning}`;
-      }
-      const context = signal.market_context;
-      if (!context) return tRiskState(signal.risk_state);
-      const crowding = crowdingStateText[context.crowding_state] || context.crowding_state || '未知';
-      const liquidity = liquidityStateText[context.liquidity_state] || context.liquidity_state || '未知';
-      const system = systemRiskStateText[context.system_risk_state] || context.system_risk_state || '未知';
-      return `拥挤:${crowding}<br>流动:${liquidity}<br>系统:${system}`;
+      const trend = String(signal.trend_state || signal.regime || '').toUpperCase();
+      if (trend === 'ONE_WAY_UP') return '强单边上涨';
+      if (trend === 'ONE_WAY_DOWN') return '强单边下跌';
+      if (trend === 'TREND_LONG') return '通道上涨';
+      if (trend === 'TREND_SHORT') return '通道下跌';
+      if (['CHOP', 'RANGE', 'BOX', 'NEUTRAL', 'SIDEWAYS'].includes(trend)) return '震荡';
+      if (trend) return '震荡';
+      const direction = String(signal.direction || '').toUpperCase();
+      const action = String(signal.candidate_action || signal.action || '').toUpperCase();
+      if (direction === 'LONG' || action === 'ENTRY_LONG') return '通道上涨';
+      if (direction === 'SHORT' || action === 'ENTRY_SHORT') return '通道下跌';
+      return '震荡';
     }
     function tReason(value) {
       if (!value) return '';
@@ -1408,6 +1378,16 @@ PAPER_DASHBOARD_HTML = """
     function tVetoes(values) {
       return [...new Set((values || []).map(tVeto).filter(Boolean))].join('；');
     }
+    function isSignalRewardRiskBlock(value) {
+      let reason = String(value || '').trim();
+      while (reason.startsWith('ACTIVE_VETO:')) {
+        reason = reason.slice('ACTIVE_VETO:'.length).trim();
+      }
+      if (reason.startsWith('NET_REWARD_R_')) return true;
+      if (/^entry reward\\/risk .*below (?:minimum|preferred) /i.test(reason)) return true;
+      if (/^(?:真实净盈亏比|实际盈亏比).*(?:低于|不足|不可用|无效)/.test(reason)) return true;
+      return false;
+    }
     function reasonList(values) {
       return (values || []).map(value => String(value || '').trim()).filter(Boolean);
     }
@@ -1443,6 +1423,7 @@ PAPER_DASHBOARD_HTML = """
       return approxPriceFromReason(`@${match[1]}`);
     }
     function numberValue(value) {
+      if (value === null || value === undefined || value === '') return null;
       const num = Number(value);
       return Number.isFinite(num) ? num : null;
     }
@@ -1588,7 +1569,17 @@ PAPER_DASHBOARD_HTML = """
       const maReason = maRetestUp || maRetestDown || maBreakUp || maBreakDown;
       const maPrice = approxPriceFromReason(maReason);
       const maZone = clusterZone(signal, maPrice || mtfPrice(rawReasons, 'ma1h') || mtfPrice(rawReasons, 'ma4h'));
-      const supportResistanceZone = structureZone(signal, direction, maPrice || mtfPrice(rawReasons, 'ma1h') || mtfPrice(rawReasons, 'ma4h'));
+      const structureLevels = entrySideLevels(signal, direction);
+      const structureLevelFallback = direction === '多头'
+        ? entryLevelZone(structureLevels.h1_support || structureLevels.h4_support)
+        : direction === '空头'
+          ? entryLevelZone(structureLevels.h1_resistance || structureLevels.h4_resistance)
+          : '';
+      const supportResistanceZone = structureZone(
+        signal,
+        direction,
+        maPrice || mtfPrice(rawReasons, 'ma1h') || mtfPrice(rawReasons, 'ma4h'),
+      ) || structureLevelFallback;
       const h1StructureZone = structureZoneByFrame(signal, direction, '1h', supportResistanceZone);
       const h4StructureZone = structureZoneByFrame(signal, direction, '4h', supportResistanceZone);
       const isOneWayUp = trend.includes('ONE_WAY_UP');
@@ -1601,32 +1592,68 @@ PAPER_DASHBOARD_HTML = """
       const hasOiValley = String(h4OiValley.state || '') === 'CONFIRMED';
       const h1Trigger = objectValue(signal.h1_trigger);
       const h1State = String(h1Trigger.state || '');
+      const h1Structure = objectValue(signal.h1_structure);
+      const h1StructureState = String(h1Structure.state || '');
       const h4Structure = objectValue(signal.h4_structure);
       const h4State = String(h4Structure.state || '');
+      const directionState = String(signal.direction_state_v8 || '');
+      const dailyBias = String(signal.daily_bias || 'NEUTRAL').toUpperCase();
+      const h4Direction = String(signal.h4_direction || h4Structure.direction || 'NEUTRAL').toUpperCase();
+      const h1Direction = String(h1Structure.direction || h1Trigger.direction || 'NEUTRAL').toUpperCase();
       const riskState = String(signal.risk_state || '');
+      const crowdingState = String(signal.crowding_state || '');
       const rsiValue = numberValue(signal.rsi14);
       const volumeRatio = numberValue(signal.volume_ratio);
+      const oiChange = numberValue(signal.oi_change);
       const oiDropFromHigh = numberValue(h4Oi.drop_from_high_pct);
       const oiRebound = numberValue(h4Oi.rebound_pct);
+      const scoreBreakdown = objectValue(signal.score_breakdown);
 
       const activeClusterStates = ['DENSE', 'BREAKOUT_UP', 'BREAKDOWN_DOWN', 'RETEST_UP', 'RETEST_DOWN'];
       let maStructure = '';
       if (maReason || activeClusterStates.includes(clusterState(signal))) maStructure = `上一个均线密集${maZone ? `≈${maZone}` : ''}`;
 
+      const h1LongConfirmed = has1hHeld
+        || h1Direction === 'LONG'
+        || ['BREAKOUT_UP', 'RETEST'].includes(h1StructureState)
+        || ['BREAKOUT', 'RETEST', 'FAKE_BREAKDOWN'].includes(h1State);
+      const h1ShortConfirmed = has1hRejected
+        || h1Direction === 'SHORT'
+        || ['BREAKDOWN_DOWN', 'RETEST'].includes(h1StructureState)
+        || ['BREAKDOWN', 'RETEST', 'FAKE_BREAKOUT'].includes(h1State);
       let structureLine = '方向与结构：震荡，等待边界确认。';
       if (direction === '多头') {
-        structureLine = `方向与结构：多头方向成立：日线不空，4H结构偏多，1H站稳EMA20/EMA50或BOLL中轨，价格回踩支撑位${supportResistanceZone ? `≈${supportResistanceZone}` : ''}不破并重新收回${maStructure ? `，${maStructure}` : ''}。`;
+        const facts = [dailyBias === 'BEAR' ? '日线逆风' : dailyBias === 'BULL' ? '日线偏多' : '日线不空'];
+        facts.push(h4Direction === 'LONG' || directionState === 'H4_CONFIRMED' ? '4H结构偏多' : '4H方向中性');
+        facts.push(h1LongConfirmed ? '1H站稳EMA20/EMA50或BOLL中轨' : '1H等待结构确认');
+        if (supportResistanceZone) facts.push(`价格回踩支撑位≈${supportResistanceZone}不破并重新收回`);
+        if (maStructure) facts.push(maStructure);
+        const prefix = directionState === 'TEMPORARY_CONFIRMED' ? '多头启动方向观察' : '多头方向成立';
+        structureLine = `方向与结构：${prefix}：${facts.join('，')}。`;
         if (hasVolumeLongConfirm || hasVolumeLongBreakout) structureLine = structureLine.replace('。', '，放量突破后回踩不破。');
       } else if (direction === '空头') {
-        structureLine = `方向与结构：空头方向成立：日线不多，4H结构偏空，1H跌破EMA20/EMA50或BOLL中轨，价格反抽压力位${supportResistanceZone ? `≈${supportResistanceZone}` : ''}不破并重新回落${maStructure ? `，${maStructure}` : ''}。`;
+        const facts = [dailyBias === 'BULL' ? '日线逆风' : dailyBias === 'BEAR' ? '日线偏空' : '日线不多'];
+        facts.push(h4Direction === 'SHORT' || directionState === 'H4_CONFIRMED' ? '4H结构偏空' : '4H方向中性');
+        facts.push(h1ShortConfirmed ? '1H跌破EMA20/EMA50或BOLL中轨' : '1H等待结构确认');
+        if (supportResistanceZone) facts.push(`价格反抽压力位≈${supportResistanceZone}不过并重新回落`);
+        if (maStructure) facts.push(maStructure);
+        const prefix = directionState === 'TEMPORARY_CONFIRMED' ? '空头启动方向观察' : '空头方向成立';
+        structureLine = `方向与结构：${prefix}：${facts.join('，')}。`;
         if (hasVolumeShortConfirm || hasVolumeShortBreakdown) structureLine = structureLine.replace('。', '，放量跌破后反抽不过。');
       }
 
       let entryBits = [];
-      const backendEntryText = String(signal.suggested_entry_text || '').trim();
+      const backendEntryText = options.ignoreBackendEntryText
+        ? ''
+        : String(signal.suggested_entry_text || '').trim();
       const levels = entrySideLevels(signal, direction);
       const candidates = [];
       if (direction === '多头') {
+        if (options.preferFullStructureEntries) {
+          addEntryCandidate(candidates, '前压力突破后回踩确认', levels.breakout_retest);
+          addEntryCandidate(candidates, '1H支撑回踩不破', levels.h1_support);
+          addEntryCandidate(candidates, '1H BOLL中轨回踩不破', levels.h1_boll_mid);
+        }
         if (String(signal.entry_timeframe_override || '') === '4h') {
           addEntryCandidate(candidates, '4H支撑回踩不破', levels.h4_support);
           addEntryCandidate(candidates, '4H BOLL中轨趋势回踩', levels.h4_boll_mid);
@@ -1654,6 +1681,11 @@ PAPER_DASHBOARD_HTML = """
           addEntryCandidate(candidates, '均线密集区突破或回踩MA20不破', levels.ma_cluster_breakout || levels.ma20_retest);
         }
       } else if (direction === '空头') {
+        if (options.preferFullStructureEntries) {
+          addEntryCandidate(candidates, '前支撑跌破后反抽确认', levels.breakdown_retest);
+          addEntryCandidate(candidates, '1H压力反抽不过', levels.h1_resistance);
+          addEntryCandidate(candidates, '1H BOLL中轨反抽失败', levels.h1_boll_mid);
+        }
         const distributionStage = String(signal.distribution_short_stage || '');
         if (distributionStage === 'HIGH_DISTRIBUTION_RANGE') {
           addEntryCandidate(candidates, '第一阶段：高位派发箱体上沿小仓试空', levels.distribution_range_high);
@@ -1684,11 +1716,13 @@ PAPER_DASHBOARD_HTML = """
       if (backendEntryText) entryBits = [backendEntryText];
       if (!entryBits.length) entryBits.push('边界确认处：暂无有效区间');
       const entryLabel = options.entryLabel || '入场位置';
-      const entryLine = `${entryLabel}：${entryBits.slice(0, 3).join('；')}`;
+      const entryLine = `${entryLabel}：${entryBits.slice(0, 3).join('；')}。`;
 
       const riskBits = [];
       if (oiDropFromHigh !== null && oiDropFromHigh <= -0.18) {
         riskBits.push(`OI骤减${pctLabel(oiDropFromHigh)}`);
+      } else if (oiChange !== null && oiChange > 0 && oiChange < 0.05) {
+        riskBits.push('OI温和上升');
       } else if (reasonHas(rawReasons, ['open interest rising mildly', 'OI 温和上升'])) {
         riskBits.push('OI温和上升');
       } else if (reasonHas(rawReasons, ['open interest stable', 'OI 基本稳定', '4h OI=NORMAL'])) {
@@ -1708,7 +1742,7 @@ PAPER_DASHBOARD_HTML = """
       if (hasVwapShortRisk) riskBits.push('价格远离VWAP，追空风险');
       if (rsiValue !== null) {
         if (rsiValue >= 75 || rsiValue <= 25) riskBits.push(`RSI=${rsiValue.toFixed(0)}`);
-        else if (reasonHas(rawReasons, ['RSI in healthy', 'RSI 处于健康'])) riskBits.push('RSI健康');
+        else riskBits.push('RSI健康');
       } else if (reasonHas(rawReasons, ['RSI in healthy', 'RSI 处于健康'])) {
         riskBits.push('RSI健康');
       }
@@ -1716,15 +1750,25 @@ PAPER_DASHBOARD_HTML = """
       if (direction === '空头' && hasUpsideSweep) riskBits.push('多次上插针已清杠杆');
       if (oiRebound !== null && oiRebound >= 0.003) riskBits.push('OI下降后回稳');
       else if (hasOiValley) riskBits.push('4H OI洼地已形成');
-      if (riskState === 'LONG_CROWD') riskBits.push('多头情绪拥挤');
-      else if (riskState === 'SHORT_CROWD') riskBits.push('空头情绪拥挤');
-      else if (riskState === 'OI_ABNORMAL') riskBits.push('OI异常');
-      else if (riskState === 'FUNDING_HOT') riskBits.push('资金费率过热');
-      else if (reasonHas(rawReasons, ['long/short ratio is not overcrowded', '多空比未出现'])) riskBits.push('情绪未拥挤');
-      const structureHeld = has1hHeld || has1hRejected || ['RETEST', 'BREAKOUT', 'BREAKDOWN', 'FAKE_BREAKOUT', 'FAKE_BREAKDOWN'].includes(h1State);
+      if (riskState === 'LONG_CROWD' || crowdingState === 'LONG_CROWD_CONFIRMED') riskBits.push('多头情绪拥挤');
+      else if (riskState === 'SHORT_CROWD' || crowdingState === 'SHORT_CROWD_CONFIRMED') riskBits.push('空头情绪拥挤');
+      else if (crowdingState === 'LONG_CROWD_SUSPECTED') riskBits.push('多头拥挤观察（证据不足，不扣分）');
+      else if (crowdingState === 'SHORT_CROWD_SUSPECTED') riskBits.push('空头拥挤观察（证据不足，不扣分）');
+      else if (crowdingState === 'NORMAL' || reasonHas(rawReasons, ['long/short ratio is not overcrowded', '多空比未出现'])) riskBits.push('情绪未拥挤');
+      else if (Number(signal.score_model_version || 0) >= 8) riskBits.push('拥挤状态待确认');
+      if (riskState === 'OI_ABNORMAL') riskBits.push('OI异常');
+      if (riskState === 'FUNDING_HOT') riskBits.push('资金费率过热');
+      const structureHeld = has1hHeld
+        || has1hRejected
+        || Number(scoreBreakdown.STRUCTURE || 0) >= 20
+        || ['RETEST', 'BREAKOUT', 'BREAKDOWN', 'FAKE_BREAKOUT', 'FAKE_BREAKDOWN'].includes(h1State);
       if (structureHeld) riskBits.push('结构未失效');
       reasonList(signal.risk_warnings || []).forEach(warning => {
-        riskBits.push(tRiskWarning(warning));
+        const warningText = String(warning);
+        const isInternalDiagnostic = warningText.includes('拥挤证据不完整')
+          || warningText.includes('超过180秒未更新')
+          || warningText.includes('降级为研究模拟通道');
+        if (!isInternalDiagnostic) riskBits.push(tRiskWarning(warning));
       });
       if (!riskBits.length) riskBits.push('风险正常');
       const riskLine = `指标与风险：${[...new Set(riskBits)].join('；')}。`;
@@ -1733,23 +1777,23 @@ PAPER_DASHBOARD_HTML = """
     }
     function signalReasonText(signal) {
       if (Number(signal.score_model_version || 0) >= 8) {
-        const scores = signal.score_breakdown || {};
-        const familyLabels = {
-          DIRECTION: '方向', STRUCTURE: '结构', LOCATION: '位置',
-          TRIGGER: '触发', PARTICIPATION: '参与流', PRICE_PROGRESS: '价格推进'
+        const fullLevels = objectValue(signal.all_entry_levels_v8);
+        const hasFullLevels = Object.keys(objectValue(fullLevels.long)).length > 0
+          || Object.keys(objectValue(fullLevels.short)).length > 0;
+        const displaySignal = {
+          ...signal,
+          entry_levels: hasFullLevels ? fullLevels : signal.entry_levels,
+          suggested_entry_text: '',
         };
-        const scoreLine = Object.entries(familyLabels)
-          .map(([key, label]) => `${label}${Number(scores[key] || 0)}分`)
-          .join('；');
-        const location = signal.selected_level_key
-          ? `${signal.selected_level_key}（${signal.selected_level_state || '等待'}）`
-          : '尚无有效主入场区';
-        const penalty = Number(signal.total_risk_penalty || 0);
-        const modeText = {
-          STANDARD: '标准通道', TREND_STARTUP: '趋势启动通道',
-          TREND_RESEARCH: '研究模拟通道', NONE: '等待通道'
-        };
-        return `评分构成：${scoreLine}。\n结构/触发：${signal.structure_state || '等待'} / ${signal.trigger_state || '等待'}。\n建议入场位置：${location}。\n决策：${modeText[signal.entry_mode] || signal.entry_mode || '等待通道'}${penalty ? `；风险扣分${penalty}` : ''}。`;
+        return conciseReason(
+          signal.legacy_reasons || signal.reasons || [],
+          displaySignal,
+          {
+            entryLabel: '建议入场位置',
+            ignoreBackendEntryText: true,
+            preferFullStructureEntries: true,
+          },
+        );
       }
       return conciseReason(signal.reasons || [], signal, { entryLabel: '建议入场位置' });
     }
@@ -1937,16 +1981,17 @@ PAPER_DASHBOARD_HTML = """
       ]));
       const signalRows = Object.entries(data.latest_signals || {})
         .map(([symbol, s]) => {
-          const blocks = [...new Set([...(s.policy_blocks || []), ...(s.auto_entry_blocks || []), ...(s.vetoes || [])])];
-          return [displaySymbol(symbol), `<span class="pill">${tAction(s.action)}</span>`, marketDirectionText(s), marketRiskText(s), tSmartMoneyPhase(s.smart_money_phase), s.score, signalEntryPosition(s), flowReasonText(signalReasonText(s)), tVetoes(blocks)];
+          const blocks = [...new Set([...(s.policy_blocks || []), ...(s.auto_entry_blocks || []), ...(s.vetoes || [])])]
+            .filter(block => !isSignalRewardRiskBlock(block));
+          return [displaySymbol(symbol), `<span class="pill">${tAction(s.action)}</span>`, marketDirectionText(s), tSmartMoneyPhase(s.smart_money_phase), s.score, signalEntryPosition(s), flowReasonText(signalReasonText(s)), tVetoes(blocks)];
         });
       const signalsTable = document.getElementById('signals');
       const signalsScrollAnchor = captureTableScrollAnchor(signalsTable);
       signalsTable.className = 'signals-table';
       signalsTable.innerHTML = table(
-        ['币种','动作','行情方向','风险状态','主力周期','分数','入场位置','原因','否决'],
+        ['币种','动作','行情方向','主力周期','分数','入场位置','原因','否决'],
         signalRows,
-        { 6: 'timing-col' },
+        { 5: 'timing-col' },
       );
       restoreTableScrollAnchor(signalsTable, signalsScrollAnchor);
       balanceSignalAndFillPanels();

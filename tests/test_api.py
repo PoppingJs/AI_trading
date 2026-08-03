@@ -52,7 +52,7 @@ def test_new_backtest_page_keeps_only_realtime_and_historical_navigation(tmp_pat
     assert "评分低于75" not in realtime.text
     assert "policy_blocks" in realtime.text
     assert "auto_entry_blocks" in realtime.text
-    assert "研究模拟通道" in realtime.text
+    assert "（研究模拟）" in realtime.text
     assert "\u6781\u7aef\u6ce2\u52a8\u89c2\u5bdf\uff08\u6a21\u62df\u76d8\u4e0d\u963b\u65ad\uff09" in realtime.text
     assert "\u8bc4\u5206\u4f4e\u4e8e82" not in realtime.text
     assert 'href="/review"' not in realtime.text
@@ -111,7 +111,7 @@ def test_realtime_dashboard_reserves_height_for_pnl_time_axis(tmp_path: Path) ->
     assert "MAX_DRAWDOWN: '最大回撤锁定'" in page
 
 
-def test_realtime_dashboard_reads_split_market_context_states(
+def test_realtime_dashboard_simplifies_signal_presentation(
     tmp_path: Path,
 ) -> None:
     client = TestClient(create_app(state_path=tmp_path / "paper_state.json"))
@@ -119,11 +119,28 @@ def test_realtime_dashboard_reads_split_market_context_states(
     page = client.get("/").text
 
     assert "marketDirectionText(s)" in page
-    assert "marketRiskText(s)" in page
-    assert "context.direction_state" in page
-    assert "context.crowding_state" in page
-    assert "context.liquidity_state" in page
-    assert "context.system_risk_state" in page
+    assert "marketRiskText(s)" not in page
+    assert "['币种','动作','行情方向','主力周期','分数','入场位置','原因','否决']" in page
+    assert ".signals-table th:nth-child(-n+6)" in page
+    assert ".signals-table th:nth-child(-n+7)" not in page
+    assert ".signals-table th:nth-child(8)" in page
+    for direction in ('通道上涨', '通道下跌', '强单边上涨', '强单边下跌', '震荡'):
+        assert direction in page
+    assert "['CHOP', 'RANGE', 'BOX', 'NEUTRAL', 'SIDEWAYS'].includes(trend)" in page
+    assert "signal.all_entry_levels_v8" in page
+    assert "preferFullStructureEntries: true" in page
+    assert "方向与结构：" in page
+    assert "建议入场位置" in page
+    assert "指标与风险：" in page
+    assert "评分构成：" not in page
+    assert "\n决策：" not in page
+    assert "多头拥挤观察（证据不足，不扣分）" in page
+    assert "空头拥挤观察（证据不足，不扣分）" in page
+    assert "signal.direction" in page
+    assert "signal.crowding_state" in page
+    assert "function isSignalRewardRiskBlock(value)" in page
+    assert ".filter(block => !isSignalRewardRiskBlock(block))" in page
+    assert "reason.startsWith('NET_REWARD_R_')" in page
 
 
 def test_trade_exit_reasons_are_rendered_with_chinese_only_fallbacks(tmp_path: Path) -> None:

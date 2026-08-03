@@ -2486,7 +2486,7 @@ def test_entry_quality_estimates_outside_zone_without_scoring() -> None:
     assert assessment["effective_risk_reward"] is not None
 
 
-def test_known_structure_room_below_one_r_stays_observation() -> None:
+def test_known_structure_room_below_one_r_remains_strategy_candidate() -> None:
     adjusted = _apply_multi_timeframe_context(
         {
             "action": SignalAction.WATCH.value,
@@ -2538,7 +2538,7 @@ def test_known_structure_room_below_one_r_stays_observation() -> None:
     assert adjusted["entry_quality_score"] == 0
     assert adjusted["effective_risk_reward"] < 1.0
     assert adjusted["entry_quality_status"] == "BELOW_MIN_NET_R"
-    assert adjusted["action"] == SignalAction.WATCH.value
+    assert adjusted["action"] == SignalAction.ENTRY_LONG.value
 
 
 def test_entry_quality_is_symmetric_for_short_structure() -> None:

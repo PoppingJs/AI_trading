@@ -109,6 +109,10 @@ class EntryPolicyV4Input:
     net_reward_r: float | None = None
     vetoes: Sequence[str] = ()
     min_net_reward_r: float = MIN_NET_REWARD_R
+    # Compatibility switch: direct/legacy callers keep the historical strict
+    # policy by default.  Strategy-signal previews disable this gate because
+    # the executable reward/risk is recalculated immediately before ordering.
+    enforce_net_reward_r: bool = True
 
 
 @dataclass(frozen=True)
@@ -136,8 +140,9 @@ def decide_entry_policy_v4(
     - Score 65-69 is research-only and requires the same core family gates.
     - Missing non-price derivatives data downgrades an otherwise eligible
       score >= 70 setup to research; broken price data always blocks.
-    - Structure, executable location, stop, target, net R and veto checks are
-      gates. They never rewrite the opportunity score.
+    - Structure, executable location, stop, target and veto checks are gates.
+      Net R is optionally enforced for compatible direct callers; strategy
+      signals defer it to the final execution-price safety check.
     """
 
     action = str(request.candidate_action or "").strip().upper()
@@ -173,15 +178,16 @@ def decide_entry_policy_v4(
         blocks.append("STRUCTURE_STOP_UNAVAILABLE")
     if not request.target_ready:
         blocks.append("STRUCTURE_TARGET_UNAVAILABLE")
-    if request.net_reward_r is None:
-        blocks.append("NET_REWARD_R_UNAVAILABLE")
-    elif not math.isfinite(float(request.net_reward_r)):
-        blocks.append("NET_REWARD_R_INVALID")
-    elif request.net_reward_r < request.min_net_reward_r:
-        blocks.append(
-            "NET_REWARD_R_BELOW_MINIMUM:"
-            f"{request.net_reward_r:.4g}<{request.min_net_reward_r:.4g}"
-        )
+    if request.enforce_net_reward_r:
+        if request.net_reward_r is None:
+            blocks.append("NET_REWARD_R_UNAVAILABLE")
+        elif not math.isfinite(float(request.net_reward_r)):
+            blocks.append("NET_REWARD_R_INVALID")
+        elif request.net_reward_r < request.min_net_reward_r:
+            blocks.append(
+                "NET_REWARD_R_BELOW_MINIMUM:"
+                f"{request.net_reward_r:.4g}<{request.min_net_reward_r:.4g}"
+            )
 
     if blocks:
         return _blocked_decision(

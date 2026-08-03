@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from ai_trading.entry_policy_v4 import (
     ENTRY_LONG,
     ENTRY_MODE_NONE,
@@ -234,6 +236,23 @@ def test_non_finite_real_r_is_a_plan_block() -> None:
     assert decision.decision_action == WATCH
     assert decision.entry_state == ENTRY_STATE_PLAN_PENDING
     assert decision.blocks == ("NET_REWARD_R_INVALID",)
+
+
+@pytest.mark.parametrize("net_reward_r", [None, float("nan"), 1.29])
+def test_signal_preview_can_defer_net_r_to_execution_layer(
+    net_reward_r: float | None,
+) -> None:
+    decision = decide_entry_policy_v4(
+        _request(
+            setup_score=100,
+            net_reward_r=net_reward_r,
+            enforce_net_reward_r=False,
+        )
+    )
+
+    assert decision.decision_action == ENTRY_LONG
+    assert decision.entry_state == ENTRY_STATE_READY
+    assert decision.blocks == ()
 
 
 def test_temporary_direction_cannot_bypass_price_progress_with_high_score() -> None:

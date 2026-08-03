@@ -22,8 +22,9 @@ from ai_trading.paper import (
     ENTRY_QUALITY_S,
     PaperTradingEngine,
     _activate_plan3_runner_stop,
-    _clear_transient_auto_entry_blocks,
+    _apply_entry_policy_v4_fields,
     _candles_current_for_scoring,
+    _clear_transient_auto_entry_blocks,
     _entry_context_from_signal,
     _entry_quality_grade,
     _latest_closed_slot,
@@ -320,6 +321,30 @@ def test_pipeline4_runtime_blocks_do_not_feed_back_into_strategy_vetoes() -> Non
     assert signal["auto_entry_blocks"] == ("ENTRY_TRIGGER_UNAVAILABLE",)
     _clear_transient_auto_entry_blocks(signal)
     assert signal["auto_entry_blocks"] == ()
+
+
+def test_v8_strategy_signal_defers_low_net_r_to_final_execution() -> None:
+    signal = _v8_ready_signal(
+        score=75,
+        direction_score=12,
+        progress_score=8,
+    )
+    signal.update(
+        {
+            "entry_timing": "GOOD",
+            "preview_structure_stop": 98.0,
+            "nearest_structure_target": 102.0,
+            "net_plan_r": 0.7595,
+            "entry_quality_status": "BELOW_MIN_NET_R",
+        }
+    )
+
+    _apply_entry_policy_v4_fields(signal)
+
+    assert signal["decision_action"] == SignalAction.ENTRY_LONG.value
+    assert signal["action"] == SignalAction.ENTRY_LONG.value
+    assert signal["policy_blocks"] == ()
+    assert signal["entry_quality_status"] == "BELOW_MIN_NET_R"
 
 
 def test_entry_context_persists_v8_decision_and_structured_evidence() -> None:

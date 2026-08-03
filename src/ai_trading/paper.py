@@ -6715,7 +6715,9 @@ def _entry_quality_assessment(
             f"真实结构目标的净计划盈亏比为 {reward_r:.2f}R，"
             f"低于 {MIN_ENTRY_REWARD_R:.2f}R，等待更优价格"
         )
-        result["entry_quality_blocks_entry"] = in_zone
+        # This is only a strategy-preview diagnostic.  The executable entry,
+        # stop and targets are rebuilt from the latest price immediately
+        # before an order, where the minimum net R remains a hard safety gate.
         return result
     if not in_zone:
         result["entry_quality_status"] = "OUTSIDE_ENTRY_ZONE"
@@ -13104,6 +13106,10 @@ def _apply_entry_policy_v4_fields(signal: dict[str, object]) -> None:
                 or signal.get("effective_risk_reward")
             ),
             vetoes=tuple(str(item) for item in signal.get("vetoes") or ()),
+            # A strategy signal is a directional/setup candidate, not an
+            # executable fill.  Final net R is enforced in _auto_trade_once
+            # after price, stop, targets and costs have all been refreshed.
+            enforce_net_reward_r=False,
         )
     )
     signal["decision_action"] = decision.decision_action
