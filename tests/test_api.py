@@ -48,7 +48,11 @@ def test_new_backtest_page_keeps_only_realtime_and_historical_navigation(tmp_pat
         backtest = client.get("/backtest")
     assert realtime.status_code == backtest.status_code == 200
     assert 'href="/backtest"' in realtime.text
-    assert "\u8bc4\u5206\u4f4e\u4e8e75" in realtime.text
+    assert "当前评分${values[1]}，低于本通道要求${values[2]}" in realtime.text
+    assert "评分低于75" not in realtime.text
+    assert "policy_blocks" in realtime.text
+    assert "auto_entry_blocks" in realtime.text
+    assert "研究模拟通道" in realtime.text
     assert "\u6781\u7aef\u6ce2\u52a8\u89c2\u5bdf\uff08\u6a21\u62df\u76d8\u4e0d\u963b\u65ad\uff09" in realtime.text
     assert "\u8bc4\u5206\u4f4e\u4e8e82" not in realtime.text
     assert 'href="/review"' not in realtime.text
@@ -146,6 +150,10 @@ def test_trade_exit_reasons_are_rendered_with_chinese_only_fallbacks(tmp_path: P
         (
             "4h body closed above resistance or EMA/BOLL zone",
             "4小时实体突破压力或EMA/BOLL区域",
+        ),
+        (
+            "no 0.5r progress, price progress ineffective and structure did not advance",
+            "未达到0.5R、价格推进无效且结构未继续发展",
         ),
     ):
         assert english in realtime

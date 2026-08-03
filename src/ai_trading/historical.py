@@ -20,7 +20,6 @@ from ai_trading.models import Candle, DerivativesSnapshot, PositionSide
 from ai_trading.paper import (
     AUTO_UNIVERSE_EXCLUDED_SYMBOLS,
     AUTO_UNIVERSE_SYMBOL,
-    AUTO_ENTRY_MIN_SCORE,
     CANDIDATE_MIN_QUOTE_VOLUME,
     PAPER_DEFAULT_BALANCE,
     PaperFill,
@@ -503,6 +502,12 @@ class HistoricalReplayEngine:
             close_time = event_time + timedelta(seconds=_TIMEFRAME_SECONDS[BASE_TIMEFRAME])
             clock.value = close_time
             signal_timeframe_closed = close_time.minute == 0
+            signal_refresh_due = _replay_signal_refresh_due(
+                close_time,
+                score_model_version=int(
+                    self.settings.strategy.score_model_version
+                ),
+            )
             for symbol in active:
                 _publish_symbol_history(
                     paper,
@@ -510,7 +515,7 @@ class HistoricalReplayEngine:
                     symbol,
                     dataset.symbols[symbol],
                     close_time,
-                    publish_signal=signal_timeframe_closed,
+                    publish_signal=signal_refresh_due,
                 )
                 _apply_replay_funding(
                     paper,
@@ -519,7 +524,7 @@ class HistoricalReplayEngine:
                     close_time,
                     charged_funding,
                 )
-            if signal_timeframe_closed:
+            if signal_refresh_due:
                 paper._rebalance_auto_signal_pools(fresh_symbols=set(active))
             paper._manage_open_positions()
             if signal_timeframe_closed:
@@ -1233,12 +1238,34 @@ def _intrabar_phase_price(
 
 def _has_replay_entry_candidate(paper: PaperTradingEngine) -> bool:
     return any(
-        int(signal.get("score") or 0) >= AUTO_ENTRY_MIN_SCORE
-        and str(signal.get("candidate_action") or signal.get("action") or "")
-        in {"ENTRY_LONG", "ENTRY_SHORT"}
+        (
+            int(signal.get("entry_pipeline_version") or 0) >= 4
+            and str(signal.get("candidate_action") or "")
+            in {"ENTRY_LONG", "ENTRY_SHORT"}
+        )
+        or (
+            int(signal.get("entry_pipeline_version") or 0) < 4
+            and int(signal.get("score") or 0) >= 75
+            and str(
+                signal.get("candidate_action")
+                or signal.get("action")
+                or ""
+            )
+            in {"ENTRY_LONG", "ENTRY_SHORT"}
+        )
         for symbol, signal in paper.latest_signals.items()
         if symbol not in paper.account.positions
     )
+
+
+def _replay_signal_refresh_due(
+    close_time: datetime,
+    *,
+    score_model_version: int,
+) -> bool:
+    # v8 consumes each newly closed 15m bar for micro-structure, trigger and
+    # price-progress evidence. Frozen legacy models retain their 1h cadence.
+    return score_model_version >= 8 or close_time.minute == 0
 
 
 def _apply_replay_funding(

@@ -7,6 +7,9 @@ from typing import Any
 
 @dataclass
 class StrategySettings:
+    # 8 enables PRD v4.0. Set to 7 for an immediate runtime rollback to the
+    # frozen pre-v4 scoring and entry pipeline without rewriting saved state.
+    score_model_version: int = 8
     score_threshold: int = 75
     watch_threshold: int = 55
     strict_trend_entry: bool = False

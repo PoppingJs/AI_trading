@@ -9,15 +9,63 @@ from ai_trading.historical import (
     SHANGHAI,
     _completed_trade_payloads,
     _floor_time,
+    _has_replay_entry_candidate,
     _inclusive_end_date,
     _progress_snapshot,
     _result_payload,
+    _replay_signal_refresh_due,
     _symbol_from_payload,
     _symbol_payload,
     analyze_replay_failures,
 )
 from ai_trading.models import Candle, DerivativesSnapshot, PositionSide
 from ai_trading.paper import PaperFill
+
+
+class _ReplayCandidatePaper:
+    def __init__(self, signal: dict[str, object]) -> None:
+        self.latest_signals = {"TESTUSDT": signal}
+        self.account = type("Account", (), {"positions": {}})()
+
+
+def test_replay_refreshes_pipeline4_research_and_startup_candidates() -> None:
+    for score, mode in ((65, "TREND_RESEARCH"), (70, "TREND_STARTUP")):
+        paper = _ReplayCandidatePaper(
+            {
+                "entry_pipeline_version": 4,
+                "candidate_action": "ENTRY_LONG",
+                "decision_action": "WATCH",
+                "entry_mode": mode,
+                "score": score,
+            }
+        )
+
+        assert _has_replay_entry_candidate(paper) is True
+
+
+def test_replay_keeps_legacy_75_threshold_for_old_pipeline() -> None:
+    assert _has_replay_entry_candidate(
+        _ReplayCandidatePaper(
+            {
+                "entry_pipeline_version": 3,
+                "candidate_action": "ENTRY_LONG",
+                "score": 74,
+            }
+        )
+    ) is False
+
+
+def test_v8_replay_recomputes_signal_on_every_closed_15m_bar() -> None:
+    at_1030 = datetime(2026, 7, 30, 10, 30, tzinfo=UTC)
+
+    assert _replay_signal_refresh_due(
+        at_1030,
+        score_model_version=8,
+    ) is True
+    assert _replay_signal_refresh_due(
+        at_1030,
+        score_model_version=7,
+    ) is False
 
 
 def test_historical_cache_round_trips_optional_participant_fields() -> None:

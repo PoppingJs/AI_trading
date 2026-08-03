@@ -306,10 +306,12 @@ def test_published_tie_signal_keeps_explicit_neutral_direction(
 
     assert signal["action"] == SignalAction.WATCH.value
     assert signal["direction"] == "NONE"
-    assert signal["direction_decision"] == "TIE"
+    assert signal["direction_decision"] in {"TIE", "SCORE_GAP_NARROW"}
+    assert signal["legacy_direction_decision"] == "TIE"
     assert signal["candidate_action"] is None
-    assert signal["long_score"] == 90
-    assert signal["short_score"] == 90
+    assert signal["long_score"] == signal["final_long_score"]
+    assert signal["short_score"] == signal["final_short_score"]
+    assert signal["legacy_score"] == 90
 
 
 def test_account_risk_snapshot_latches_daily_loss_and_drawdown() -> None:
@@ -565,9 +567,17 @@ def test_single_symbol_incomplete_derivatives_is_local_and_recovers() -> None:
     engine.running = True
     zec_signal = engine.status()["latest_signals"]["ZECUSDT"]
     assert zec_signal["data_warning"].startswith("衍生品数据不完整")
+    assert zec_signal["data_confidence"]["derivatives_data_complete"] is False
+    assert not any(
+        str(reason).startswith("衍生品数据不完整")
+        for reason in (
+            *zec_signal["vetoes"],
+            *zec_signal.get("auto_entry_blocks", ()),
+        )
+    )
     assert any(
         str(reason).startswith("衍生品数据不完整")
-        for reason in zec_signal["vetoes"]
+        for reason in zec_signal["risk_warnings"]
     )
 
     market.fail_zec = False
@@ -575,6 +585,57 @@ def test_single_symbol_incomplete_derivatives_is_local_and_recovers() -> None:
 
     assert engine.last_error is None
     assert engine.status()["symbol_data_warnings"] == {}
+
+
+@pytest.mark.parametrize(
+    ("score_model_version", "expected_timeframes"),
+    [
+        (8, {"15m", "1h", "4h"}),
+        (7, {"1h", "4h"}),
+    ],
+)
+def test_derivatives_refresh_uses_v8_m15_source_without_changing_v7(
+    score_model_version: int,
+    expected_timeframes: set[str],
+) -> None:
+    class RecordingDerivativesMarket(FakeMarketData):
+        def __init__(self) -> None:
+            super().__init__()
+            self.requested_timeframes: set[str] = set()
+
+        async def derivatives_bundle(
+            self,
+            symbol,
+            interval,
+            candle_times,
+            *,
+            include_funding=True,
+        ):
+            del symbol, include_funding
+            self.requested_timeframes.add(interval)
+            return [
+                DerivativesSnapshot(
+                    timestamp=timestamp,
+                    open_interest=1_000_000.0,
+                    long_short_ratio=1.0,
+                    funding_rate=0.0,
+                )
+                for timestamp in candle_times
+            ]
+
+    settings = AppSettings()
+    settings.strategy.score_model_version = score_model_version
+    market = RecordingDerivativesMarket()
+    engine = PaperTradingEngine(
+        settings,
+        symbols=["TESTUSDT"],
+        interval="1h",
+        market_data=market,
+    )
+
+    asyncio.run(engine.refresh_once())
+
+    assert market.requested_timeframes == expected_timeframes
 
 
 def indicator_snapshot(

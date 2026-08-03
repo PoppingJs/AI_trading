@@ -1007,6 +1007,23 @@ PAPER_DASHBOARD_HTML = """
     function tTrendState(value) { return trendStateText[value] || value || '震荡'; }
     function tRiskState(value) { return riskStateText[value] || value || '正常'; }
     function marketDirectionText(signal) {
+      if (Number(signal.score_model_version || 0) >= 8) {
+        const state = String(signal.direction_state_v8 || signal.direction_confirmation_state || 'UNKNOWN');
+        const v8DirectionText = {
+          D1_H4_ALIGNED: '日线与4小时同向',
+          H4_ALIGNED: '4小时方向成立',
+          H4_ALIGNED_D1_HEADWIND: '4小时成立、日线逆风',
+          PROVISIONAL_STARTUP: '趋势启动临时方向',
+          PROVISIONAL_D1_HEADWIND: '趋势启动、日线逆风',
+          D1_BACKGROUND_ONLY: '仅日线背景',
+          H4_OPPOSED: '4小时方向相反',
+          NO_DIRECTION: '方向尚未建立',
+          H4_CONFIRMED: '4小时方向确认',
+          TEMPORARY_CONFIRMED: '临时启动方向确认',
+          DIRECTION_PENDING: '方向等待'
+        };
+        return v8DirectionText[state] || state;
+      }
       const context = signal.market_context;
       if (context && context.direction_state) {
         return directionStateText[context.direction_state] || context.direction_state;
@@ -1014,6 +1031,18 @@ PAPER_DASHBOARD_HTML = """
       return tTrendState(signal.trend_state || signal.regime);
     }
     function marketRiskText(signal) {
+      if (Number(signal.score_model_version || 0) >= 8) {
+        const crowdingText = {
+          NORMAL: '正常',
+          LONG_CROWD_SUSPECTED: '多头拥挤观察（不扣分）',
+          SHORT_CROWD_SUSPECTED: '空头拥挤观察（不扣分）',
+          LONG_CROWD_CONFIRMED: '多头拥挤已确认',
+          SHORT_CROWD_CONFIRMED: '空头拥挤已确认'
+        };
+        const crowding = crowdingText[signal.crowding_state] || signal.crowding_state || '正常';
+        const dataWarning = signal.data_warning ? '<br>衍生品数据降级' : '';
+        return `拥挤:${crowding}${dataWarning}`;
+      }
       const context = signal.market_context;
       if (!context) return tRiskState(signal.risk_state);
       const crowding = crowdingStateText[context.crowding_state] || context.crowding_state || '未知';
@@ -1069,7 +1098,8 @@ PAPER_DASHBOARD_HTML = """
         return values ? `实际盈亏比${values[1]}R，低于最低${values[2]}R` : '实际盈亏比低于最低要求';
       }
       if (reason.startsWith('final score ')) {
-        return '评分低于75';
+        const values = reason.match(/final score ([0-9]+) below (?:auto-entry minimum|required entry policy score) ([0-9]+)/);
+        return values ? `当前评分${values[1]}，低于本通道要求${values[2]}` : '评分未达到当前通道要求';
       }
       if (reason === 'directional entry signal not established') {
         return '多空方向信号尚未成立';
@@ -1166,7 +1196,7 @@ PAPER_DASHBOARD_HTML = """
       let prefix = '策略退出';
       if (lower.startsWith('stop loss')) prefix = '止损';
       else if (lower.startsWith('take profit')) prefix = '止盈';
-      else if (lower.includes('time exit')) prefix = '时间退出';
+      else if (lower.includes('time exit') || lower.includes('time stop')) prefix = '时间退出';
       const details = [
         ['target 1 reached', '第一止盈目标达成'],
         ['target 2 reached', '第二止盈目标达成'],
@@ -1207,7 +1237,9 @@ PAPER_DASHBOARD_HTML = """
         ['funding overheated risk', '资金费率过热风险'],
         ['structure invalidated', '交易结构失效'],
         ['trend late stage', '趋势进入末期'],
-        ['efficiency', '持仓效率下降']
+        ['efficiency', '持仓效率下降'],
+        ['no 0.5r progress, price progress ineffective and structure did not advance', '未达到0.5R、价格推进无效且结构未继续发展'],
+        ['no 0.5r progress, price advance is weak, and structure has not developed', '未达到0.5R、价格推进偏弱且结构未发展']
       ];
       const matched = details.find(([needle]) => lower.includes(needle));
       if (matched) return `${prefix}：${matched[1]}`;
@@ -1226,8 +1258,40 @@ PAPER_DASHBOARD_HTML = """
         || reason === 'lower wick reclaimed; wait for bounce or breakdown before adding short'
       ) return '下插针收回，等待反抽或重新跌回';
       if (vetoText[reason]) return vetoText[reason];
+      const policyCode = reason.split(':', 1)[0];
+      const policyBlockText = {
+        CANDIDATE_ACTION_NOT_ESTABLISHED: '多空评分差不足，候选方向尚未建立',
+        PRICE_DATA_DISCONTINUOUS: '价格K线不连续',
+        PRICE_DATA_STALE: '价格数据已过期',
+        H4_DIRECTION_OPPOSED: '4小时方向与候选方向相反',
+        DIRECTION_CONFIRMATION_PENDING: '高周期方向尚未确认',
+        CORE_STRUCTURE_UNAVAILABLE: '核心价格结构尚未形成',
+        ENTRY_LOCATION_NOT_READY: '尚未进入所选优势入场区',
+        ENTRY_TRIGGER_UNAVAILABLE: '独立收盘触发尚未确认',
+        STRUCTURE_STOP_UNAVAILABLE: '缺少有效结构止损',
+        STRUCTURE_TARGET_UNAVAILABLE: '缺少真实结构目标',
+        NET_REWARD_R_UNAVAILABLE: '真实净盈亏比暂不可用',
+        NET_REWARD_R_INVALID: '真实净盈亏比数据无效'
+      };
+      if (policyBlockText[policyCode]) return policyBlockText[policyCode];
+      const scoreBlock = reason.match(/^(STANDARD|RESEARCH)_SCORE_BELOW_MINIMUM:([0-9]+)<([0-9]+)$/);
+      if (scoreBlock) {
+        const channel = scoreBlock[1] === 'RESEARCH' ? '研究' : '标准';
+        return `当前评分${scoreBlock[2]}，低于${channel}通道要求${scoreBlock[3]}`;
+      }
+      const familyBlock = reason.match(/^(STRUCTURE|LOCATION|TRIGGER|PRICE_PROGRESS)_SCORE_BELOW_MINIMUM:([0-9]+)<([0-9]+)$/);
+      if (familyBlock) {
+        const labels = { STRUCTURE: '结构', LOCATION: '位置', TRIGGER: '触发', PRICE_PROGRESS: '价格推进' };
+        return `${labels[familyBlock[1]]}证据${familyBlock[2]}分，低于启动要求${familyBlock[3]}分`;
+      }
+      const netRBlock = reason.match(/^NET_REWARD_R_BELOW_MINIMUM:([^<]+)<(.+)$/);
+      if (netRBlock) return `真实净盈亏比${netRBlock[1]}R，低于最低${netRBlock[2]}R`;
+      if (reason.startsWith('ACTIVE_VETO:')) return tVeto(reason.replace('ACTIVE_VETO:', ''));
       if (reason === 'directional entry signal not established') return '多/空方向未成立';
-      if (reason.startsWith('final score ')) return '评分低于75';
+      if (reason.startsWith('final score ')) {
+        const values = reason.match(/final score ([0-9]+) below (?:auto-entry minimum|required entry policy score) ([0-9]+)/);
+        return values ? `当前评分${values[1]}，低于本通道要求${values[2]}` : '评分未达到当前通道要求';
+      }
       if (reason.startsWith('liquidity state ')) return '流动性异常或未知，禁止新开仓';
       if (reason.startsWith('system risk state ')) return '系统性风险异常或未知，禁止新增风险';
       if (reason.startsWith('等待 ') || reason.startsWith('已进入建议区') || reason === '暂无有效建议入场区') {
@@ -1668,6 +1732,25 @@ PAPER_DASHBOARD_HTML = """
       return `${structureLine}\n${entryLine}\n${riskLine}`;
     }
     function signalReasonText(signal) {
+      if (Number(signal.score_model_version || 0) >= 8) {
+        const scores = signal.score_breakdown || {};
+        const familyLabels = {
+          DIRECTION: '方向', STRUCTURE: '结构', LOCATION: '位置',
+          TRIGGER: '触发', PARTICIPATION: '参与流', PRICE_PROGRESS: '价格推进'
+        };
+        const scoreLine = Object.entries(familyLabels)
+          .map(([key, label]) => `${label}${Number(scores[key] || 0)}分`)
+          .join('；');
+        const location = signal.selected_level_key
+          ? `${signal.selected_level_key}（${signal.selected_level_state || '等待'}）`
+          : '尚无有效主入场区';
+        const penalty = Number(signal.total_risk_penalty || 0);
+        const modeText = {
+          STANDARD: '标准通道', TREND_STARTUP: '趋势启动通道',
+          TREND_RESEARCH: '研究模拟通道', NONE: '等待通道'
+        };
+        return `评分构成：${scoreLine}。\n结构/触发：${signal.structure_state || '等待'} / ${signal.trigger_state || '等待'}。\n建议入场位置：${location}。\n决策：${modeText[signal.entry_mode] || signal.entry_mode || '等待通道'}${penalty ? `；风险扣分${penalty}` : ''}。`;
+      }
       return conciseReason(signal.reasons || [], signal, { entryLabel: '建议入场位置' });
     }
     function signalEntryPosition(signal) {
@@ -1677,7 +1760,12 @@ PAPER_DASHBOARD_HTML = """
         timingText.WAIT = '等待';
         timingText.BLOCK = '禁止';
         const timingClass = signal.entry_timing === 'GOOD' ? 'pos' : signal.entry_timing === 'BLOCK' ? 'neg' : 'muted';
-        return `<span class="${timingClass}">${timingText[signal.entry_timing] || signal.entry_timing}</span>`;
+        const modeSuffix = signal.entry_mode === 'TREND_RESEARCH'
+          ? '（研究模拟）'
+          : signal.entry_mode === 'TREND_STARTUP'
+            ? '（趋势启动）'
+            : '';
+        return `<span class="${timingClass}">${timingText[signal.entry_timing] || signal.entry_timing}${modeSuffix}</span>`;
       }
       const action = String(signal.action || '');
       return action === 'ENTRY_LONG' || action === 'ENTRY_SHORT' ? '等待' : '禁止';
@@ -1848,7 +1936,10 @@ PAPER_DASHBOARD_HTML = """
         `<button class="neutral" onclick="closePosition('${displaySymbol(p.symbol)}')">平仓</button>`
       ]));
       const signalRows = Object.entries(data.latest_signals || {})
-        .map(([symbol, s]) => [displaySymbol(symbol), `<span class="pill">${tAction(s.action)}</span>`, marketDirectionText(s), marketRiskText(s), tSmartMoneyPhase(s.smart_money_phase), s.score, signalEntryPosition(s), flowReasonText(signalReasonText(s)), tVetoes(s.vetoes)]);
+        .map(([symbol, s]) => {
+          const blocks = [...new Set([...(s.policy_blocks || []), ...(s.auto_entry_blocks || []), ...(s.vetoes || [])])];
+          return [displaySymbol(symbol), `<span class="pill">${tAction(s.action)}</span>`, marketDirectionText(s), marketRiskText(s), tSmartMoneyPhase(s.smart_money_phase), s.score, signalEntryPosition(s), flowReasonText(signalReasonText(s)), tVetoes(blocks)];
+        });
       const signalsTable = document.getElementById('signals');
       const signalsScrollAnchor = captureTableScrollAnchor(signalsTable);
       signalsTable.className = 'signals-table';

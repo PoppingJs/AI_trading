@@ -17,6 +17,13 @@ from typing import Literal
 from ai_trading.binance import BinanceFuturesMarketData
 from ai_trading.config import AppSettings
 from ai_trading.indicators import build_indicators, ema, sma
+from ai_trading.entry_policy_v4 import (
+    ENTRY_MODE_TREND_RESEARCH,
+    ENTRY_MODE_TREND_STARTUP,
+    EntryDataConfidenceV4,
+    EntryPolicyV4Input,
+    decide_entry_policy_v4,
+)
 from ai_trading.market_context import (
     LiquidityObservation,
     MarketContextTracker,
@@ -51,6 +58,14 @@ from ai_trading.strategy import (
     CompositeStrategy,
     apply_positive_evidence_family,
 )
+from ai_trading.score_pipeline_v8 import (
+    DualScoreV8,
+    LevelSelectionV8,
+    SideScoreV8,
+    evaluate_dual_score_v8,
+    location_for_selected_level_v8,
+)
+from ai_trading.score_v8 import RiskPenaltyV8, compose_score_v8
 from ai_trading.risk import (
     AccountRiskSnapshot,
     PortfolioRiskDecision,
@@ -77,7 +92,7 @@ ROTATION_MIN_VOLUME_RATIO = 1.2
 PYRAMID_MAX_ADDS = 1
 AUTO_PYRAMID_ENABLED = False
 AUTO_ROTATION_ENABLED = False
-CURRENT_TRADE_PLAN_VERSION = 2
+CURRENT_TRADE_PLAN_VERSION = 3
 PAPER_DEFAULT_BALANCE = 1200.0
 CAPITAL_DEPLOYMENT_FRACTION = 0.95
 CAPITAL_UNIT_COUNT = 5
@@ -112,8 +127,10 @@ DISTRIBUTION_STAGE_MARKDOWN = "MARKDOWN_ACCELERATION"
 AUTO_ENTRY_MIN_SCORE = 75
 CORE_STRUCTURE_SCORE_CAP = AUTO_ENTRY_MIN_SCORE - 1
 MIN_ENTRY_REWARD_R = 1.3
-SCORE_MODEL_VERSION = 7
+SCORE_MODEL_VERSION = 8
+FROZEN_SCORE_MODEL_VERSION = 7
 LEGACY_SCORE_MODEL_VERSION = 2
+ENTRY_PIPELINE_VERSION = 4
 DIRECTION_H4_BASE_SCORE = 6
 DIRECTION_DAILY_BACKGROUND_SCORE = 3
 DIRECTION_ALIGNMENT_BONUS = 3
@@ -146,7 +163,29 @@ MARKET_REQUEST_CONCURRENCY = 3
 WARMUP_BATCH_SIZE = 5
 TIMEFRAME_CLOSE_GRACE_SECONDS = 5.0
 SUPPORTED_TIMEFRAMES = ("15m", "1h", "4h", "1d")
+V8_REQUIRED_PRICE_TIMEFRAMES = ("15m", "1h", "4h")
 POSITION_SAFETY_REFRESH_SECONDS = 1.0
+
+
+def _derivatives_refresh_timeframes(
+    interval: str,
+    score_model_version: int,
+) -> tuple[str, ...]:
+    """Return the derivative windows required by the active score model.
+
+    V8 participation/crowding evidence is deliberately sourced from closed
+    15-minute bars even when the dashboard's primary interval is 1 hour.  The
+    frozen V7 path keeps its previous request set for rollback compatibility.
+    """
+
+    required = {interval, "1h", "4h"}
+    if score_model_version >= SCORE_MODEL_VERSION:
+        required.add("15m")
+    return tuple(
+        timeframe
+        for timeframe in SUPPORTED_TIMEFRAMES
+        if timeframe in required
+    )
 
 
 class PaperStateError(RuntimeError):
@@ -399,7 +438,7 @@ class PaperTradingEngine:
     ) -> None:
         symbol = symbol.upper()
         self._symbol_data_warnings[symbol] = (
-            "衍生品数据不完整，已保留上次有效值并仅暂停该币种新开仓；"
+            "衍生品数据不完整，已保留价格信号；该币种仅可降级进入研究模拟通道，"
             "其他币种继续运行"
         )
         self._oi_ratio_updated_at.pop(symbol, None)
@@ -1872,6 +1911,10 @@ class PaperTradingEngine:
         refresh = getattr(self.market_data, "derivatives_bundle", None)
         if refresh is None or self._scan_lock.locked():
             return
+        derivative_timeframes = _derivatives_refresh_timeframes(
+            self.interval,
+            int(self.settings.strategy.score_model_version),
+        )
         position_symbols = set(self.account.positions)
         ranked_candidates = [
             symbol
@@ -1880,7 +1923,7 @@ class PaperTradingEngine:
                 key=lambda item: int(item[1].get("score") or 0),
                 reverse=True,
             )
-            if int(signal.get("score") or 0) >= AUTO_ENTRY_MIN_SCORE
+            if _signal_is_entry_refresh_priority(signal)
             and symbol not in position_symbols
         ]
         fast_symbols = position_symbols | set(ranked_candidates[:10])
@@ -1937,7 +1980,7 @@ class PaperTradingEngine:
                 async with semaphore:
                     changed = False
                     source_timestamps: list[datetime] = []
-                    for timeframe in {self.interval, "1h", "4h"}:
+                    for timeframe in derivative_timeframes:
                         candles = self._timeframe_candles.get(symbol, {}).get(timeframe, [])
                         if not candles:
                             continue
@@ -1991,7 +2034,7 @@ class PaperTradingEngine:
                                     {},
                                 ).get(timeframe, [])
                             )
-                            for timeframe in {self.interval, "1h", "4h"}
+                            for timeframe in derivative_timeframes
                         ):
                             self._clear_symbol_data_warning(symbol)
                         self._publish_symbol_from_cache(symbol)
@@ -2183,7 +2226,7 @@ class PaperTradingEngine:
                 key=lambda item: int(item[1].get("score") or 0),
                 reverse=True,
             )
-            if int(signal.get("score") or 0) >= AUTO_ENTRY_MIN_SCORE and symbol not in positions
+            if _signal_is_entry_refresh_priority(signal) and symbol not in positions
         ]
         remainder = [
             symbol for symbol in self._managed_symbols()
@@ -2218,6 +2261,10 @@ class PaperTradingEngine:
             ).items()
         }
         derivatives_refresh_incomplete = False
+        derivative_timeframes = _derivatives_refresh_timeframes(
+            self.interval,
+            int(self.settings.strategy.score_model_version),
+        )
         for timeframe in SUPPORTED_TIMEFRAMES:
             candles = await self.market_data.klines(
                 symbol,
@@ -2229,7 +2276,7 @@ class PaperTradingEngine:
             return False
         refresh_derivatives = getattr(self.market_data, "derivatives_bundle", None)
         if refresh_derivatives is not None:
-            for timeframe in {self.interval, "1h", "4h"}:
+            for timeframe in derivative_timeframes:
                 closed = timeframe_candles.get(timeframe, [])
                 if not closed:
                     continue
@@ -2272,7 +2319,7 @@ class PaperTradingEngine:
         now = self._now()
         if not derivatives_refresh_incomplete and all(
             _derivatives_complete(timeframe_derivatives.get(timeframe, []))
-            for timeframe in {self.interval, "1h", "4h"}
+            for timeframe in derivative_timeframes
         ):
             self._oi_ratio_updated_at[symbol] = now
             self._derivatives_updated_at[symbol] = now
@@ -2419,6 +2466,16 @@ class PaperTradingEngine:
             ),
         }
         published = _apply_multi_timeframe_context(payload, mtf_context)
+        if int(self.settings.strategy.score_model_version) >= 8:
+            published = _apply_score_model_v8(
+                symbol=symbol,
+                signal=published,
+                context=mtf_context,
+                timeframe_candles=timeframe_candles,
+                timeframe_indicators=timeframe_indicators,
+                settings=self.settings,
+                observed_at=self._now(),
+            )
         published["market_context"] = self._market_context_for_symbol(
             symbol,
             mtf_context,
@@ -2714,7 +2771,11 @@ class PaperTradingEngine:
             if self.running:
                 for reason in self._data_freshness_blocks(symbol, signal):
                     _record_auto_entry_block(signal, reason)
-            if signal.get("vetoes") or entry_position_block:
+            if (
+                signal.get("vetoes")
+                or signal.get("auto_entry_blocks")
+                or entry_position_block
+            ):
                 continue
             candidates.append((symbol, signal))
         candidates.sort(key=lambda item: int(item[1].get("score") or 0), reverse=True)
@@ -2787,8 +2848,24 @@ class PaperTradingEngine:
                     preferred_indicator,
                 )
                 stop_basis = "volatility_fallback"
+                if int(signal.get("score_model_version") or 0) >= 8:
+                    v8_stop = _float_or_none(
+                        signal.get("v8_structure_stop")
+                    )
+                    if (
+                        v8_stop is not None
+                        and _entry_stop_error(
+                            side_enum,
+                            entry_price,
+                            v8_stop,
+                        )
+                        is None
+                    ):
+                        stop_loss = v8_stop
+                        stop_basis = "v8_selected_structure"
                 precision_entry_only = (
                     entry_timeframe == "15m"
+                    and stop_basis == "volatility_fallback"
                 )
                 if precision_entry_only:
                     if not _precision_stop_allowed(
@@ -2818,7 +2895,7 @@ class PaperTradingEngine:
                     )
                     stop_loss = refined_stop
                     stop_basis = "15m_precision_structure"
-                else:
+                elif stop_basis == "volatility_fallback":
                     structure_stop, structure_basis = _refine_stop_with_setup_structure(
                         side_enum,
                         stop_loss,
@@ -2831,19 +2908,20 @@ class PaperTradingEngine:
                     if structure_stop != stop_loss:
                         stop_loss = structure_stop
                         stop_basis = structure_basis
-                staged_stop = _refine_stop_with_distribution_stage(
-                    side_enum,
-                    stop_loss,
-                    entry_price,
-                    signal,
-                    preferred_indicator,
-                )
-                if staged_stop != stop_loss:
-                    stop_loss = staged_stop
-                    stop_basis = (
-                        f"{signal.get('distribution_short_stage')}"
-                        "_structure"
+                if int(signal.get("score_model_version") or 0) < 8:
+                    staged_stop = _refine_stop_with_distribution_stage(
+                        side_enum,
+                        stop_loss,
+                        entry_price,
+                        signal,
+                        preferred_indicator,
                     )
+                    if staged_stop != stop_loss:
+                        stop_loss = staged_stop
+                        stop_basis = (
+                            f"{signal.get('distribution_short_stage')}"
+                            "_structure"
+                        )
                 if stop_basis == "volatility_fallback":
                     stop_loss, stop_basis = _refine_stop_with_entry_zone(
                         side_enum,
@@ -2939,11 +3017,15 @@ class PaperTradingEngine:
                 stop_pct = _entry_stop_pct(entry_price, stop_loss)
                 entry_quality = _entry_quality_grade(
                     score=position_policy_score,
+                    entry_mode=str(signal.get("entry_mode") or ""),
                 )
                 if entry_quality is None:
                     _record_auto_entry_block(
                         signal,
-                        f"final score {score} below auto-entry minimum {AUTO_ENTRY_MIN_SCORE}",
+                        (
+                            f"final score {score} below required entry policy score "
+                            f"{int(signal.get('policy_score_required') or AUTO_ENTRY_MIN_SCORE)}"
+                        ),
                     )
                     continue
                 leverage_cap = int(
@@ -3017,6 +3099,8 @@ class PaperTradingEngine:
                 )
                 entry_context["plan_version"] = (
                     CURRENT_TRADE_PLAN_VERSION
+                    if int(signal.get("score_model_version") or 0) >= 8
+                    else 2
                 )
                 await self.open_position(
                     symbol,
@@ -3152,14 +3236,24 @@ class PaperTradingEngine:
     ) -> tuple[str, ...]:
         now = self._now()
         blocks: list[str] = []
+        is_v8 = bool(
+            signal
+            and int(signal.get("score_model_version") or 0) >= 8
+        )
+        derivatives_degraded = False
         data_warning = self._symbol_data_warnings.get(symbol)
         if data_warning:
-            blocks.append(data_warning)
+            if is_v8 and signal is not None:
+                derivatives_degraded = True
+                _record_risk_warning(signal, data_warning)
+            else:
+                blocks.append(data_warning)
         price_updated_at = self._price_updated_at.get(symbol)
-        if (
+        mark_price_fresh = not (
             price_updated_at is None
             or (now - price_updated_at).total_seconds() > MARKET_PRICE_STALE_SECONDS
-        ):
+        )
+        if not mark_price_fresh:
             blocks.append("latest price is stale for more than 15 seconds")
         derivatives_updated_at = (
             self._oi_ratio_updated_at.get(symbol)
@@ -3169,12 +3263,65 @@ class PaperTradingEngine:
             derivatives_updated_at is None
             or (now - derivatives_updated_at).total_seconds() > DERIVATIVES_STALE_SECONDS
         ):
-            blocks.append("OI/long-short ratio data is stale for more than 180 seconds")
-        if not self._symbol_cache_valid(symbol):
-            cache = self._timeframe_candles.get(symbol, {})
+            if is_v8 and signal is not None:
+                derivatives_degraded = True
+                _record_risk_warning(
+                    signal,
+                    "OI/主动成交数据超过180秒未更新；当前标的降级为研究模拟通道",
+                )
+            else:
+                blocks.append("OI/long-short ratio data is stale for more than 180 seconds")
+        cache = self._timeframe_candles.get(symbol, {})
+        if is_v8 and signal is not None:
+            price_data_contiguous = all(
+                _candles_contiguous(
+                    cache.get(timeframe, []),
+                    timeframe,
+                )
+                for timeframe in V8_REQUIRED_PRICE_TIMEFRAMES
+            )
+            price_candles_fresh = all(
+                _candles_current_for_scoring(
+                    cache.get(timeframe, []),
+                    timeframe,
+                    now,
+                )
+                for timeframe in V8_REQUIRED_PRICE_TIMEFRAMES
+            )
+            for timeframe in V8_REQUIRED_PRICE_TIMEFRAMES:
+                candles = cache.get(timeframe, [])
+                if not _candles_contiguous(candles, timeframe):
+                    blocks.append(
+                        f"{timeframe} K-line context is missing or discontinuous"
+                    )
+                elif not _candles_current_for_scoring(
+                    candles,
+                    timeframe,
+                    now,
+                ):
+                    blocks.append(
+                        f"{timeframe} K-line context is stale"
+                    )
+            confidence = dict(signal.get("data_confidence") or {})
+            confidence["price_data_contiguous"] = price_data_contiguous
+            confidence["price_data_fresh"] = (
+                mark_price_fresh and price_candles_fresh
+            )
+            if derivatives_degraded:
+                confidence["derivatives_data_complete"] = False
+            signal["data_confidence"] = confidence
+            _apply_entry_policy_v4_fields(signal)
+            _update_entry_state_fields(signal)
+        elif not self._symbol_cache_valid(symbol):
             for timeframe in _required_entry_timeframes(signal):
                 if not _candles_contiguous(cache.get(timeframe, []), timeframe):
                     blocks.append(f"{timeframe} K-line context is missing or discontinuous")
+        if derivatives_degraded and signal is not None and not is_v8:
+            confidence = dict(signal.get("data_confidence") or {})
+            confidence["derivatives_data_complete"] = False
+            signal["data_confidence"] = confidence
+            _apply_entry_policy_v4_fields(signal)
+            _update_entry_state_fields(signal)
         return tuple(blocks)
 
     def _manage_open_positions(self, *, fresh_only: bool = False) -> None:
@@ -3197,9 +3344,19 @@ class PaperTradingEngine:
             strong_trend = trend_state in {"ONE_WAY_UP", "ONE_WAY_DOWN"}
             signal = self.latest_signals.get(position.symbol, {})
             exit_indicator = _preferred_exit_indicator(tf_indicators, indicators, position)
-            if int(
+            plan_version = int(
                 position.metadata.get("plan_version") or 0
-            ) >= CURRENT_TRADE_PLAN_VERSION:
+            )
+            if plan_version >= 3:
+                self._manage_open_position_v3(
+                    position,
+                    price,
+                    signal,
+                    exit_indicator,
+                    strong_trend=strong_trend,
+                )
+                continue
+            if plan_version >= 2:
                 self._manage_open_position_v2(
                     position,
                     price,
@@ -3502,6 +3659,152 @@ class PaperTradingEngine:
                 exit_indicator,
                 lock_r=self.settings.risk.trailing_lock_r,
             )
+
+    def _manage_open_position_v3(
+        self,
+        position: Position,
+        price: float,
+        signal: dict[str, object],
+        exit_indicator: IndicatorSnapshot | None,
+        *,
+        strong_trend: bool,
+    ) -> None:
+        """Manage a plan-3 trend position without legacy early-profit exits."""
+
+        _update_position_excursions(position, price)
+        _increment_position_bars_held(position, exit_indicator)
+        _update_position_validation(position)
+
+        # Disaster protection remains executable on every mark update.
+        if _stop_hit(position, price):
+            self._close_position_unlocked(
+                position,
+                price,
+                _stop_exit_reason(
+                    position,
+                    signal,
+                    price,
+                    self.settings.execution.taker_fee_rate,
+                ),
+            )
+            return
+
+        # Ordinary invalidation requires the entered timeframe's closed body;
+        # a single wick, RSI, account ratio, or one OI observation is not an
+        # independent full-exit instruction.
+        structure_reason = _soft_stop_close_exit_reason(
+            position,
+            exit_indicator,
+        ) or _confirmed_structure_exit_reason(
+            position,
+            price,
+            signal,
+        )
+        if structure_reason:
+            self._close_position_unlocked(
+                position,
+                price,
+                structure_reason,
+            )
+            return
+
+        if (
+            not position.first_tp_done
+            and _take_profit_1_hit(position, price)
+        ):
+            self._close_position_fraction_unlocked(
+                position,
+                price,
+                min(
+                    self.settings.risk.first_take_profit_fraction,
+                    position.remaining_fraction,
+                ),
+                "take profit: target 1 reached",
+            )
+            position.first_tp_done = True
+            position.metadata["position_stage"] = "TP1_DONE"
+            position.metadata["tp1_completed_at"] = self._now().isoformat()
+            position.metadata["tp1_structure_event_id"] = (
+                _v3_structure_event_id(position, signal)
+            )
+            h1_event_id, _ = _v3_h1_structure_snapshot(
+                position,
+                signal,
+            )
+            position.metadata["tp1_h1_structure_event_id"] = h1_event_id
+            # Plan 3 deliberately keeps the original structural room here.
+            # A stop is promoted only after a later favourable structure.
+            if position.remaining_fraction <= 1e-9:
+                self._mark_symbol_for_post_close_pool_review(
+                    position.symbol
+                )
+                self.account.positions.pop(position.symbol, None)
+            self._save_state_unlocked()
+            return
+
+        if (
+            not position.first_tp_done
+            and position.bars_held >= self.settings.risk.time_stop_bars
+            and not _position_reached_initial_r(position, price, 0.5)
+            and _v3_price_progress_ineffective(position, signal)
+            and not _v3_structure_advancing(position, signal)
+        ):
+            self._close_position_unlocked(
+                position,
+                price,
+                (
+                    "time stop: no 0.5R progress, price advance is weak, "
+                    "and structure has not developed"
+                ),
+            )
+            return
+
+        if position.first_tp_done:
+            if _promote_plan3_stop_after_structure(
+                position,
+                price,
+                signal,
+                exit_indicator,
+            ):
+                self._save_state_unlocked()
+
+        if position.first_tp_done and _take_profit_hit(position, price):
+            if _v3_runner_can_continue(
+                position,
+                signal,
+                strong_trend=strong_trend,
+            ):
+                position.second_tp_done = True
+                position.metadata["position_stage"] = "RUNNER"
+                _activate_plan3_runner_stop(
+                    position,
+                    price,
+                    signal,
+                    exit_indicator,
+                    lock_r=self.settings.risk.trailing_lock_r,
+                )
+                self._save_state_unlocked()
+                return
+            self._close_position_unlocked(
+                position,
+                price,
+                "take profit: target 2 reached",
+            )
+            return
+
+        if (
+            position.first_tp_done
+            and str(position.metadata.get("position_stage") or "")
+            == "RUNNER"
+        ):
+            if _activate_plan3_runner_stop(
+                position,
+                price,
+                signal,
+                exit_indicator,
+                lock_r=self.settings.risk.trailing_lock_r,
+            ):
+                self._save_state_unlocked()
 
     def _update_trailing_stop(self, position: Position, price: float, strong_trend: bool, indicator: IndicatorSnapshot | None) -> None:
         stop_distance = float(position.metadata.get("initial_stop_distance") or abs(position.entry_price - position.stop_price))
@@ -4341,7 +4644,14 @@ def _stop_timeframe_from_context(context: dict[str, object]) -> str:
 
 def _entry_context_from_signal(signal: dict[str, object]) -> dict[str, object]:
     keys = (
+        "prd_version",
         "action",
+        "candidate_action",
+        "decision_action",
+        "entry_mode",
+        "policy_entry_state",
+        "policy_score_required",
+        "policy_blocks",
         "signal_timeframe",
         "trend_state",
         "regime",
@@ -4373,6 +4683,18 @@ def _entry_context_from_signal(signal: dict[str, object]) -> dict[str, object]:
         "preview_structure_stop",
         "preview_structure_stop_basis",
         "score_before_entry_quality",
+        "gross_setup_score",
+        "setup_score",
+        "score_breakdown",
+        "risk_penalties",
+        "total_risk_penalty",
+        "long_score_breakdown",
+        "short_score_breakdown",
+        "long_risk_penalties",
+        "short_risk_penalties",
+        "final_long_score",
+        "final_short_score",
+        "score_gap",
         "score_delta_vs_v4",
         "v4_action",
         "daily_bias",
@@ -4382,10 +4704,39 @@ def _entry_context_from_signal(signal: dict[str, object]) -> dict[str, object]:
         "direction_gate",
         "direction_veto_reason",
         "direction_score_breakdown",
+        "direction_confirmation_state",
+        "direction_state_v8",
+        "structure_state",
+        "trigger_state",
+        "participation_state",
+        "price_progress_efficiency",
+        "price_progress_magnitude",
+        "price_progress_score",
+        "price_progress_state",
+        "long_price_progress_score",
+        "long_price_progress_state",
+        "short_price_progress_score",
+        "short_price_progress_state",
+        "crowding_state",
         "score_model_version",
+        "entry_pipeline_version",
         "legacy_score",
         "legacy_action",
+        "legacy_vetoes",
+        "legacy_reasons",
+        "legacy_risk_state",
         "score_delta_vs_legacy",
+        "evidence_event_ids",
+        "long_evidence_event_ids",
+        "short_evidence_event_ids",
+        "setup_id",
+        "selected_level_key",
+        "selected_level_zone",
+        "selected_level_structural",
+        "selected_level_state",
+        "v8_structure_stop",
+        "v8_structure_target",
+        "data_confidence",
         "oi_valley_long_eligible",
         "oi_valley_direction_gate_reason",
         "h4_structure",
@@ -4421,6 +4772,7 @@ def _entry_context_from_signal(signal: dict[str, object]) -> dict[str, object]:
         "trade_plan",
         "score_evidence_families",
         "entry_levels",
+        "all_entry_levels_v8",
     )
     return {key: signal[key] for key in keys if key in signal}
 
@@ -5023,6 +5375,342 @@ def _activate_runner_stop(
             position.stop_price = min(position.stop_price, candidate)
 
 
+def _v3_price_progress_ineffective(
+    position: Position,
+    signal: dict[str, object],
+) -> bool:
+    prefix = "long" if position.side == PositionSide.LONG else "short"
+    state = str(
+        signal.get(f"{prefix}_price_progress_state")
+        or signal.get("price_progress_state")
+        or "UNKNOWN"
+    )
+    side_score_key = f"{prefix}_price_progress_score"
+    score_value = (
+        signal.get(side_score_key)
+        if side_score_key in signal
+        else signal.get("price_progress_score")
+    )
+    score = int(score_value or 0)
+    return state in {"NO_PROGRESS", "WEAK_PROGRESS"} and score <= 3
+
+
+def _v3_structure_advancing(
+    position: Position,
+    signal: dict[str, object],
+) -> bool:
+    event_id = _v3_structure_event_id(position, signal)
+    if not event_id or _v3_side_structure_score(position, signal) < 20:
+        return False
+    baseline = str(
+        position.metadata.get("plan3_initial_structure_event_id") or ""
+    )
+    if not baseline:
+        entry_context = (
+            position.metadata.get("entry_context")
+            if isinstance(position.metadata.get("entry_context"), dict)
+            else {}
+        )
+        baseline = _v3_structure_event_id(position, entry_context)
+        # A persisted early plan-3 position may predate structured event
+        # storage.  Establish a baseline on first observation instead of
+        # treating the already-existing structure as a new advance.
+        position.metadata["plan3_initial_structure_event_id"] = (
+            baseline or event_id
+        )
+        if not baseline:
+            return False
+    return event_id != baseline
+
+
+def _v3_structure_event_id(
+    position: Position,
+    signal: dict[str, object],
+) -> str:
+    side_key = (
+        "long_evidence_event_ids"
+        if position.side == PositionSide.LONG
+        else "short_evidence_event_ids"
+    )
+    evidence = (
+        signal.get(side_key)
+        if isinstance(signal.get(side_key), dict)
+        else signal.get("evidence_event_ids")
+        if isinstance(signal.get("evidence_event_ids"), dict)
+        else {}
+    )
+    return str(evidence.get("STRUCTURE") or "")
+
+
+def _v3_side_structure_score(
+    position: Position,
+    signal: dict[str, object],
+) -> int:
+    side_key = (
+        "long_score_breakdown"
+        if position.side == PositionSide.LONG
+        else "short_score_breakdown"
+    )
+    breakdown = (
+        signal.get(side_key)
+        if isinstance(signal.get(side_key), dict)
+        else signal.get("score_breakdown")
+        if isinstance(signal.get("score_breakdown"), dict)
+        else {}
+    )
+    return int(breakdown.get("STRUCTURE") or 0)
+
+
+def _v3_h4_opposes_position(
+    position: Position,
+    signal: dict[str, object],
+) -> bool:
+    h4 = (
+        signal.get("h4_structure")
+        if isinstance(signal.get("h4_structure"), dict)
+        else {}
+    )
+    direction = str(h4.get("direction") or "NEUTRAL").upper()
+    state = str(h4.get("state") or "UNKNOWN").upper()
+    if direction == "NEUTRAL" and state == "BREAKOUT_UP":
+        direction = "LONG"
+    elif direction == "NEUTRAL" and state == "BREAKDOWN_DOWN":
+        direction = "SHORT"
+    opposite = (
+        PositionSide.SHORT.value
+        if position.side == PositionSide.LONG
+        else PositionSide.LONG.value
+    )
+    return direction == opposite
+
+
+def _v3_h4_structure_valid(
+    position: Position,
+    signal: dict[str, object],
+) -> bool:
+    h4 = (
+        signal.get("h4_structure")
+        if isinstance(signal.get("h4_structure"), dict)
+        else {}
+    )
+    if not h4:
+        return False
+    state = str(h4.get("state") or "UNKNOWN").upper()
+    structure_type = str(
+        h4.get("structure_type") or "UNKNOWN"
+    ).upper()
+    if state in {"", "UNKNOWN"} and structure_type in {"", "UNKNOWN"}:
+        return False
+    return not _v3_h4_opposes_position(position, signal)
+
+
+def _promote_plan3_stop_after_structure(
+    position: Position,
+    price: float,
+    signal: dict[str, object],
+    indicator: IndicatorSnapshot | None,
+) -> bool:
+    if not position.first_tp_done:
+        return False
+    event_id, level_mapping = _v3_h1_structure_snapshot(
+        position,
+        signal,
+    )
+    if not event_id or not level_mapping:
+        return False
+    tp1_event_id = str(
+        position.metadata.get("tp1_h1_structure_event_id") or ""
+    )
+    if not tp1_event_id:
+        position.metadata["tp1_h1_structure_event_id"] = event_id
+        return False
+    if event_id in {
+        tp1_event_id,
+        str(position.metadata.get("plan3_stop_structure_event_id") or ""),
+    }:
+        return False
+    buffer = (
+        indicator.atr14 * 0.25
+        if indicator is not None and indicator.atr14
+        else position.entry_price * 0.002
+    )
+    levels: list[float] = []
+    keys = (
+        ("support_zone_low", "support")
+        if position.side == PositionSide.LONG
+        else ("resistance_zone_high", "resistance", "rejection_high")
+    )
+    for key in keys:
+        value = _float_or_none(level_mapping.get(key))
+        if value is not None:
+            levels.append(value)
+    if not levels:
+        return False
+    previous_stop = position.stop_price
+    if position.side == PositionSide.LONG:
+        candidates = [level - buffer for level in levels]
+        valid = [candidate for candidate in candidates if candidate < price]
+        if valid:
+            position.stop_price = max(position.stop_price, max(valid))
+    else:
+        candidates = [level + buffer for level in levels]
+        valid = [candidate for candidate in candidates if candidate > price]
+        if valid:
+            position.stop_price = min(position.stop_price, min(valid))
+    if position.stop_price == previous_stop:
+        return False
+    position.metadata["plan3_stop_promoted_at"] = str(
+        signal.get("timestamp") or ""
+    )
+    position.metadata["plan3_stop_structure_event_id"] = event_id
+    position.metadata["plan3_stop_basis"] = "new_favourable_1h_structure"
+    return True
+
+
+def _v3_h1_structure_snapshot(
+    position: Position,
+    signal: dict[str, object],
+) -> tuple[str, dict[str, object]]:
+    expected = position.side.value
+    candidates: list[tuple[float, str, dict[str, object]]] = []
+    for source_key in ("h1_structure", "h1_trigger"):
+        mapping = (
+            signal.get(source_key)
+            if isinstance(signal.get(source_key), dict)
+            else {}
+        )
+        if not mapping:
+            continue
+        direction = str(mapping.get("direction") or "NEUTRAL").upper()
+        state = str(mapping.get("state") or "UNKNOWN").upper()
+        if direction == "NEUTRAL" and state == "BREAKOUT_UP":
+            direction = "LONG"
+        elif direction == "NEUTRAL" and state == "BREAKDOWN_DOWN":
+            direction = "SHORT"
+        if direction != expected or state in {"", "UNKNOWN", "WAIT"}:
+            continue
+        keys = (
+            ("support_zone_low", "support")
+            if position.side == PositionSide.LONG
+            else (
+                "resistance_zone_high",
+                "resistance",
+                "rejection_high",
+            )
+        )
+        values = [
+            value
+            for key in keys
+            if (value := _float_or_none(mapping.get(key))) is not None
+        ]
+        if not values:
+            continue
+        anchor = (
+            max(values)
+            if position.side == PositionSide.LONG
+            else min(values)
+        )
+        event_id = (
+            f"{position.symbol}:{position.side.value}:H1_STRUCTURE:"
+            f"{source_key}:{state}:{anchor:.10g}"
+        )
+        candidates.append((anchor, event_id, dict(mapping)))
+    if not candidates:
+        return "", {}
+    anchor, event_id, mapping = (
+        max(candidates, key=lambda item: item[0])
+        if position.side == PositionSide.LONG
+        else min(candidates, key=lambda item: item[0])
+    )
+    del anchor
+    return event_id, mapping
+
+
+def _v3_runner_can_continue(
+    position: Position,
+    signal: dict[str, object],
+    *,
+    strong_trend: bool,
+) -> bool:
+    opposite_prefix = (
+        "short" if position.side == PositionSide.LONG else "long"
+    )
+    opposite_progress = int(
+        signal.get(f"{opposite_prefix}_price_progress_score") or 0
+    )
+    return (
+        _v3_h4_structure_valid(position, signal)
+        and
+        (strong_trend or _v3_structure_advancing(position, signal))
+        and opposite_progress < 7
+    )
+
+
+def _activate_plan3_runner_stop(
+    position: Position,
+    price: float,
+    signal: dict[str, object],
+    indicator: IndicatorSnapshot | None,
+    *,
+    lock_r: float,
+) -> bool:
+    initial_distance = float(
+        position.metadata.get("initial_stop_distance")
+        or abs(position.entry_price - position.stop_price)
+    )
+    if initial_distance <= 0:
+        return False
+    crowding_state = str(signal.get("crowding_state") or "")
+    same_side_crowded = crowding_state == (
+        "LONG_CROWD_CONFIRMED"
+        if position.side == PositionSide.LONG
+        else "SHORT_CROWD_CONFIRMED"
+    )
+    effective_lock_r = max(lock_r, 0.75 if same_side_crowded else 0.0)
+    h1 = (
+        signal.get("h1_structure")
+        if isinstance(signal.get("h1_structure"), dict)
+        else {}
+    )
+    trigger = (
+        signal.get("h1_trigger")
+        if isinstance(signal.get("h1_trigger"), dict)
+        else {}
+    )
+    buffer = (
+        indicator.atr14 * 0.35
+        if indicator is not None and indicator.atr14
+        else position.entry_price * 0.003
+    )
+    previous_stop = position.stop_price
+    if position.side == PositionSide.LONG:
+        candidates = [position.entry_price + initial_distance * effective_lock_r]
+        for mapping in (h1, trigger):
+            for key in ("support_zone_low", "support"):
+                value = _float_or_none(mapping.get(key))
+                if value is not None:
+                    candidates.append(value - buffer)
+        valid = [candidate for candidate in candidates if candidate < price]
+        if valid:
+            position.stop_price = max(position.stop_price, max(valid))
+    else:
+        candidates = [position.entry_price - initial_distance * effective_lock_r]
+        for mapping in (h1, trigger):
+            for key in ("resistance_zone_high", "resistance", "rejection_high"):
+                value = _float_or_none(mapping.get(key))
+                if value is not None:
+                    candidates.append(value + buffer)
+        valid = [candidate for candidate in candidates if candidate > price]
+        if valid:
+            position.stop_price = min(position.stop_price, min(valid))
+    if position.stop_price == previous_stop:
+        return False
+    position.metadata["plan3_stop_basis"] = "latest_confirmed_1h_structure"
+    if same_side_crowded:
+        position.metadata["plan3_crowding_tightened"] = True
+    return True
+
+
 def _update_position_validation(position: Position) -> None:
     if str(position.metadata.get("validation_state") or "UNVALIDATED") == "VALIDATED":
         return
@@ -5480,7 +6168,10 @@ def _pyramid_allowed(
         return False
     if _score_before_entry_quality(signal) < ENTRY_QUALITY_S_MIN_SCORE:
         return False
-    if str(signal.get("risk_state") or "NORMAL") != "NORMAL":
+    if (
+        int(signal.get("score_model_version") or 0) < 8
+        and str(signal.get("risk_state") or "NORMAL") != "NORMAL"
+    ):
         return False
     if _trend_stage_from_signal(signal, indicator) == TREND_STAGE_LATE:
         return False
@@ -5508,6 +6199,35 @@ def _pyramid_allowed(
 
 
 def _pyramid_structure_confirmed(side: PositionSide, signal: dict[str, object]) -> bool:
+    if int(signal.get("score_model_version") or 0) >= 8:
+        # v8 add-on authorization only consumes structured evidence.  Legacy
+        # reason copy and OI setup labels must not alter this business rule.
+        expected_action = (
+            SignalAction.ENTRY_LONG.value
+            if side == PositionSide.LONG
+            else SignalAction.ENTRY_SHORT.value
+        )
+        candidate_action = str(
+            signal.get("candidate_action")
+            or signal.get("decision_action")
+            or ""
+        )
+        direction_state = str(
+            signal.get("direction_confirmation_state") or ""
+        )
+        breakdown = (
+            signal.get("score_breakdown")
+            if isinstance(signal.get("score_breakdown"), dict)
+            else {}
+        )
+        return (
+            candidate_action == expected_action
+            and direction_state
+            in {"H4_CONFIRMED", "TEMPORARY_CONFIRMED"}
+            and int(breakdown.get("STRUCTURE") or 0) >= 25
+            and int(breakdown.get("TRIGGER") or 0) >= 10
+        )
+
     h4_oi = signal.get("h4_oi") if isinstance(signal.get("h4_oi"), dict) else {}
     h1_pullback = signal.get("h1_pullback") if isinstance(signal.get("h1_pullback"), dict) else {}
     h1_trigger = signal.get("h1_trigger") if isinstance(signal.get("h1_trigger"), dict) else {}
@@ -6067,6 +6787,14 @@ def _preview_structure_stop(
     *,
     timeframe: str,
 ) -> tuple[float | None, str]:
+    if int(signal.get("score_model_version") or 0) >= 8:
+        v8_stop = _float_or_none(signal.get("v8_structure_stop"))
+        if (
+            v8_stop is not None
+            and _entry_stop_error(side, entry_price, v8_stop) is None
+        ):
+            return v8_stop, "v8_selected_structure"
+        return None, ""
     fallback_stop = (
         entry_price * 0.95
         if side == PositionSide.LONG
@@ -6136,6 +6864,9 @@ def _nearest_higher_timeframe_structure_target(
     side: PositionSide,
     price: float,
 ) -> float | None:
+    v8_target = _float_or_none(signal.get("v8_structure_target"))
+    if _target_is_profitable(side, price, v8_target):
+        return v8_target
     candidates = [
         *(_timeframe_target_candidates(signal, side, price, "1h")),
         *(_timeframe_target_candidates(signal, side, price, "4h")),
@@ -6338,6 +7069,10 @@ def _timeframe_target_candidates(
     timeframe: str,
 ) -> list[float]:
     candidates: list[float] = []
+    if timeframe == "1h" and int(signal.get("score_model_version") or 0) >= 8:
+        v8_target = _float_or_none(signal.get("v8_structure_target"))
+        if _target_is_profitable(side, price, v8_target):
+            candidates.append(float(v8_target))
     structure_keys = (
         ("h4_structure",)
         if timeframe == "4h"
@@ -6365,9 +7100,22 @@ def _structure_target_candidates(mapping: dict[str, object], side: PositionSide,
 
 
 def _auto_signal_allowed(signal: dict[str, object]) -> bool:
-    if signal.get("vetoes"):
+    if signal.get("vetoes") or signal.get("auto_entry_blocks"):
         return False
     return not _auto_entry_prerequisite_blocks(signal)
+
+
+def _signal_is_entry_refresh_priority(
+    signal: dict[str, object],
+) -> bool:
+    """Keep every executable v4 channel on the fast market-data cadence."""
+
+    if int(signal.get("entry_pipeline_version") or 0) >= 4:
+        return str(signal.get("decision_action") or "") in {
+            SignalAction.ENTRY_LONG.value,
+            SignalAction.ENTRY_SHORT.value,
+        }
+    return int(signal.get("score") or 0) >= AUTO_ENTRY_MIN_SCORE
 
 
 def _auto_entry_prerequisite_blocks(
@@ -6401,6 +7149,25 @@ def _auto_entry_prerequisite_blocks(
             blocks.append(
                 f"system risk state {system_risk_state}; new entries blocked"
             )
+    if int(signal.get("entry_pipeline_version") or 0) >= 4:
+        blocks.extend(
+            str(block)
+            for block in (signal.get("policy_blocks") or ())
+            if str(block)
+        )
+        entry_position_block = (
+            _auto_entry_position_block(signal)
+            if include_entry_position
+            else None
+        )
+        if entry_position_block and str(
+            signal.get("decision_action") or ""
+        ) in {
+            SignalAction.ENTRY_LONG.value,
+            SignalAction.ENTRY_SHORT.value,
+        }:
+            blocks.append(entry_position_block)
+        return tuple(dict.fromkeys(blocks))
     if (
         not is_entry
         and score >= AUTO_ENTRY_MIN_SCORE
@@ -6466,6 +7233,7 @@ def _auto_entry_status_signal(
     )
     if has_position:
         payload["vetoes"] = ("symbol already has an open position",)
+        payload["auto_entry_blocks"] = ()
         return payload
     _update_entry_position_fields(payload)
     for reason in _auto_entry_prerequisite_blocks(
@@ -6483,10 +7251,18 @@ def _auto_entry_status_signal(
 
 
 def _record_auto_entry_block(signal: dict[str, object], reason: str) -> None:
-    vetoes = list(signal.get("vetoes") or ())
-    if reason not in vetoes:
-        vetoes.append(reason)
-    signal["vetoes"] = tuple(vetoes)
+    # Pipeline 4 keeps diagnostic/runtime blocks separate from strategy vetoes.
+    # Feeding a policy block back into ``vetoes`` would make the next policy
+    # evaluation reinterpret its own previous diagnosis as an ACTIVE_VETO.
+    key = (
+        "auto_entry_blocks"
+        if int(signal.get("entry_pipeline_version") or 0) >= 4
+        else "vetoes"
+    )
+    blocks = list(signal.get(key) or ())
+    if reason not in blocks:
+        blocks.append(reason)
+    signal[key] = tuple(blocks)
 
 
 def _market_risk_warning_texts(
@@ -6528,21 +7304,31 @@ def _record_risk_warning(
 def _score_before_entry_quality(signal: dict[str, object]) -> int:
     value = signal.get("score_before_entry_quality")
     if isinstance(value, (int, float)):
-        return min(100, max(0, int(value)))
-    current_score = min(
-        100,
-        max(0, int(signal.get("score") or 0)),
-    )
+        score = max(0, int(value))
+        return (
+            score
+            if int(signal.get("score_model_version") or 0) >= 8
+            else min(100, score)
+        )
+    current_score = max(0, int(signal.get("score") or 0))
     quality_score = (
         max(0, int(signal.get("entry_quality_score") or 0))
         if int(signal.get("score_model_version") or 0) >= 5
         else 0
     )
-    return min(100, max(0, current_score - quality_score))
+    score = max(0, current_score - quality_score)
+    return (
+        score
+        if int(signal.get("score_model_version") or 0) >= 8
+        else min(100, score)
+    )
 
 
 def _position_policy_score(signal: dict[str, object]) -> int:
-    """Return the bounded setup score used only for entry ranking."""
+    """Return the raw setup score used only for entry ranking."""
+
+    if int(signal.get("score_model_version") or 0) >= 8:
+        return _score_before_entry_quality(signal)
 
     return min(
         100,
@@ -6558,6 +7344,9 @@ def _refresh_entry_quality_for_live_price(
 ) -> None:
     """Refresh executable price quality without changing setup score."""
 
+    if int(signal.get("score_model_version") or 0) >= 8:
+        _refresh_score_model_v8_for_live_price(signal)
+        return
     if int(signal.get("score_model_version") or 0) < 5:
         return
     candidate_action = str(
@@ -6654,6 +7443,19 @@ def _higher_timeframe_direction_established(
     signal: dict[str, object],
     side: PositionSide,
 ) -> bool:
+    if int(signal.get("score_model_version") or 0) >= 8:
+        direction_state = str(
+            signal.get("direction_confirmation_state") or ""
+        ).upper()
+        return direction_state in {
+            "CONFIRMED",
+            "FORMAL_CONFIRMED",
+            "H4_CONFIRMED",
+            "H4_ALIGNED",
+            "TEMPORARY_CONFIRMED",
+            "PROVISIONAL_CONFIRMED",
+            "TREND_STARTUP_CONFIRMED",
+        }
     market_context = (
         signal.get("market_context")
         if isinstance(signal.get("market_context"), dict)
@@ -6710,27 +7512,37 @@ def _higher_timeframe_direction_established(
 def _update_entry_state_fields(signal: dict[str, object]) -> None:
     action = str(signal.get("action") or "")
     side = _candidate_entry_side(signal)
+    is_v8 = int(signal.get("score_model_version") or 0) >= 8
     signal["primary_setup"] = str(
         signal.get("primary_setup")
         or signal.get("setup_type")
         or _entry_setup_from_context(signal)
     )
-    signal["setup_score"] = min(
-        100,
-        max(
-            0,
-            int(
-                signal.get("setup_score")
-                if isinstance(signal.get("setup_score"), (int, float))
-                else signal.get("score")
-                or 0
-            ),
+    raw_setup_score = max(
+        0,
+        int(
+            signal.get("setup_score")
+            if isinstance(signal.get("setup_score"), (int, float))
+            else signal.get("score")
+            or 0
         ),
     )
+    signal["setup_score"] = (
+        raw_setup_score if is_v8 else min(100, raw_setup_score)
+    )
     primary_key, primary_zone = _primary_entry_zone(signal, side)
+    if is_v8 and str(signal.get("selected_level_key") or ""):
+        primary_key = str(signal.get("selected_level_key") or "")
+        selected_zone = signal.get("selected_level_zone")
+        if isinstance(selected_zone, dict):
+            primary_zone = dict(selected_zone)
     signal["primary_entry_zone_key"] = primary_key
     signal["primary_entry_zone"] = primary_zone
-    families = signal.get("score_evidence_families")
+    families = (
+        signal.get("score_breakdown")
+        if is_v8
+        else signal.get("score_evidence_families")
+    )
     if isinstance(families, dict):
         signal["supporting_evidence"] = tuple(
             f"{family}:{int(points):+d}"
@@ -6739,6 +7551,52 @@ def _update_entry_state_fields(signal: dict[str, object]) -> None:
         )
     else:
         signal["supporting_evidence"] = ()
+    if is_v8:
+        trigger_score = int(
+            (signal.get("score_breakdown") or {}).get("TRIGGER", 0)
+            if isinstance(signal.get("score_breakdown"), dict)
+            else 0
+        )
+        signal["entry_trigger"] = (
+            str(signal.get("trigger_state") or "")
+            if trigger_score >= 10
+            else ""
+        )
+        policy_state = str(signal.get("policy_entry_state") or "")
+        if policy_state:
+            signal["entry_state"] = policy_state
+            decision_action = str(
+                signal.get("decision_action") or SignalAction.WATCH.value
+            )
+            signal["action"] = (
+                SignalAction.NO_TRADE.value
+                if (
+                    decision_action == SignalAction.WATCH.value
+                    and bool(str(signal.get("candidate_action") or ""))
+                    and int(signal.get("score") or 0)
+                    < AUTO_MAIN_POOL_MIN_SCORE
+                )
+                else decision_action
+            )
+            return
+        direction_state = str(
+            signal.get("direction_confirmation_state") or ""
+        )
+        if direction_state in {"H4_OPPOSED", "DIRECTION_PENDING", ""}:
+            signal["entry_state"] = "DIRECTION_PENDING"
+        elif int(
+            (signal.get("score_breakdown") or {}).get("STRUCTURE", 0)
+            if isinstance(signal.get("score_breakdown"), dict)
+            else 0
+        ) < 20:
+            signal["entry_state"] = "STRUCTURE_PENDING"
+        elif str(signal.get("entry_timing") or "") != ENTRY_TIMING_GOOD:
+            signal["entry_state"] = "POSITION_PENDING"
+        elif trigger_score < 10:
+            signal["entry_state"] = "TRIGGER_PENDING"
+        else:
+            signal["entry_state"] = "SIGNAL_PENDING"
+        return
     score = int(signal.get("score") or 0)
     is_entry = action in {
         SignalAction.ENTRY_LONG.value,
@@ -6834,8 +7692,13 @@ def _update_trade_plan_fields(signal: dict[str, object]) -> None:
             ).isoformat()
         except (TypeError, ValueError):
             valid_until = None
+    plan_version = (
+        CURRENT_TRADE_PLAN_VERSION
+        if int(signal.get("score_model_version") or 0) >= 8
+        else 2
+    )
     plan = {
-        "plan_version": CURRENT_TRADE_PLAN_VERSION,
+        "plan_version": plan_version,
         "side": side.value,
         "setup_type": str(signal.get("primary_setup") or ""),
         "setup_score": int(signal.get("setup_score") or 0),
@@ -6863,7 +7726,7 @@ def _update_trade_plan_fields(signal: dict[str, object]) -> None:
         "valid_until": valid_until,
         "vetoes": tuple(str(item) for item in signal.get("vetoes") or ()),
     }
-    signal["plan_version"] = CURRENT_TRADE_PLAN_VERSION
+    signal["plan_version"] = plan_version
     signal["plan_valid_until"] = valid_until
     signal["trade_plan"] = plan
 
@@ -6938,6 +7801,17 @@ def _clear_transient_auto_entry_blocks(
         if not should_clear(str(reason))
     ]
     signal["vetoes"] = tuple(vetoes)
+    auto_blocks = [
+        str(reason)
+        for reason in (signal.get("auto_entry_blocks") or ())
+        if (
+            preserve_evaluation_results
+            and str(reason).startswith(
+                _AUTO_ENTRY_EVALUATION_RESULT_PREFIXES
+            )
+        )
+    ]
+    signal["auto_entry_blocks"] = tuple(auto_blocks)
 
 
 def _entry_stop_error(side: PositionSide, entry_price: float, stop_price: float) -> str | None:
@@ -7025,6 +7899,32 @@ def _rotation_candidate_allowed(signal: dict[str, object], indicator: IndicatorS
 
 def _signal_entry_timing(signal: dict[str, object]) -> tuple[str, str]:
     action = str(signal.get("action") or "")
+    if int(signal.get("score_model_version") or 0) >= 8:
+        candidate_side = _candidate_entry_side(signal)
+        if candidate_side is None:
+            return (
+                ENTRY_TIMING_BLOCK,
+                "入场位置受阻：多空评分差不足，尚未建立候选方向",
+            )
+        if not _higher_timeframe_direction_established(
+            signal,
+            candidate_side,
+        ):
+            return (
+                ENTRY_TIMING_BLOCK,
+                "入场位置受阻：4小时正式方向或临时启动方向尚未建立",
+            )
+        price = _float_or_none(signal.get("price"))
+        entry_levels = (
+            signal.get("entry_levels")
+            if isinstance(signal.get("entry_levels"), dict)
+            else {}
+        )
+        if not entry_levels:
+            return ENTRY_TIMING_BLOCK, "暂无有效建议入场区"
+        if price is None:
+            return ENTRY_TIMING_WAIT, "等待最新价格"
+        return _side_entry_timing(candidate_side, price, signal)
     if action == SignalAction.WATCH.value:
         score = int(signal.get("score") or 0)
         if score < AUTO_ENTRY_MIN_SCORE:
@@ -7323,6 +8223,28 @@ def _entry_zone_bounds(
     side_levels = levels.get(side_key) if isinstance(levels.get(side_key), dict) else {}
     if not side_levels:
         return None
+    if int(signal.get("score_model_version") or 0) >= 8:
+        breakdown = (
+            signal.get("score_breakdown")
+            if isinstance(signal.get("score_breakdown"), dict)
+            else {}
+        )
+        if int(breakdown.get("TRIGGER") or 0) < 10:
+            return None
+        selected_key = str(signal.get("selected_level_key") or "")
+        level = side_levels.get(selected_key)
+        if not isinstance(level, dict) or not _entry_level_hit(price, level):
+            return None
+        values = [
+            value
+            for value in (
+                _float_or_none(level.get("low")),
+                _float_or_none(level.get("high")),
+                _float_or_none(level.get("price")),
+            )
+            if value is not None
+        ]
+        return (min(values), max(values)) if values else None
     keys = _entry_level_keys(side)
     if include_m15:
         keys = (*keys, "m15_ema20_ema60")
@@ -8278,6 +9200,14 @@ def _entry_timeframe_for_signal(
     price: float,
 ) -> str:
     """Resolve the stop/target timeframe from the entry zone actually being traded."""
+    if int(signal.get("score_model_version") or 0) >= 8:
+        selected_key = str(signal.get("selected_level_key") or "")
+        if selected_key.startswith("v8_") or selected_key.startswith("m15_"):
+            return "15m"
+        if selected_key.startswith("h4_"):
+            return "4h"
+        if selected_key.startswith("h1_"):
+            return "1h"
     levels = signal.get("entry_levels") if isinstance(signal.get("entry_levels"), dict) else {}
     side_key = "long" if side == PositionSide.LONG else "short"
     side_levels = levels.get(side_key) if isinstance(levels.get(side_key), dict) else {}
@@ -8707,6 +9637,22 @@ def _candles_contiguous(candles: list[Candle], timeframe: str) -> bool:
         current.timestamp - previous.timestamp == expected
         for previous, current in zip(recent, recent[1:])
     )
+
+
+def _candles_current_for_scoring(
+    candles: list[Candle],
+    timeframe: str,
+    now: datetime,
+) -> bool:
+    """Require the most recent fully closed bar, not merely a gap-free tail."""
+
+    if not _candles_contiguous(candles, timeframe):
+        return False
+    expected_open = _latest_closed_slot(
+        timeframe,
+        now,
+    ) - timedelta(seconds=_timeframe_seconds(timeframe))
+    return candles[-1].timestamp >= expected_open
 
 
 def _build_multi_timeframe_context(
@@ -11752,7 +12698,7 @@ def _apply_multi_timeframe_context(
         direction_score_breakdown
     )
     out["score_model_version"] = (
-        SCORE_MODEL_VERSION
+        FROZEN_SCORE_MODEL_VERSION
         if _score_model == "hierarchical"
         else LEGACY_SCORE_MODEL_VERSION
     )
@@ -11775,6 +12721,478 @@ def _apply_multi_timeframe_context(
     out.pop("entry_zone_confirmation", None)
     _update_entry_position_fields(out)
     return out
+
+
+def _apply_score_model_v8(
+    *,
+    symbol: str,
+    signal: dict[str, object],
+    context: dict[str, object],
+    timeframe_candles: dict[str, list[Candle]],
+    timeframe_indicators: dict[str, list[IndicatorSnapshot]],
+    settings: AppSettings,
+    observed_at: datetime,
+) -> dict[str, object]:
+    """Replace model-7 scoring with the structured v4/v8 score pipeline.
+
+    The complete model-7 result is retained under ``legacy_*`` fields.  This
+    function is shared by realtime paper trading and historical replay, so the
+    same closed candles, evidence families, and policy code decide both paths.
+    """
+
+    out = dict(signal)
+    price = _float_or_none(out.get("price"))
+    if price is None or price <= 0:
+        return out
+    dual = evaluate_dual_score_v8(
+        symbol=symbol,
+        price=price,
+        timeframe_candles=timeframe_candles,
+        timeframe_indicators=timeframe_indicators,
+        context=context,
+        long_ratio_extreme=(
+            settings.strategy.long_short_overcrowded_long
+        ),
+        short_ratio_extreme=(
+            settings.strategy.long_short_overcrowded_short
+        ),
+        funding_hot_long=settings.strategy.funding_hot_long,
+        funding_hot_short=settings.strategy.funding_hot_short,
+    )
+    legacy_score = int(out.get("score") or 0)
+    legacy_action = str(out.get("action") or SignalAction.WATCH.value)
+    legacy_vetoes = tuple(str(item) for item in out.get("vetoes") or ())
+    legacy_reasons = tuple(str(item) for item in out.get("reasons") or ())
+    legacy_risk_state = str(out.get("risk_state") or "NORMAL")
+    legacy_direction = str(out.get("direction") or "NONE")
+    legacy_direction_decision = str(
+        out.get("direction_decision") or "UNKNOWN"
+    )
+    out["legacy_model2_score"] = out.get("legacy_score")
+    out["legacy_model2_action"] = out.get("legacy_action")
+    out["legacy_score"] = legacy_score
+    out["legacy_action"] = legacy_action
+    out["legacy_vetoes"] = legacy_vetoes
+    out["legacy_reasons"] = legacy_reasons
+    out["legacy_risk_state"] = legacy_risk_state
+    out["legacy_direction"] = legacy_direction
+    out["legacy_direction_decision"] = legacy_direction_decision
+
+    display_result = (
+        dual.long
+        if dual.long.setup_score >= dual.short.setup_score
+        else dual.short
+    )
+    selected_result = _selected_score_result_v8(dual)
+    selected_side = dual.selected_side
+    candidate_action = (
+        SignalAction.ENTRY_LONG.value
+        if selected_side == PositionSide.LONG
+        else SignalAction.ENTRY_SHORT.value
+        if selected_side == PositionSide.SHORT
+        else None
+    )
+    score_result = selected_result or display_result
+    out["prd_version"] = "4.0"
+    out["score_model_version"] = SCORE_MODEL_VERSION
+    out["entry_pipeline_version"] = ENTRY_PIPELINE_VERSION
+    out["candidate_action"] = candidate_action
+    out["direction"] = selected_side.value if selected_side else "NONE"
+    out["direction_decision"] = (
+        "LONG_WINS"
+        if selected_side == PositionSide.LONG
+        else "SHORT_WINS"
+        if selected_side == PositionSide.SHORT
+        else "TIE"
+        if dual.long.setup_score == dual.short.setup_score
+        else "SCORE_GAP_NARROW"
+    )
+    out["long_score"] = dual.long.setup_score
+    out["short_score"] = dual.short.setup_score
+    out["final_long_score"] = dual.long.setup_score
+    out["final_short_score"] = dual.short.setup_score
+    out["long_score_breakdown"] = dict(dual.long.score_breakdown)
+    out["short_score_breakdown"] = dict(dual.short.score_breakdown)
+    out["long_risk_penalties"] = dict(dual.long.risk_penalties)
+    out["short_risk_penalties"] = dict(dual.short.risk_penalties)
+    out["score_gap"] = dual.score_gap
+    out["gross_setup_score"] = score_result.gross_setup_score
+    out["risk_penalties"] = dict(score_result.risk_penalties)
+    out["total_risk_penalty"] = score_result.total_risk_penalty
+    out["setup_score"] = score_result.setup_score
+    out["score"] = score_result.setup_score
+    out["score_before_entry_quality"] = score_result.setup_score
+    out["score_breakdown"] = dict(score_result.score_breakdown)
+    out["score_evidence_families"] = dict(score_result.score_breakdown)
+    out["score_delta_vs_legacy"] = score_result.setup_score - legacy_score
+    out["direction_confirmation_state"] = (
+        score_result.direction_confirmation_state
+    )
+    out["direction_state_v8"] = score_result.direction_state
+    out["structure_state"] = score_result.structure_state
+    out["trigger_state"] = score_result.trigger_state
+    out["participation_state"] = score_result.participation_state
+    out["participant_flow_state"] = score_result.participation_state
+    out["participant_flow_score"] = int(
+        score_result.score_breakdown.get("PARTICIPATION", 0)
+    )
+    out["price_progress_efficiency"] = (
+        score_result.price_progress.efficiency
+    )
+    out["price_progress_magnitude"] = (
+        score_result.price_progress.magnitude
+    )
+    out["price_progress_score"] = score_result.price_progress.score
+    out["price_progress_state"] = score_result.price_progress.state
+    out["long_price_progress_score"] = dual.long.price_progress.score
+    out["long_price_progress_state"] = dual.long.price_progress.state
+    out["short_price_progress_score"] = dual.short.price_progress.score
+    out["short_price_progress_state"] = dual.short.price_progress.state
+    m15_indicators = timeframe_indicators.get("15m", [])
+    out["m15_atr14"] = (
+        m15_indicators[-1].atr14 if m15_indicators else None
+    )
+    out["crowding_state"] = score_result.crowding_state
+    out["risk_state"] = _compatible_risk_state_v8(score_result)
+    if str(out.get("regime") or "") == "OVERCROWDED" and not str(
+        score_result.crowding_state
+    ).endswith("_CONFIRMED"):
+        out["regime"] = (
+            "TREND_LONG"
+            if score_result.direction_state.startswith(("D1_H4", "H4"))
+            and score_result.side == PositionSide.LONG
+            else "TREND_SHORT"
+            if score_result.direction_state.startswith(("D1_H4", "H4"))
+            and score_result.side == PositionSide.SHORT
+            else "CHOP"
+        )
+    out["evidence_event_ids"] = dict(score_result.evidence_event_ids)
+    out["long_evidence_event_ids"] = dict(dual.long.evidence_event_ids)
+    out["short_evidence_event_ids"] = dict(dual.short.evidence_event_ids)
+    out["setup_id"] = (
+        f"{symbol.upper()}:{score_result.side.value}:"
+        f"{str(out.get('timestamp') or '')}:v8"
+    )
+    out["selected_level_key"] = (
+        score_result.selected_level.key if selected_result else ""
+    )
+    out["selected_level_zone"] = (
+        dict(score_result.selected_level.zone) if selected_result else {}
+    )
+    out["selected_level_structural"] = bool(
+        score_result.selected_level.structural if selected_result else False
+    )
+    out["selected_level_state"] = score_result.selected_level.state
+    out["v8_structure_stop"] = (
+        score_result.structure_stop if selected_result else None
+    )
+    out["v8_structure_target"] = (
+        score_result.structure_target if selected_result else None
+    )
+    out["entry_levels"] = _selected_entry_levels_v8(
+        selected_result,
+    )
+    out["all_entry_levels_v8"] = dict(context.get("entry_levels") or {})
+    out["setup_type"] = (
+        f"V8_TREND_STARTUP_{score_result.side.value}"
+        if score_result.direction_confirmation_state
+        == "TEMPORARY_CONFIRMED"
+        else f"V8_STRUCTURE_{score_result.side.value}"
+    )
+    out["primary_setup"] = out["setup_type"]
+    out["data_confidence"] = {
+        "price_data_contiguous": all(
+            _candles_contiguous(
+                list(timeframe_candles.get(timeframe, [])),
+                timeframe,
+            )
+            for timeframe in V8_REQUIRED_PRICE_TIMEFRAMES
+        ),
+        "price_data_fresh": all(
+            _candles_current_for_scoring(
+                list(timeframe_candles.get(timeframe, [])),
+                timeframe,
+                observed_at,
+            )
+            for timeframe in V8_REQUIRED_PRICE_TIMEFRAMES
+        ),
+        "price_progress_data_valid": bool(
+            score_result.price_progress.data_valid
+        ),
+        "derivatives_data_complete": bool(
+            score_result.derivatives_data_complete
+        ),
+    }
+    out["vetoes"] = ()
+    out["risk_warnings"] = tuple(
+        dict.fromkeys(
+            (
+                *(str(item) for item in out.get("risk_warnings") or ()),
+                *(
+                    ("账户多空比或其他拥挤证据不完整，仅提示、不扣分",)
+                    if str(score_result.crowding_state).endswith("_SUSPECTED")
+                    else ()
+                ),
+            )
+        )
+    )
+    out["reasons"] = _score_reasons_v8(score_result, dual)
+    out.pop("decision_action", None)
+    out.pop("policy_entry_state", None)
+    out["action"] = candidate_action or SignalAction.WATCH.value
+    _update_entry_position_fields(out)
+    if selected_result is not None and candidate_action is not None:
+        side = selected_result.side
+        assessment = _entry_quality_assessment(out, side)
+        out.update(assessment)
+        out.pop("entry_quality_blocks_entry", None)
+    else:
+        out.update(_empty_entry_quality_v8())
+    _apply_entry_policy_v4_fields(out)
+    _update_entry_position_fields(out)
+    return out
+
+
+def _selected_score_result_v8(dual: DualScoreV8) -> SideScoreV8 | None:
+    if dual.selected_side == PositionSide.LONG:
+        return dual.long
+    if dual.selected_side == PositionSide.SHORT:
+        return dual.short
+    return None
+
+
+def _selected_entry_levels_v8(
+    result: SideScoreV8 | None,
+) -> dict[str, object]:
+    if result is None or not result.selected_level.key:
+        return {}
+    side_key = "long" if result.side == PositionSide.LONG else "short"
+    return {
+        side_key: {
+            result.selected_level.key: dict(result.selected_level.zone),
+        }
+    }
+
+
+def _compatible_risk_state_v8(result: SideScoreV8) -> str:
+    if result.crowding_state == "LONG_CROWD_CONFIRMED":
+        return "LONG_CROWD"
+    if result.crowding_state == "SHORT_CROWD_CONFIRMED":
+        return "SHORT_CROWD"
+    return "NORMAL"
+
+
+def _score_reasons_v8(
+    result: SideScoreV8,
+    dual: DualScoreV8,
+) -> tuple[str, ...]:
+    breakdown = result.score_breakdown
+    reasons = [
+        (
+            f"方向：{result.direction_state}，"
+            f"方向证据 {int(breakdown.get('DIRECTION', 0))} 分"
+        ),
+        (
+            f"结构：{result.structure_state}，"
+            f"结构证据 {int(breakdown.get('STRUCTURE', 0))} 分"
+        ),
+        (
+            f"位置：{result.selected_level.state}"
+            f"（{result.selected_level.key or '无有效主区'}），"
+            f"位置证据 {int(breakdown.get('LOCATION', 0))} 分"
+        ),
+        (
+            f"触发：{result.trigger_state}，"
+            f"触发证据 {int(breakdown.get('TRIGGER', 0))} 分"
+        ),
+        (
+            f"参与流：{result.participation_state}，"
+            f"参与流证据 {int(breakdown.get('PARTICIPATION', 0))} 分"
+        ),
+        (
+            f"价格推进：{result.price_progress.state}，"
+            f"推进证据 {result.price_progress.score} 分"
+        ),
+        (
+            f"多空完整评分：多 {dual.long.setup_score}，"
+            f"空 {dual.short.setup_score}，分差 {dual.score_gap}"
+        ),
+    ]
+    if result.crowding_state.endswith("_CONFIRMED"):
+        reasons.append(
+            f"拥挤风险：{result.crowding_state}，仅对同向候选扣6分"
+        )
+    elif result.crowding_state.endswith("_SUSPECTED"):
+        reasons.append(
+            f"拥挤观察：{result.crowding_state}，证据不完整，扣分0"
+        )
+    return tuple(reasons)
+
+
+def _empty_entry_quality_v8() -> dict[str, object]:
+    return {
+        "entry_quality_score": 0,
+        "entry_quality_status": "UNAVAILABLE",
+        "entry_quality_reason": "尚未建立可执行候选方向",
+        "entry_quality_in_zone": False,
+        "entry_quality_reference_price": None,
+        "effective_risk_reward": None,
+        "effective_risk_distance": None,
+        "effective_reward_distance": None,
+        "net_plan_r": None,
+        "nearest_structure_target": None,
+        "planned_take_profit_1": None,
+        "planned_take_profit_2": None,
+        "preview_structure_stop": None,
+        "preview_structure_stop_basis": "",
+    }
+
+
+def _apply_entry_policy_v4_fields(signal: dict[str, object]) -> None:
+    breakdown = (
+        signal.get("score_breakdown")
+        if isinstance(signal.get("score_breakdown"), dict)
+        else {}
+    )
+    confidence = (
+        signal.get("data_confidence")
+        if isinstance(signal.get("data_confidence"), dict)
+        else {}
+    )
+    timing_ready = str(signal.get("entry_timing") or "") == ENTRY_TIMING_GOOD
+    decision = decide_entry_policy_v4(
+        EntryPolicyV4Input(
+            setup_score=int(signal.get("setup_score") or 0),
+            candidate_action=str(signal.get("candidate_action") or ""),
+            direction_confirmation_state=str(
+                signal.get("direction_confirmation_state") or ""
+            ),
+            family_scores={
+                str(key): int(value)
+                for key, value in breakdown.items()
+                if isinstance(value, (int, float))
+            },
+            data_confidence=EntryDataConfidenceV4(
+                price_data_contiguous=bool(
+                    confidence.get("price_data_contiguous", False)
+                ),
+                price_data_fresh=bool(
+                    confidence.get("price_data_fresh", False)
+                ),
+                derivatives_data_complete=bool(
+                    confidence.get("derivatives_data_complete", False)
+                ),
+            ),
+            structure_ready=int(breakdown.get("STRUCTURE") or 0) >= 20,
+            location_ready=(
+                int(breakdown.get("LOCATION") or 0) >= 15
+                and timing_ready
+            ),
+            trigger_ready=int(breakdown.get("TRIGGER") or 0) >= 10,
+            stop_ready=_float_or_none(
+                signal.get("preview_structure_stop")
+                or signal.get("v8_structure_stop")
+            )
+            is not None,
+            target_ready=_float_or_none(
+                signal.get("nearest_structure_target")
+                or signal.get("v8_structure_target")
+            )
+            is not None,
+            net_reward_r=_float_or_none(
+                signal.get("net_plan_r")
+                or signal.get("effective_risk_reward")
+            ),
+            vetoes=tuple(str(item) for item in signal.get("vetoes") or ()),
+        )
+    )
+    signal["decision_action"] = decision.decision_action
+    signal["entry_mode"] = decision.entry_mode
+    signal["policy_entry_state"] = decision.entry_state
+    signal["entry_state"] = decision.entry_state
+    signal["policy_score_required"] = decision.required_score
+    signal["policy_blocks"] = decision.blocks
+    signal["action"] = (
+        SignalAction.NO_TRADE.value
+        if (
+            decision.decision_action == SignalAction.WATCH.value
+            and bool(str(signal.get("candidate_action") or ""))
+            and int(signal.get("score") or 0) < AUTO_MAIN_POOL_MIN_SCORE
+        )
+        else decision.decision_action
+    )
+
+
+def _refresh_score_model_v8_for_live_price(
+    signal: dict[str, object],
+) -> None:
+    side = _candidate_entry_side(signal)
+    price = _float_or_none(signal.get("price"))
+    selected_key = str(signal.get("selected_level_key") or "")
+    selected_zone = (
+        signal.get("selected_level_zone")
+        if isinstance(signal.get("selected_level_zone"), dict)
+        else {}
+    )
+    if side is None or price is None or not selected_key or not selected_zone:
+        _apply_entry_policy_v4_fields(signal)
+        _update_entry_position_fields(signal)
+        return
+    location = location_for_selected_level_v8(
+        price=price,
+        side=side,
+        key=selected_key,
+        zone=selected_zone,
+        structural=bool(signal.get("selected_level_structural")),
+        atr14=_float_or_none(signal.get("m15_atr14")),
+    )
+    breakdown = dict(signal.get("score_breakdown") or {})
+    breakdown["LOCATION"] = location.score
+    penalty_inputs = [
+        RiskPenaltyV8(channel=str(channel), penalty=int(penalty))
+        for channel, penalty in dict(signal.get("risk_penalties") or {}).items()
+        if isinstance(penalty, (int, float))
+    ]
+    composed = compose_score_v8(breakdown, penalty_inputs)
+    signal["score_breakdown"] = dict(composed.score_breakdown)
+    signal["score_evidence_families"] = dict(composed.score_breakdown)
+    signal["gross_setup_score"] = composed.gross_setup_score
+    signal["total_risk_penalty"] = composed.total_risk_penalty
+    signal["setup_score"] = composed.setup_score
+    signal["score"] = composed.setup_score
+    signal["score_before_entry_quality"] = composed.setup_score
+    signal["selected_level_state"] = location.state
+    if side == PositionSide.LONG:
+        signal["final_long_score"] = composed.setup_score
+        signal["long_score"] = composed.setup_score
+    else:
+        signal["final_short_score"] = composed.setup_score
+        signal["short_score"] = composed.setup_score
+    legacy_score = signal.get("legacy_score")
+    if isinstance(legacy_score, (int, float)):
+        signal["score_delta_vs_legacy"] = (
+            composed.setup_score - int(legacy_score)
+        )
+    previous_reason = str(signal.get("entry_quality_reason") or "")
+    signal["reasons"] = tuple(
+        str(reason)
+        for reason in signal.get("reasons") or ()
+        if str(reason) != previous_reason
+    )
+    signal.pop("policy_entry_state", None)
+    signal.pop("decision_action", None)
+    signal["action"] = str(signal.get("candidate_action") or "")
+    _update_entry_position_fields(signal)
+    assessment = _entry_quality_assessment(signal, side)
+    signal.update(assessment)
+    signal.pop("entry_quality_blocks_entry", None)
+    quality_reason = str(signal.get("entry_quality_reason") or "")
+    if quality_reason:
+        signal["reasons"] = tuple(
+            (*signal.get("reasons", ()), quality_reason)
+        )
+    _apply_entry_policy_v4_fields(signal)
+    _update_entry_position_fields(signal)
 
 
 def _rsi_entry_adjustment(
@@ -12592,6 +14010,7 @@ def _entry_quality_grade(
     reward_r: float | None = None,
     stop_pct: float | None = None,
     setup_type: str = "",
+    entry_mode: str = "",
 ) -> str | None:
     """Classify deployable capital only; entry-plan checks stay independent."""
 
@@ -12601,6 +14020,11 @@ def _entry_quality_grade(
     if score >= ENTRY_QUALITY_A_MIN_SCORE:
         return ENTRY_QUALITY_A
     if score >= AUTO_ENTRY_MIN_SCORE:
+        return ENTRY_QUALITY_B
+    if entry_mode in {
+        ENTRY_MODE_TREND_STARTUP,
+        ENTRY_MODE_TREND_RESEARCH,
+    }:
         return ENTRY_QUALITY_B
     return None
 

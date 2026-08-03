@@ -256,6 +256,8 @@ HISTORICAL_BACKTEST_HTML = r"""<!doctype html>
 
     function setupText(context,side){
       const code=String(context.setup_type||context.entry_setup||'').toUpperCase();
+      if(code.includes('V8_TREND_STARTUP'))return side==='LONG'?'趋势启动做多':'趋势启动做空';
+      if(code.includes('V8_STRUCTURE'))return side==='LONG'?'核心结构做多':'核心结构做空';
       if(code.includes('DISTRIBUTION'))return'高位派发结构';
       if(code.includes('OI_VALLEY'))return'4小时持仓量洼地反转';
       if(code.includes('SQUEEZE'))return'15分钟挤压回踩';
@@ -274,6 +276,8 @@ HISTORICAL_BACKTEST_HTML = r"""<!doctype html>
       if(row.entry_score!==null&&row.entry_score!==undefined&&String(row.entry_score)!==''){
         parts.push(`评分 ${row.entry_score}`);
       }
+      const modeText={STANDARD:'标准通道',TREND_STARTUP:'趋势启动通道',TREND_RESEARCH:'研究模拟通道'};
+      if(modeText[context.entry_mode])parts.push(modeText[context.entry_mode]);
       const setup=setupText(context,row.side);
       if(setup)parts.push(setup);
       const trend=trendText[context.trend_state||context.regime];
@@ -294,7 +298,7 @@ HISTORICAL_BACKTEST_HTML = r"""<!doctype html>
       let prefix='策略退出';
       if(lower.startsWith('stop loss'))prefix='止损';
       else if(lower.startsWith('take profit'))prefix='止盈';
-      else if(lower.includes('time exit'))prefix='时间退出';
+      else if(lower.includes('time exit')||lower.includes('time stop'))prefix='时间退出';
       const details=[
         ['target 1 reached','第一止盈目标达成'],
         ['target 2 reached','第二止盈目标达成'],
@@ -321,7 +325,9 @@ HISTORICAL_BACKTEST_HTML = r"""<!doctype html>
         ['body closed above resistance or ema/boll zone','实体收盘突破压力或均线区域'],
         ['structure invalidated','交易结构失效'],
         ['trend late stage','趋势进入末期'],
-        ['efficiency','持仓效率下降']
+        ['efficiency','持仓效率下降'],
+        ['no 0.5r progress, price progress ineffective and structure did not advance','未达到0.5R、价格推进无效且结构未继续发展'],
+        ['no 0.5r progress, price advance is weak, and structure has not developed','未达到0.5R、价格推进偏弱且结构未发展']
       ];
       const matched=details.find(([needle])=>lower.includes(needle));
       if(matched)return`${prefix}：${matched[1]}`;

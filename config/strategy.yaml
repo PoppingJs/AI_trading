@@ -7,6 +7,8 @@ timeframes:
   - 1d
 
 strategy:
+  # PRD v4.0；紧急回退可改为7并重启，旧持仓仍按自身plan_version管理
+  score_model_version: 8
   score_threshold: 75
   watch_threshold: 55
   strict_trend_entry: false
