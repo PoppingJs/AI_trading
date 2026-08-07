@@ -28,6 +28,12 @@ class PositionSide(str, Enum):
     SHORT = "SHORT"
 
 
+POSITION_SCHEMA_VERSION = 2
+PLAN_TARGET_MODE_BOUNDED_TARGETS = "BOUNDED_TARGETS"
+PLAN_TARGET_MODE_OPEN_SPACE = "OPEN_SPACE"
+PLAN_TARGET_MODE_LEGACY_BOUNDED_DUAL_TP = "LEGACY_BOUNDED_DUAL_TP"
+
+
 SETUP_M15_SQUEEZE_TACTICAL_LONG = "M15_SQUEEZE_TACTICAL_LONG"
 SETUP_H1_PULLBACK_LONG = "H1_PULLBACK_LONG"
 SETUP_H1_STRUCTURE_LONG = "H1_STRUCTURE_LONG"
@@ -128,13 +134,15 @@ class Position:
     quantity: float
     opened_at: datetime
     stop_price: float
-    take_profit_1: float
-    take_profit_2: float
+    take_profit_1: float | None
+    take_profit_2: float | None
     remaining_fraction: float = 1.0
     first_tp_done: bool = False
     second_tp_done: bool = False
     bars_held: int = 0
     metadata: dict[str, Any] = field(default_factory=dict)
+    position_schema_version: int = POSITION_SCHEMA_VERSION
+    plan_target_mode: str = PLAN_TARGET_MODE_LEGACY_BOUNDED_DUAL_TP
 
     @property
     def notional(self) -> float:
@@ -148,9 +156,10 @@ class RiskDecision:
     notional: float
     margin_required: float
     stop_price: float
-    take_profit_1: float
-    take_profit_2: float
+    take_profit_1: float | None
+    take_profit_2: float | None
     reasons: tuple[str, ...] = ()
+    plan_target_mode: str = PLAN_TARGET_MODE_LEGACY_BOUNDED_DUAL_TP
 
 
 @dataclass(frozen=True)

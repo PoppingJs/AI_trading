@@ -6,19 +6,30 @@ from datetime import UTC, datetime
 import math
 
 from ai_trading.config import RiskSettings
-from ai_trading.models import Candle, IndicatorSnapshot, Position, PositionSide, RiskDecision, SignalAction, StrategySignal
+from ai_trading.models import (
+    PLAN_TARGET_MODE_BOUNDED_TARGETS,
+    PLAN_TARGET_MODE_LEGACY_BOUNDED_DUAL_TP,
+    PLAN_TARGET_MODE_OPEN_SPACE,
+    Candle,
+    IndicatorSnapshot,
+    Position,
+    PositionSide,
+    RiskDecision,
+    SignalAction,
+    StrategySignal,
+)
 
 
 @dataclass(frozen=True)
 class TradePlan:
-    """A strategy-owned plan whose stop and targets are already final."""
+    """A strategy-owned plan whose stop and optional targets are final."""
 
     symbol: str
     side: PositionSide
     entry_price: float
     stop_price: float
-    take_profit_1: float
-    take_profit_2: float
+    take_profit_1: float | None
+    take_profit_2: float | None
     leverage: int
     risk_factor: float = 1.0
     is_addition: bool = False
@@ -26,6 +37,7 @@ class TradePlan:
     # Compatibility field: this is now a maximum-margin cap after risk-based
     # sizing, never an independent fixed-margin sizing path.
     requested_margin_usdt: float | None = None
+    plan_target_mode: str = PLAN_TARGET_MODE_LEGACY_BOUNDED_DUAL_TP
 
 
 @dataclass(frozen=True)
@@ -323,16 +335,34 @@ def _portfolio_blocked(
 
 
 def _trade_plan_error(plan: TradePlan) -> str | None:
-    numeric_values = (
+    supported_target_modes = {
+        PLAN_TARGET_MODE_BOUNDED_TARGETS,
+        PLAN_TARGET_MODE_OPEN_SPACE,
+        PLAN_TARGET_MODE_LEGACY_BOUNDED_DUAL_TP,
+    }
+    if plan.plan_target_mode not in supported_target_modes:
+        return "unsupported plan target mode"
+
+    numeric_values: tuple[float | int | None, ...] = (
         plan.entry_price,
         plan.stop_price,
-        plan.take_profit_1,
-        plan.take_profit_2,
-        float(plan.leverage),
+        plan.leverage,
         plan.risk_factor,
         plan.adverse_cost_rate,
     )
-    if not all(math.isfinite(float(value)) for value in numeric_values):
+    if plan.plan_target_mode == PLAN_TARGET_MODE_OPEN_SPACE:
+        if plan.take_profit_1 is not None or plan.take_profit_2 is not None:
+            return "open-space plan must not define take-profit targets"
+    else:
+        numeric_values += (plan.take_profit_1, plan.take_profit_2)
+    try:
+        values_are_finite = all(
+            value is not None and math.isfinite(float(value))
+            for value in numeric_values
+        )
+    except (TypeError, ValueError):
+        values_are_finite = False
+    if not values_are_finite:
         return "trade plan values must be finite"
     if plan.entry_price <= 0:
         return "entry price must be positive"
@@ -344,6 +374,19 @@ def _trade_plan_error(plan: TradePlan) -> str | None:
         return "long stop must be below entry"
     if plan.side == PositionSide.SHORT and plan.stop_price <= plan.entry_price:
         return "short stop must be above entry"
+    if plan.plan_target_mode != PLAN_TARGET_MODE_OPEN_SPACE:
+        take_profit_1 = float(plan.take_profit_1)  # validated as finite above
+        take_profit_2 = float(plan.take_profit_2)  # validated as finite above
+        if take_profit_1 <= 0 or take_profit_2 <= 0:
+            return "take-profit prices must be positive"
+        if plan.side == PositionSide.LONG and not (
+            plan.entry_price < take_profit_1 <= take_profit_2
+        ):
+            return "long targets must be ordered above entry"
+        if plan.side == PositionSide.SHORT and not (
+            plan.entry_price > take_profit_1 >= take_profit_2
+        ):
+            return "short targets must be ordered below entry"
     return None
 
 

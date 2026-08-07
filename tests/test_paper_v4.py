@@ -413,7 +413,7 @@ def test_fixed_unit_mode_falls_back_to_risk_sizing_when_disabled(
     assert context["risk_gate_status"] == "ALLOWED"
 
 
-def test_fixed_unit_mode_keeps_account_loss_gate_as_a_hard_block() -> None:
+def test_fixed_unit_mode_keeps_account_loss_gate_as_advisory() -> None:
     settings = AppSettings()
     settings.execution.paper_trading = True
     settings.risk.paper_fixed_unit_sizing = True
@@ -441,13 +441,13 @@ def test_fixed_unit_mode_keeps_account_loss_gate_as_a_hard_block() -> None:
 
     asyncio.run(engine._auto_trade_once())
 
-    assert "TESTUSDT" not in engine.account.positions
+    assert "TESTUSDT" in engine.account.positions
     published = engine.latest_signals["TESTUSDT"]
-    assert published["risk_gate_status"] == "BLOCKED"
+    assert published["risk_gate_status"] == "PAPER_FIXED_UNIT"
     assert published["risk_gate_code"] == "DAILY_LOSS_LIMIT"
     assert any(
-        "daily loss limit reached" in str(reason)
-        for reason in published["auto_entry_blocks"]
+        "模拟盘账户风险仅提示" in str(reason)
+        for reason in published["risk_warnings"]
     )
 
 
@@ -482,7 +482,8 @@ def test_v8_stale_closed_candle_updates_policy_and_blocks_entry() -> None:
     )
     assert "15m K-line context is stale" in blocks
     assert signal["data_confidence"]["price_data_fresh"] is False
-    assert "PRICE_DATA_STALE" in signal["policy_blocks"]
+    assert "PRICE_DATA_STALE" in signal["policy_block_codes"]
+    assert signal["policy_blocks"] == ("标的资格与行情数据：价格数据已过期",)
     assert signal["decision_action"] == "WATCH"
 
 
@@ -495,7 +496,9 @@ def test_pipeline4_runtime_blocks_do_not_feed_back_into_strategy_vetoes() -> Non
     _record_auto_entry_block(signal, "ENTRY_TRIGGER_UNAVAILABLE")
 
     assert signal["vetoes"] == ()
-    assert signal["auto_entry_blocks"] == ("ENTRY_TRIGGER_UNAVAILABLE",)
+    assert signal["auto_entry_blocks"] == (
+        "系统与下单：自动开仓前置审核返回未分类异常，已写入决策流水",
+    )
     _clear_transient_auto_entry_blocks(signal)
     assert signal["auto_entry_blocks"] == ()
 
@@ -935,7 +938,7 @@ def test_unclosed_live_m15_does_not_replace_v5_authorized_zone() -> None:
     assert "live_m15_precision" in signal
 
 
-def test_stale_v8_entry_zone_policy_waits_for_v5_rescore() -> None:
+def test_stale_v8_entry_zone_policy_is_reprojected_to_v7() -> None:
     engine = PaperTradingEngine(
         AppSettings(),
         starting_balance=1_000.0,
@@ -954,11 +957,8 @@ def test_stale_v8_entry_zone_policy_waits_for_v5_rescore() -> None:
 
     asyncio.run(engine._auto_trade_once())
 
-    assert "TESTUSDT" not in engine.account.positions
-    assert any(
-        "entry-zone policy is stale" in str(reason)
-        for reason in engine.latest_signals["TESTUSDT"].get(
-            "auto_entry_blocks",
-            (),
-        )
+    assert "TESTUSDT" in engine.account.positions
+    assert (
+        engine.latest_signals["TESTUSDT"]["entry_pipeline_version"]
+        == 7
     )

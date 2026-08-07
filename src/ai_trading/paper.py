@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import math
 import os
+import re
 import shutil
 from collections.abc import Iterable, Sequence
 from dataclasses import asdict, dataclass, field
@@ -24,11 +26,39 @@ from ai_trading.entry_policy_v4 import (
     EntryPolicyV4Input,
     decide_entry_policy_v4,
 )
+from ai_trading.entry_policy_v7 import (
+    ENTRY_ROUTE_H4_ALIGNED,
+    ENTRY_ROUTE_H4_CLEAN_NEUTRAL,
+    ENTRY_ROUTE_M15_EARLY_RESEARCH,
+    EntryDataConfidenceV7,
+    EntryPolicyV7Input,
+    decide_entry_policy_v7,
+)
+from ai_trading.execution_plan_v7 import (
+    EXECUTION_PLAN_FORMULA_VERSION,
+    PLAN_STATUS_READY,
+    PROTECTION_ELIGIBLE,
+    PROTECTION_INACTIVE,
+    ExecutionPlanV7Input,
+    advance_open_space_protection,
+    build_execution_plan_v7,
+)
 from ai_trading.market_context import (
     LiquidityObservation,
     MarketContextTracker,
 )
+from ai_trading.market_state_v4 import (
+    H4BackgroundV4,
+    H4BackgroundSnapshotV4,
+    MarketStateSnapshotV4,
+    classify_h4_background_v4,
+    classify_market_state_v4,
+)
 from ai_trading.models import (
+    PLAN_TARGET_MODE_BOUNDED_TARGETS,
+    PLAN_TARGET_MODE_LEGACY_BOUNDED_DUAL_TP,
+    PLAN_TARGET_MODE_OPEN_SPACE,
+    POSITION_SCHEMA_VERSION,
     SETUP_DISTRIBUTION_STAGE1_SHORT,
     SETUP_DISTRIBUTION_STAGE2_SHORT,
     SETUP_DISTRIBUTION_STAGE3_SHORT,
@@ -80,10 +110,10 @@ AUTO_UNIVERSE_SYMBOL = "AUTO_TOP50"
 LEGACY_AUTO_UNIVERSE_SYMBOL = "AUTO_TOP30"
 AUTO_UNIVERSE_EXCLUDED_SYMBOLS = {"BTCUSDT", "BTCUSDC", "ETHUSDT", "SOLUSDT", "XAUUSDT"}
 AUTO_UNIVERSE_SCAN_LIMIT = 80
-# Keep the requested universe semantics simple: take the exchange's
-# quote-volume-descending Top80 first, then retain symbols whose closed-candle
-# setup score is at least the V9 watch threshold.
-AUTO_MAIN_POOL_LIMIT = AUTO_UNIVERSE_SCAN_LIMIT
+# Top80 is the evaluation/shadow universe.  Only the stable Top50 main pool is
+# the denominator for automatic entry decisions; the remaining symbols keep
+# their pool-evaluation audit but cannot become hidden strategy vetoes.
+AUTO_MAIN_POOL_LIMIT = 50
 AUTO_MAIN_POOL_MIN_SCORE = 55
 AUTO_POOL_REBALANCE_TIMEFRAME = "15m"
 CANDIDATE_MIN_QUOTE_VOLUME = 50_000_000
@@ -98,7 +128,37 @@ CAPITAL_DEPLOYMENT_FRACTION = 0.95
 CAPITAL_UNIT_COUNT = 5
 PAPER_FIXED_UNIT_RISK_STATUS = "PAPER_FIXED_UNIT"
 PAPER_FIXED_UNIT_ADVISORY_RISK_BLOCKS = frozenset(
-    {"OPEN_RISK_LIMIT", "MARGIN_LIMIT"}
+    {
+        "DAILY_LOSS_LIMIT",
+        "WEEKLY_LOSS_LIMIT",
+        "MAX_DRAWDOWN",
+        "LOSS_COOLDOWN",
+        "CONSECUTIVE_LOSSES",
+        "OPEN_RISK_LIMIT",
+        "MARGIN_LIMIT",
+    }
+)
+
+# Exact execution-plan values belong to one execution attempt.  A fresh
+# signal-stage projection must never inherit them from the previous scan.
+_EXECUTION_STAGE_SIGNAL_FIELDS = (
+    "exit_plan_error",
+    "exit_plan_status",
+    "plan_target_mode",
+    "effective_risk_reward",
+    "effective_risk_distance",
+    "effective_reward_distance",
+    "net_plan_r",
+    "nearest_structure_target",
+    "planned_take_profit_1",
+    "planned_take_profit_2",
+    "preview_structure_stop",
+    "preview_structure_stop_basis",
+    "open_space_reference_price",
+    "open_space_capacity_r",
+    "fee_adjusted_breakeven_price",
+    "risk_unit",
+    "final_fill_price",
 )
 ENTRY_QUALITY_A_MIN_SCORE = 80
 ENTRY_QUALITY_S_MIN_SCORE = 95
@@ -134,7 +194,13 @@ MIN_ENTRY_REWARD_R = 1.3
 SCORE_MODEL_VERSION = 8
 FROZEN_SCORE_MODEL_VERSION = 7
 LEGACY_SCORE_MODEL_VERSION = 2
-ENTRY_PIPELINE_VERSION = 5
+ENTRY_PIPELINE_VERSION = 7
+MARKET_STATE_VERSION = 4
+CHANNEL_GEOMETRY_VERSION = 2
+ER12_FORMULA_VERSION = 2
+POSITION_SCHEMA_VERSION_ACTIVE = 2
+DECISION_REASON_SCHEMA_VERSION = 2
+_AUDIT_VALUE_UNSET = object()
 DIRECTION_H4_BASE_SCORE = 6
 DIRECTION_DAILY_BACKGROUND_SCORE = 3
 DIRECTION_ALIGNMENT_BONUS = 3
@@ -276,8 +342,8 @@ class PaperFill:
     leverage: int
     margin_usdt: float
     stop_price: float
-    take_profit_1: float
-    take_profit_2: float
+    take_profit_1: float | None
+    take_profit_2: float | None
     opened_at: datetime
     entry_position: str = ""
     closed_at: datetime | None = None
@@ -310,6 +376,9 @@ class PaperAccount:
     daily_pnl_baselines: dict[str, float] = field(default_factory=dict)
     pnl_history: dict[str, float] = field(default_factory=dict)
     latest_signals: dict[str, dict[str, object]] = field(default_factory=dict)
+    decision_audit_log: list[dict[str, object]] = field(
+        default_factory=list
+    )
     market_context_state: dict[str, object] = field(default_factory=dict)
     reentry_barriers: dict[str, dict[str, str]] = field(default_factory=dict)
     risk_day_key: str = ""
@@ -376,6 +445,41 @@ class PaperTradingEngine:
             if (mark_price := _stored_mark_price(position)) is not None
         }
         self.latest_signals: dict[str, dict[str, object]] = {symbol: dict(signal) for symbol, signal in self.account.latest_signals.items()}
+        self._attempted_auto_decision_ids: set[str] = {
+            str(signal.get("decision_id"))
+            for signal in self.latest_signals.values()
+            if isinstance(signal, dict)
+            and signal.get("auto_open_attempted") is True
+            and str(signal.get("decision_id") or "")
+        }
+        self._attempted_auto_decision_ids.update(
+            str(item.get("decision_id"))
+            for item in self.account.decision_audit_log
+            if isinstance(item, dict)
+            and str(item.get("code") or "").startswith(
+                "AUTO_OPEN_ATTEMPT_"
+            )
+            and str(item.get("decision_id") or "")
+        )
+        self._decision_audit_keys: set[
+            tuple[str, str, str, str, str]
+        ] = {
+            (
+                str(item.get("decision_id") or ""),
+                str(item.get("code") or ""),
+                str(item.get("detail") or ""),
+                str(item.get("stage") or ""),
+                str(item.get("status") or ""),
+            )
+            for item in self.account.decision_audit_log
+            if isinstance(item, dict)
+        }
+        self._market_state_shadow_snapshots: dict[
+            str, MarketStateSnapshotV4
+        ] = {}
+        self._h4_background_shadow_snapshots: dict[
+            str, H4BackgroundSnapshotV4
+        ] = {}
         self.latest_indicators: dict[str, list[IndicatorSnapshot]] = {}
         self.latest_timeframe_contexts: dict[str, dict[str, object]] = {}
         self.latest_timeframe_indicators: dict[str, dict[str, list[IndicatorSnapshot]]] = {}
@@ -809,6 +913,36 @@ class PaperTradingEngine:
             for symbol in self._universe_symbols
             if symbol not in main_set
         ]
+        self._record_pool_evaluation(main_set)
+
+    def _record_pool_evaluation(self, decision_symbols: set[str]) -> None:
+        """Keep Top80 shadow and Top50 decision denominators auditable."""
+
+        rank_by_symbol = {
+            symbol: index
+            for index, symbol in enumerate(self._universe_symbols, start=1)
+        }
+        for symbol, rank in rank_by_symbol.items():
+            signal = self.latest_signals.get(symbol)
+            if not isinstance(signal, dict):
+                continue
+            score = int(signal.get("score") or 0)
+            in_decision_universe = symbol in decision_symbols
+            if in_decision_universe:
+                reason_code = ""
+            elif score < AUTO_MAIN_POOL_MIN_SCORE:
+                reason_code = "SCORE_BELOW_WATCH_THRESHOLD"
+            else:
+                reason_code = "OUTSIDE_DECISION_TOP50"
+            signal["pool_evaluation"] = {
+                "evaluation_universe": "AUTO_TOP80",
+                "decision_universe": AUTO_UNIVERSE_SYMBOL,
+                "quote_volume_rank": rank,
+                "in_decision_universe": in_decision_universe,
+                "reason_code": reason_code,
+            }
+            if symbol in self.account.latest_signals:
+                self.account.latest_signals[symbol] = dict(signal)
 
     def _managed_symbols(self) -> list[str]:
         if self._auto_universe:
@@ -1021,15 +1155,205 @@ class PaperTradingEngine:
             raise ValueError(f"{symbol} already has an open paper position")
         price = await self._price(symbol)
         async with self._lock:
+            # The public pre-check is a fast path only.  The lock-protected
+            # check is the authoritative idempotency guard for concurrent
+            # auto-entry/manual requests.
+            if symbol in self.account.positions:
+                raise ValueError(
+                    f"{symbol} already has an open paper position"
+                )
             available = self._available_balance_unlocked()
             if margin_usdt > available:
                 raise ValueError(f"insufficient paper balance: available {available:.2f} USDT")
             side_enum = PositionSide(side)
             price = self._execution_price(price, side_enum, entering=True)
-            stop_loss = stop_loss or _default_stop(side_enum, price, leverage)
-            take_profit_1 = take_profit_1 or _default_take_profit(side_enum, price, stop_loss, 1)
-            take_profit_2 = take_profit_2 or _default_take_profit(side_enum, price, stop_loss, 2)
             normalized_entry_context = _normalize_entry_context(entry_context)
+            decision_audit_ref = normalized_entry_context.pop(
+                "_decision_audit_ref",
+                None,
+            )
+            fixed_unit_entry_requested = bool(
+                self.settings.execution.paper_trading
+                and self.settings.risk.paper_fixed_unit_sizing
+                and normalized_entry_context.get("entry_source")
+                == "AUTO_STRATEGY"
+                and normalized_entry_context.get("position_sizing_mode")
+                == "FIXED_CAPITAL_UNIT"
+            )
+            if (
+                fixed_unit_entry_requested
+                and len(self.account.positions)
+                >= max(1, self.settings.risk.max_open_positions)
+            ):
+                raise ValueError(
+                    "position capacity full at atomic submission"
+                )
+            plan_target_mode = str(
+                normalized_entry_context.get("plan_target_mode")
+                or PLAN_TARGET_MODE_LEGACY_BOUNDED_DUAL_TP
+            )
+            if plan_target_mode not in {
+                PLAN_TARGET_MODE_BOUNDED_TARGETS,
+                PLAN_TARGET_MODE_OPEN_SPACE,
+                PLAN_TARGET_MODE_LEGACY_BOUNDED_DUAL_TP,
+            }:
+                raise ValueError(
+                    f"unsupported plan target mode: {plan_target_mode}"
+                )
+            stop_loss = stop_loss or _default_stop(side_enum, price, leverage)
+            if plan_target_mode != PLAN_TARGET_MODE_OPEN_SPACE:
+                take_profit_1 = take_profit_1 or _default_take_profit(
+                    side_enum, price, stop_loss, 1
+                )
+                take_profit_2 = take_profit_2 or _default_take_profit(
+                    side_enum, price, stop_loss, 2
+                )
+            else:
+                # OPEN_SPACE deliberately carries no promised targets.  The
+                # 1.30R reference lives only in entry_context and must never
+                # be backfilled into these compatibility fields.
+                take_profit_1 = None
+                take_profit_2 = None
+            if int(
+                normalized_entry_context.get(
+                    "execution_plan_formula_version"
+                )
+                or 0
+            ) >= EXECUTION_PLAN_FORMULA_VERSION:
+                execution_zone = normalized_entry_context.get(
+                    "execution_entry_zone"
+                )
+                if (
+                    isinstance(execution_zone, dict)
+                    and execution_zone
+                    and not _entry_level_hit(price, execution_zone)
+                ):
+                    raise ValueError(
+                        "execution plan blocked: FINAL_PRICE_OUTSIDE_ENTRY_ZONE"
+                    )
+                disaster_price = _float_or_none(
+                    normalized_entry_context.get("disaster_stop_price")
+                )
+                if disaster_price is None:
+                    raise ValueError(
+                        "execution plan blocked: DISASTER_STOP_UNAVAILABLE"
+                    )
+                target_prices = (
+                    ()
+                    if plan_target_mode == PLAN_TARGET_MODE_OPEN_SPACE
+                    else tuple(
+                        value
+                        for value in (take_profit_1, take_profit_2)
+                        if value is not None
+                    )
+                )
+                raw_weights = normalized_entry_context.get(
+                    "execution_target_weights"
+                )
+                target_weights = (
+                    tuple(float(value) for value in raw_weights)
+                    if isinstance(raw_weights, (list, tuple))
+                    else ()
+                )
+                raw_obstacles = normalized_entry_context.get(
+                    "opposing_structure_prices"
+                )
+                opposing_prices = (
+                    tuple(float(value) for value in raw_obstacles)
+                    if isinstance(raw_obstacles, (list, tuple))
+                    else ()
+                )
+                execution_plan = build_execution_plan_v7(
+                    ExecutionPlanV7Input(
+                        side=side_enum,
+                        final_fill_price=price,
+                        structure_invalidation_price=stop_loss,
+                        disaster_stop_price=disaster_price,
+                        tick_size=float(
+                            normalized_entry_context.get("tick_size")
+                            or _execution_tick_size(price)
+                        ),
+                        fee_rate=float(
+                            normalized_entry_context.get("entry_fee_rate")
+                            or self.settings.execution.taker_fee_rate
+                        ),
+                        slippage_rate=float(
+                            normalized_entry_context.get(
+                                "execution_slippage_rate"
+                            )
+                            or self.settings.execution.slippage_rate
+                        ),
+                        target_prices=target_prices,
+                        target_weights=target_weights,
+                        opposing_structure_prices=opposing_prices,
+                        market_state=str(
+                            normalized_entry_context.get(
+                                "execution_market_state"
+                            )
+                            or ""
+                        ),
+                        reliable_historical_target_absent=bool(
+                            normalized_entry_context.get(
+                                "reliable_historical_target_absent"
+                            )
+                        ),
+                    )
+                )
+                if execution_plan.status != PLAN_STATUS_READY:
+                    normalized_entry_context["execution_plan_block"] = (
+                        execution_plan.blocked_code
+                    )
+                    if (
+                        execution_plan.blocked_code
+                        == "NET_PLAN_R_BELOW_MINIMUM"
+                        and execution_plan.net_plan_r is not None
+                    ):
+                        detail = (
+                            "entry reward/risk "
+                            f"{execution_plan.net_plan_r:.4f}R below minimum "
+                            f"{MIN_ENTRY_REWARD_R:.2f}R"
+                        )
+                    else:
+                        detail = (
+                            "execution plan blocked: "
+                            f"{execution_plan.blocked_code}"
+                        )
+                    raise ValueError(
+                        detail
+                    )
+                price = execution_plan.entry_price
+                stop_loss = execution_plan.structure_invalidation_price
+                take_profit_1 = execution_plan.take_profit_1
+                take_profit_2 = execution_plan.take_profit_2
+                plan_target_mode = execution_plan.target_mode
+                normalized_entry_context.update(
+                    {
+                        "plan_target_mode": execution_plan.target_mode,
+                        "execution_plan_formula_version": (
+                            execution_plan.formula_version
+                        ),
+                        "expected_structure_exit_price": (
+                            execution_plan.expected_structure_exit_price
+                        ),
+                        "risk_unit": execution_plan.risk_unit,
+                        "net_plan_r": execution_plan.net_plan_r,
+                        "open_space_reference_price": (
+                            execution_plan.open_space_reference_price
+                        ),
+                        "open_space_capacity_r": (
+                            execution_plan.open_space_capacity_r
+                        ),
+                        "fee_adjusted_breakeven_price": (
+                            execution_plan.fee_adjusted_breakeven_price
+                        ),
+                        "open_space_protection_state": (
+                            PROTECTION_INACTIVE
+                            if execution_plan.target_mode
+                            == PLAN_TARGET_MODE_OPEN_SPACE
+                            else ""
+                        ),
+                    }
+                )
             risk_gate_status = str(
                 normalized_entry_context.get("risk_gate_status") or ""
             )
@@ -1067,17 +1391,13 @@ class PaperTradingEngine:
                             if requested_margin is not None
                             else None
                         ),
+                        plan_target_mode=plan_target_mode,
                     ),
                     self._account_risk_snapshot(self.status()),
                 )
                 fixed_unit_entry = bool(
                     risk_gate_status == PAPER_FIXED_UNIT_RISK_STATUS
-                    and self.settings.execution.paper_trading
-                    and self.settings.risk.paper_fixed_unit_sizing
-                    and normalized_entry_context.get("entry_source")
-                    == "AUTO_STRATEGY"
-                    and normalized_entry_context.get("position_sizing_mode")
-                    == "FIXED_CAPITAL_UNIT"
+                    and fixed_unit_entry_requested
                 )
                 if not final_decision.allowed and not (
                     fixed_unit_entry
@@ -1133,14 +1453,13 @@ class PaperTradingEngine:
             notional = margin_usdt * leverage
             quantity = notional / price
             fee = notional * self.settings.execution.taker_fee_rate
-            self.account.wallet_balance -= fee
-            self.account.fees_paid += fee
             _assert_valid_exit_plan(
                 side_enum,
                 price,
                 stop_loss,
                 take_profit_1,
                 take_profit_2,
+                plan_target_mode=plan_target_mode,
             )
             opened_at = self._now()
             trade_cycle_id = _trade_cycle_id(symbol, opened_at)
@@ -1227,6 +1546,16 @@ class PaperTradingEngine:
                     "entry_reason": _entry_reason_text(reason, entry_reasons),
                     "entry_reasons": list(entry_reasons or ()),
                     "entry_context": normalized_entry_context,
+                    "decision_version_bundle": dict(
+                        normalized_entry_context.get(
+                            "decision_version_bundle"
+                        )
+                        or {}
+                    ),
+                    "market_state_at_entry": str(
+                        normalized_entry_context.get("trend_state")
+                        or "LEGACY_PRE_V4"
+                    ),
                     "entry_position": entry_position,
                     "trade_cycle_id": trade_cycle_id,
                     "primary_setup": str(
@@ -1248,6 +1577,8 @@ class PaperTradingEngine:
                     "stop_execution_mode": (
                         "HTF_CLOSE" if plan4_auto_position else "MARK_PRICE"
                     ),
+                    "position_schema_version": POSITION_SCHEMA_VERSION,
+                    "plan_target_mode": plan_target_mode,
                     "adds": 0,
                     # 兼容旧调用：只有显式携带新版交易计划的自动开仓才启用
                     # 分段止盈/时间止损等 V2 仓位管理，手工开仓与历史仓位继续走旧逻辑。
@@ -1263,10 +1594,18 @@ class PaperTradingEngine:
                     ),
                     "last_mark_price": price,
                 },
+                position_schema_version=POSITION_SCHEMA_VERSION,
+                plan_target_mode=plan_target_mode,
             )
-            self.account.positions[symbol] = position
-            self.account.fills.append(
-                PaperFill(
+            if plan_target_mode == PLAN_TARGET_MODE_OPEN_SPACE:
+                baseline_event_id, _ = _v3_h1_structure_snapshot(
+                    position,
+                    normalized_entry_context,
+                )
+                normalized_entry_context[
+                    "open_space_baseline_h1_structure_event_id"
+                ] = baseline_event_id
+            fill = PaperFill(
                     timestamp=position.opened_at,
                     symbol=symbol,
                     side=side_enum,
@@ -1286,8 +1625,31 @@ class PaperTradingEngine:
                     entry_position=entry_position,
                     **_position_fill_metadata(position),
                 )
-            )
-            self._save_state_unlocked()
+            previous_wallet_balance = self.account.wallet_balance
+            previous_fees_paid = self.account.fees_paid
+            if isinstance(decision_audit_ref, dict):
+                decision_audit_ref["eligible_at_submit"] = True
+                decision_audit_ref["final_fill_price"] = price
+            self.account.positions[symbol] = position
+            self.account.fills.append(fill)
+            self.account.wallet_balance -= fee
+            self.account.fees_paid += fee
+            try:
+                self._save_state_unlocked()
+            except Exception:
+                # A failed atomic commit must not leave a fee, fill, or
+                # position in memory when the caller sees an execution error.
+                self.account.positions.pop(symbol, None)
+                if self.account.fills and self.account.fills[-1] is fill:
+                    self.account.fills.pop()
+                else:
+                    try:
+                        self.account.fills.remove(fill)
+                    except ValueError:
+                        pass
+                self.account.wallet_balance = previous_wallet_balance
+                self.account.fees_paid = previous_fees_paid
+                raise
             return position
 
     async def close_position(self, symbol: str, *, reason: str = "manual close") -> Trade:
@@ -1364,6 +1726,7 @@ class PaperTradingEngine:
         now: datetime,
     ) -> dict[str, object]:
         blocked_codes: list[str] = []
+        advisory_codes: list[str] = []
         if not self.running:
             blocked_codes.append("SERVICE_STOPPED")
         if not self.auto_trade:
@@ -1411,19 +1774,28 @@ class PaperTradingEngine:
                 or cooldown_active
             )
         )
+        account_risk_codes: list[str] = []
         if daily_locked:
-            blocked_codes.append("DAILY_LOSS_LIMIT")
+            account_risk_codes.append("DAILY_LOSS_LIMIT")
         if weekly_locked:
-            blocked_codes.append("WEEKLY_LOSS_LIMIT")
+            account_risk_codes.append("WEEKLY_LOSS_LIMIT")
         if drawdown_locked:
-            blocked_codes.append("MAX_DRAWDOWN")
+            account_risk_codes.append("MAX_DRAWDOWN")
         if cooldown_active:
-            blocked_codes.append("LOSS_COOLDOWN")
+            account_risk_codes.append("LOSS_COOLDOWN")
         elif consecutive_loss_locked:
-            blocked_codes.append("CONSECUTIVE_LOSSES")
+            account_risk_codes.append("CONSECUTIVE_LOSSES")
+        if (
+            self.settings.execution.paper_trading
+            and self.settings.risk.paper_fixed_unit_sizing
+        ):
+            advisory_codes.extend(account_risk_codes)
+        else:
+            blocked_codes.extend(account_risk_codes)
         return {
             "allowed": not blocked_codes,
             "blocked_codes": blocked_codes,
+            "advisory_codes": advisory_codes,
             "daily_loss_locked": daily_locked,
             "weekly_loss_locked": weekly_locked,
             "drawdown_enabled": drawdown_enabled,
@@ -1582,6 +1954,7 @@ class PaperTradingEngine:
             "auto_trade": self.auto_trade,
             "new_entries_allowed": entry_gate["allowed"],
             "new_entry_block_codes": entry_gate["blocked_codes"],
+            "new_entry_advisory_codes": entry_gate["advisory_codes"],
             "symbols": self.symbols,
             "candidate_symbols": self._candidate_symbols,
             "universe_symbols": self._universe_symbols,
@@ -2610,6 +2983,34 @@ class PaperTradingEngine:
                 settings=self.settings,
                 observed_at=self._now(),
             )
+        # PRD v7.5 phase 2: compute the five-state classifier as a shadow
+        # snapshot only.  It is intentionally not wired into action,
+        # allowed direction, setup selection, score, position management, or
+        # any page-facing projection until the documented shadow gates pass.
+        shadow_observed_at = self._now()
+        h1_shadow = classify_market_state_v4(
+            timeframe_candles.get("1h", ()),
+            as_of=shadow_observed_at,
+            previous_snapshot=self._market_state_shadow_snapshots.get(
+                symbol
+            ),
+        )
+        h4_shadow = classify_h4_background_v4(
+            timeframe_candles.get("4h", ()),
+            as_of=shadow_observed_at,
+            previous_background=(
+                self._h4_background_shadow_snapshots.get(symbol)
+                or H4BackgroundV4.CLEAN_NEUTRAL
+            ),
+        )
+        self._market_state_shadow_snapshots[symbol] = h1_shadow
+        self._h4_background_shadow_snapshots[symbol] = h4_shadow
+        published["market_state_shadow_v4"] = (
+            _market_state_shadow_payload(h1_shadow)
+        )
+        published["h4_background_shadow_v4"] = (
+            _h4_background_shadow_payload(h4_shadow)
+        )
         published["market_context"] = self._market_context_for_symbol(
             symbol,
             mtf_context,
@@ -2862,10 +3263,25 @@ class PaperTradingEngine:
             symbol: dict(signal)
             for symbol, signal in baseline_signals.items()
         }
-        for signal in evaluated_signals.values():
+        for symbol, signal in evaluated_signals.items():
+            _clear_execution_stage_signal_fields(signal)
             _clear_transient_auto_entry_blocks(signal)
             _refresh_entry_quality_for_live_price(signal)
             _update_entry_position_fields(signal)
+            previous_decision_id = str(signal.get("decision_id") or "")
+            decision_id = _auto_entry_decision_id(symbol, signal)
+            signal["decision_id"] = decision_id
+            already_attempted = bool(
+                decision_id in self._attempted_auto_decision_ids
+                or (
+                    previous_decision_id == decision_id
+                    and signal.get("auto_open_attempted") is True
+                )
+            )
+            signal["auto_open_attempted"] = already_attempted
+            if not already_attempted:
+                signal["eligible_at_submit"] = False
+                signal["auto_open_succeeded"] = False
         system_risk_state = await self._refresh_runtime_market_context(
             evaluated_signals
         )
@@ -2875,21 +3291,24 @@ class PaperTradingEngine:
         max_positions = max(1, self.settings.risk.max_open_positions)
         candidates: list[tuple[str, dict[str, object]]] = []
         for symbol, signal in evaluated_signals.items():
-            signal.pop("exit_plan_error", None)
-            signal.pop("exit_plan_status", None)
+            _clear_execution_stage_signal_fields(signal)
             _clear_transient_auto_entry_blocks(signal)
             if symbol in self.account.positions:
+                _record_auto_entry_block(
+                    signal,
+                    "资金、仓位与交易限制：同标的已有持仓，本轮不重复开仓",
+                )
                 continue
             if (
                 int(signal.get("score_model_version") or 0) >= 8
                 and int(signal.get("entry_pipeline_version") or 0)
                 < ENTRY_PIPELINE_VERSION
             ):
-                _record_auto_entry_block(
-                    signal,
-                    "entry-zone policy is stale; wait for a closed-candle V5 rescore",
-                )
-                continue
+                # Persisted V5/V4 signal snapshots are deterministically
+                # re-projected through the V7 signal-stage policy.  They are
+                # not silently rejected merely because the process restarted
+                # between a closed-candle refresh and the execution scan.
+                _apply_entry_policy_v4_fields(signal)
             if system_risk_state == "STRESS":
                 reason = (
                     "BTC 4h extreme volatility; pause new altcoin entries"
@@ -2904,21 +3323,22 @@ class PaperTradingEngine:
                 continue
             for reason in _auto_entry_prerequisite_blocks(
                 signal,
-                include_entry_position=False,
+                include_entry_position=(
+                    int(signal.get("entry_pipeline_version") or 0)
+                    < ENTRY_PIPELINE_VERSION
+                ),
                 market_risk_blocks=market_risk_blocks,
             ):
                 _record_auto_entry_block(signal, reason)
             if not market_risk_blocks:
                 for reason in _market_risk_warning_texts(signal):
                     _record_risk_warning(signal, reason)
-            entry_position_block = _auto_entry_position_block(signal)
             if self.running:
                 for reason in self._data_freshness_blocks(symbol, signal):
                     _record_auto_entry_block(signal, reason)
             if (
                 signal.get("vetoes")
                 or signal.get("auto_entry_blocks")
-                or entry_position_block
             ):
                 continue
             candidates.append((symbol, signal))
@@ -2949,12 +3369,34 @@ class PaperTradingEngine:
                 continue
             action = signal.get("action")
             if action not in {SignalAction.ENTRY_LONG.value, SignalAction.ENTRY_SHORT.value}:
+                if not (
+                    signal.get("vetoes")
+                    or signal.get("policy_blocks")
+                    or signal.get("auto_entry_blocks")
+                ):
+                    _record_auto_entry_block(
+                        signal,
+                        "方向、结构与市场环境：当前策略信号尚未形成可执行开仓动作",
+                    )
+                continue
+            decision_id = str(signal.get("decision_id") or "")
+            if decision_id in self._attempted_auto_decision_ids:
+                _record_auto_entry_block(
+                    signal,
+                    (
+                        "auto entry already attempted for current decision: "
+                        f"{decision_id}"
+                    ),
+                )
                 continue
             side = "LONG" if action == SignalAction.ENTRY_LONG.value else "SHORT"
             status = self.status()
             equity = float(status["equity"])
             score = int(signal.get("score") or 0)
             position_policy_score = _position_policy_score(signal)
+            decision_audit_ref: dict[str, object] = {
+                "eligible_at_submit": False,
+            }
             try:
                 indicators = self.latest_indicators.get(symbol, [])
                 precision = self.latest_timeframe_contexts.get(symbol, {}).get("m15_precision", {})
@@ -3007,39 +3449,7 @@ class PaperTradingEngine:
                     ):
                         stop_loss = v8_stop
                         stop_basis = "v8_selected_structure"
-                precision_entry_only = (
-                    entry_timeframe == "15m"
-                    and stop_basis == "volatility_fallback"
-                )
-                if precision_entry_only:
-                    if not _precision_stop_allowed(
-                        side_enum,
-                        trend_state,
-                        str(signal.get("risk_state") or "NORMAL"),
-                        score,
-                        precision,
-                        str(signal.get("smart_money_phase") or ""),
-                    ) or not _m15_precision_stop_distance_ok(
-                        side_enum,
-                        entry_price,
-                        precision,
-                        preferred_indicator,
-                    ):
-                        _record_auto_entry_block(
-                            signal,
-                            "15m tactical entry lacks a valid 15m structure stop or 1h/4h entry zone",
-                        )
-                        continue
-                    refined_stop = _refine_stop_with_precision(
-                        side_enum,
-                        stop_loss,
-                        precision,
-                        entry_price,
-                        preferred_indicator,
-                    )
-                    stop_loss = refined_stop
-                    stop_basis = "15m_precision_structure"
-                elif stop_basis == "volatility_fallback":
+                if stop_basis == "volatility_fallback":
                     structure_stop, structure_basis = _refine_stop_with_setup_structure(
                         side_enum,
                         stop_loss,
@@ -3047,7 +3457,9 @@ class PaperTradingEngine:
                         signal,
                         mtf_context,
                         preferred_indicator,
-                        timeframe=entry_timeframe,
+                        timeframe=(
+                            "1h" if entry_timeframe == "15m" else entry_timeframe
+                        ),
                     )
                     if structure_stop != stop_loss:
                         stop_loss = structure_stop
@@ -3084,79 +3496,146 @@ class PaperTradingEngine:
                     self.settings.execution.taker_fee_rate
                     + self.settings.execution.slippage_rate
                 )
-                structure_reward_r = _entry_reward_r(
+                structure_targets = _structure_targets_for_plan(
                     signal,
                     side_enum,
                     entry_price,
-                    stop_loss,
                     timeframe=entry_timeframe,
-                    round_trip_cost_rate=round_trip_cost_rate,
                 )
-                take_profit_1, take_profit_2 = _take_profits_for_final_stop(
-                    signal,
-                    side_enum,
-                    entry_price,
-                    stop_loss,
-                    timeframe=entry_timeframe,
-                    round_trip_cost_rate=round_trip_cost_rate,
+                execution_market_state = (
+                    "STRONG_UP"
+                    if trend_state == "ONE_WAY_UP"
+                    else "STRONG_DOWN"
+                    if trend_state == "ONE_WAY_DOWN"
+                    else None
                 )
-                if not (
-                    _target_is_profitable(
-                        side_enum,
-                        entry_price,
-                        take_profit_1,
+                open_space_allowed = bool(
+                    (
+                        side_enum == PositionSide.LONG
+                        and execution_market_state == "STRONG_UP"
                     )
-                    and _target_is_profitable(
-                        side_enum,
-                        entry_price,
-                        take_profit_2,
+                    or (
+                        side_enum == PositionSide.SHORT
+                        and execution_market_state == "STRONG_DOWN"
                     )
-                ):
-                    _record_auto_entry_block(
-                        signal,
-                        "entry reward/risk unavailable: no real 1h/4h structure target",
-                    )
-                    continue
-                try:
-                    _assert_valid_exit_plan(
-                        side_enum,
-                        entry_price,
-                        stop_loss,
-                        take_profit_1,
-                        take_profit_2,
-                    )
-                except ExitPlanAssertionError as exc:
-                    signal["exit_plan_status"] = "ERROR"
-                    signal["exit_plan_error"] = str(exc)
-                    self.last_error = f"{symbol} exit plan assertion failed: {exc}"
-                    continue
-                reward_r = _net_plan_reward_r(
-                    side_enum,
-                    entry_price,
-                    stop_loss,
-                    take_profit_1,
-                    take_profit_2,
-                    round_trip_cost_rate=round_trip_cost_rate,
-                    first_fraction=(
-                        self.settings.risk.first_take_profit_fraction
-                    ),
-                    funding_rate=_float_or_none(
-                        signal.get("funding_rate")
-                    ),
                 )
-                signal["net_plan_r"] = reward_r
-                signal["planned_take_profit_1"] = take_profit_1
-                signal["planned_take_profit_2"] = take_profit_2
-                if reward_r < MIN_ENTRY_REWARD_R:
+                if not structure_targets and not open_space_allowed:
                     _record_auto_entry_block(
                         signal,
                         (
-                            "entry reward/risk "
-                            f"{reward_r:.2f}R below minimum "
-                            f"{MIN_ENTRY_REWARD_R:.2f}R; wait for a better price"
+                            "entry reward/risk unavailable: no real 1h/4h "
+                            "structure target"
                         ),
                     )
                     continue
+                plan_target_mode = (
+                    PLAN_TARGET_MODE_BOUNDED_TARGETS
+                    if structure_targets
+                    else PLAN_TARGET_MODE_OPEN_SPACE
+                )
+                if structure_targets:
+                    take_profit_1 = structure_targets[0]
+                    take_profit_2 = (
+                        structure_targets[1]
+                        if len(structure_targets) > 1
+                        else structure_targets[0]
+                    )
+                    target_prices = (take_profit_1, take_profit_2)
+                    target_weights = (
+                        self.settings.risk.first_take_profit_fraction,
+                        1.0
+                        - self.settings.risk.first_take_profit_fraction,
+                    )
+                else:
+                    take_profit_1 = None
+                    take_profit_2 = None
+                    target_prices = ()
+                    target_weights = ()
+                opposing_structure_prices = (
+                    _opposing_structure_prices_for_plan(
+                        signal,
+                        side_enum,
+                        entry_price,
+                    )
+                )
+                h4_plan_indicators = timeframe_indicators.get("4h") or []
+                plan_context = _entry_context_from_signal(signal)
+                disaster_stop, disaster_basis = _v4_disaster_stop_plan(
+                    side_enum,
+                    entry_price,
+                    stop_loss,
+                    plan_context,
+                    initial_leverage,
+                    h4_plan_indicators[-1]
+                    if h4_plan_indicators
+                    else None,
+                )
+                execution_plan = build_execution_plan_v7(
+                    ExecutionPlanV7Input(
+                        side=side_enum,
+                        final_fill_price=entry_price,
+                        structure_invalidation_price=stop_loss,
+                        disaster_stop_price=disaster_stop,
+                        tick_size=_execution_tick_size(entry_price),
+                        fee_rate=self.settings.execution.taker_fee_rate,
+                        slippage_rate=self.settings.execution.slippage_rate,
+                        target_prices=target_prices,
+                        target_weights=target_weights,
+                        opposing_structure_prices=(
+                            opposing_structure_prices
+                        ),
+                        market_state=execution_market_state,
+                        reliable_historical_target_absent=(
+                            not structure_targets
+                        ),
+                    )
+                )
+                signal.update(
+                    {
+                        "execution_plan_formula_version": (
+                            execution_plan.formula_version
+                        ),
+                        "plan_target_mode": execution_plan.target_mode,
+                        "net_plan_r": execution_plan.net_plan_r,
+                        "planned_take_profit_1": (
+                            execution_plan.take_profit_1
+                        ),
+                        "planned_take_profit_2": (
+                            execution_plan.take_profit_2
+                        ),
+                        "open_space_reference_price": (
+                            execution_plan.open_space_reference_price
+                        ),
+                        "open_space_capacity_r": (
+                            execution_plan.open_space_capacity_r
+                        ),
+                        "fee_adjusted_breakeven_price": (
+                            execution_plan.fee_adjusted_breakeven_price
+                        ),
+                        "risk_unit": execution_plan.risk_unit,
+                    }
+                )
+                if execution_plan.status != PLAN_STATUS_READY:
+                    _record_auto_entry_block(
+                        signal,
+                        (
+                            "交易计划："
+                            + str(execution_plan.diagnostic_message or "执行计划审核未通过")
+                            .strip()
+                            .rstrip("。")
+                        ),
+                        reason_code=execution_plan.blocked_code,
+                        reason_category="TRADE_PLAN",
+                        actual_value=execution_plan.net_plan_r,
+                        threshold_value=execution_plan.minimum_net_plan_r,
+                    )
+                    continue
+                entry_price = execution_plan.entry_price
+                stop_loss = execution_plan.structure_invalidation_price
+                take_profit_1 = execution_plan.take_profit_1
+                take_profit_2 = execution_plan.take_profit_2
+                reward_r = float(execution_plan.net_plan_r or 0.0)
+                structure_reward_r = reward_r
                 signal["exit_plan_status"] = "NORMAL"
                 stop_pct = _entry_stop_pct(entry_price, stop_loss)
                 entry_quality = _entry_quality_grade(
@@ -3199,6 +3678,7 @@ class PaperTradingEngine:
                         take_profit_2=take_profit_2,
                         leverage=leverage,
                         adverse_cost_rate=round_trip_cost_rate,
+                        plan_target_mode=plan_target_mode,
                     ),
                     self._account_risk_snapshot(status),
                 )
@@ -3207,6 +3687,19 @@ class PaperTradingEngine:
                     self.settings.execution.paper_trading
                     and self.settings.risk.paper_fixed_unit_sizing
                 )
+                if (
+                    fixed_unit_sizing
+                    and not risk_decision.allowed
+                    and risk_decision.blocked_code
+                    in PAPER_FIXED_UNIT_ADVISORY_RISK_BLOCKS
+                ):
+                    _record_risk_warning(
+                        signal,
+                        (
+                            "模拟盘账户风险仅提示，不阻断策略样本："
+                            f"{risk_decision.blocked_code}"
+                        ),
+                    )
                 if not risk_decision.allowed and not (
                     fixed_unit_sizing
                     and risk_decision.blocked_code
@@ -3217,6 +3710,8 @@ class PaperTradingEngine:
                         risk_decision.reasons[0]
                         if risk_decision.reasons
                         else risk_decision.blocked_code,
+                        reason_code=risk_decision.blocked_code,
+                        reason_category="ACCOUNT_ORDER",
                     )
                     continue
                 if fixed_unit_sizing:
@@ -3310,6 +3805,53 @@ class PaperTradingEngine:
                 entry_context["adverse_cost_rate"] = (
                     round_trip_cost_rate
                 )
+                entry_context["plan_target_mode"] = plan_target_mode
+                entry_context["execution_plan_formula_version"] = (
+                    execution_plan.formula_version
+                )
+                entry_context["tick_size"] = execution_plan.tick_size
+                entry_context["entry_fee_rate"] = (
+                    self.settings.execution.taker_fee_rate
+                )
+                entry_context["execution_slippage_rate"] = (
+                    self.settings.execution.slippage_rate
+                )
+                entry_context["execution_target_weights"] = list(
+                    execution_plan.target_weights
+                )
+                entry_context["opposing_structure_prices"] = list(
+                    opposing_structure_prices
+                )
+                entry_context["execution_market_state"] = (
+                    execution_market_state
+                )
+                entry_context[
+                    "reliable_historical_target_absent"
+                ] = not structure_targets
+                raw_execution_zone = signal.get("primary_entry_zone")
+                entry_context["execution_entry_zone"] = (
+                    dict(raw_execution_zone)
+                    if isinstance(raw_execution_zone, dict)
+                    else {}
+                )
+                entry_context["open_space_reference_price"] = (
+                    execution_plan.open_space_reference_price
+                )
+                entry_context["open_space_capacity_r"] = (
+                    execution_plan.open_space_capacity_r
+                )
+                entry_context["fee_adjusted_breakeven_price"] = (
+                    execution_plan.fee_adjusted_breakeven_price
+                )
+                entry_context["open_space_protection_state"] = (
+                    PROTECTION_INACTIVE
+                    if plan_target_mode == PLAN_TARGET_MODE_OPEN_SPACE
+                    else ""
+                )
+                entry_context["risk_unit"] = execution_plan.risk_unit
+                entry_context["structure_stop_price"] = stop_loss
+                entry_context["disaster_stop_price"] = disaster_stop
+                entry_context["disaster_stop_basis"] = disaster_basis
                 entry_context["capital_unit_margin"] = capital_unit_margin
                 entry_context["capital_units"] = (
                     margin / capital_unit_margin
@@ -3325,15 +3867,6 @@ class PaperTradingEngine:
                     else 2
                 )
                 if int(signal.get("score_model_version") or 0) >= 8:
-                    h4_indicators = timeframe_indicators.get("4h") or []
-                    disaster_stop, disaster_basis = _v4_disaster_stop_plan(
-                        side_enum,
-                        entry_price,
-                        stop_loss,
-                        entry_context,
-                        leverage,
-                        h4_indicators[-1] if h4_indicators else None,
-                    )
                     entry_context.update(
                         {
                             "structure_stop_price": stop_loss,
@@ -3342,7 +3875,45 @@ class PaperTradingEngine:
                             "stop_execution_mode": "HTF_CLOSE",
                         }
                     )
-                await self.open_position(
+                entry_context["decision_id"] = decision_id
+                entry_context["market_state_shadow_at_entry"] = (
+                    dict(signal.get("market_state_shadow_v4") or {})
+                    if isinstance(
+                        signal.get("market_state_shadow_v4"), dict
+                    )
+                    else {}
+                )
+                entry_context["h4_background_shadow_at_entry"] = (
+                    dict(signal.get("h4_background_shadow_v4") or {})
+                    if isinstance(
+                        signal.get("h4_background_shadow_v4"), dict
+                    )
+                    else {}
+                )
+                entry_context["decision_version_bundle"] = {
+                    "score_model_version": int(
+                        signal.get("score_model_version") or 0
+                    ),
+                    "entry_pipeline_version": int(
+                        signal.get("entry_pipeline_version") or 0
+                    ),
+                    "execution_plan_formula_version": (
+                        execution_plan.formula_version
+                    ),
+                    "position_schema_version": (
+                        POSITION_SCHEMA_VERSION_ACTIVE
+                    ),
+                    "decision_reason_schema_version": (
+                        DECISION_REASON_SCHEMA_VERSION
+                    ),
+                    "market_state_authority": "LEGACY_V8",
+                    "market_state_shadow_version": MARKET_STATE_VERSION,
+                    "channel_geometry_shadow_version": (
+                        CHANNEL_GEOMETRY_VERSION
+                    ),
+                }
+                entry_context["_decision_audit_ref"] = decision_audit_ref
+                position = await self.open_position(
                     symbol,
                     side,
                     margin_usdt=margin,
@@ -3354,8 +3925,21 @@ class PaperTradingEngine:
                     entry_reasons=tuple(str(reason) for reason in (signal.get("reasons") or ())),
                     entry_context=entry_context,
                 )
+                if decision_audit_ref.get("eligible_at_submit") is True:
+                    self._attempted_auto_decision_ids.add(decision_id)
+                    signal["eligible_at_submit"] = True
+                    signal["auto_open_attempted"] = True
+                    signal["auto_open_succeeded"] = True
+                    signal["open_attempt_count"] = 1
+                    signal["final_fill_price"] = position.entry_price
                 opened_count += 1
             except Exception as exc:  # noqa: BLE001 - one rejected candidate must not block later candidates
+                if decision_audit_ref.get("eligible_at_submit") is True:
+                    self._attempted_auto_decision_ids.add(decision_id)
+                    signal["eligible_at_submit"] = True
+                    signal["auto_open_attempted"] = True
+                    signal["auto_open_succeeded"] = False
+                    signal["open_attempt_count"] = 1
                 signal["exit_plan_status"] = "ERROR"
                 _record_auto_entry_block(signal, f"auto entry execution failed: {exc}")
         self._commit_auto_entry_signal_snapshot(
@@ -3371,14 +3955,256 @@ class PaperTradingEngine:
         evaluated_signals: dict[str, dict[str, object]],
     ) -> None:
         """Publish one completed auto-entry pass without exposing partial veto states."""
+        audit_changed = False
         for symbol, evaluated in evaluated_signals.items():
             baseline = baseline_signals.get(symbol)
             current = self.latest_signals.get(symbol)
             if baseline is None or current != baseline:
                 continue
             committed = dict(evaluated)
+            if (
+                symbol not in self.account.positions
+                and committed.get("auto_open_attempted") is not True
+                and not (
+                    committed.get("vetoes")
+                    or committed.get("policy_blocks")
+                    or committed.get("auto_entry_blocks")
+                )
+            ):
+                _record_auto_entry_block(
+                    committed,
+                    "方向、结构与市场环境：当前决策未形成可执行开仓动作",
+                )
             self.latest_signals[symbol] = committed
             self.account.latest_signals[symbol] = dict(committed)
+            audit_changed = (
+                self._append_decision_audit_from_signal(
+                    symbol,
+                    committed,
+                )
+                or audit_changed
+            )
+        if audit_changed and self.state_path is not None:
+            self._save_state_unlocked()
+
+    def _append_decision_audit_from_signal(
+        self,
+        symbol: str,
+        signal: dict[str, object],
+    ) -> bool:
+        """Append immutable reason/attempt events for one decision snapshot."""
+
+        decision_id = str(signal.get("decision_id") or "")
+        if not decision_id:
+            return False
+        current_blocks = {
+            *(str(item) for item in signal.get("vetoes") or ()),
+            *(str(item) for item in signal.get("policy_blocks") or ()),
+            *(str(item) for item in signal.get("policy_block_codes") or ()),
+            *(str(item) for item in signal.get("auto_entry_blocks") or ()),
+        }
+        raw_ledger = [
+            dict(item)
+            for item in signal.get("decision_reason_ledger") or ()
+            if isinstance(item, dict)
+        ]
+        current_reason_keys: set[tuple[str, str, str]] = set()
+        changed = False
+        active_by_reason: dict[tuple[str, str, str], dict[str, object]] = {}
+        for item in self.account.decision_audit_log:
+            if (
+                isinstance(item, dict)
+                and str(item.get("decision_id") or "") == decision_id
+                and str(item.get("status") or "") == "ACTIVE"
+            ):
+                active_by_reason[
+                    (
+                        str(item.get("code") or ""),
+                        str(item.get("detail") or ""),
+                        str(item.get("stage") or ""),
+                    )
+                ] = item
+
+        for reason in raw_ledger:
+            code = str(reason.get("code") or "UNCLASSIFIED_REASON")
+            detail = str(reason.get("detail") or code)
+            stage = str(reason.get("stage") or "SIGNAL")
+            category = str(
+                reason.get("category") or "SYSTEM_EXECUTION"
+            )
+            is_blocking = bool(code in current_blocks or detail in current_blocks)
+            reason_key = (code, detail, stage)
+            previous_active = active_by_reason.get(reason_key)
+            status = (
+                "ACTIVE"
+                if is_blocking
+                else "RESOLVED"
+                if previous_active is not None
+                else "OBSERVED"
+            )
+            current_reason_keys.add(reason_key)
+            changed = self._append_decision_audit_event(
+                decision_id=decision_id,
+                symbol=symbol,
+                signal=signal,
+                code=code,
+                category=category,
+                detail=detail,
+                stage=stage,
+                status=status,
+                is_blocking=is_blocking,
+                previous_event_id=(
+                    str(previous_active.get("event_id") or "")
+                    if previous_active is not None and not is_blocking
+                    else ""
+                ),
+                actual_value=reason.get(
+                    "actual_value",
+                    _AUDIT_VALUE_UNSET,
+                ),
+                threshold_value=reason.get(
+                    "threshold_value",
+                    _AUDIT_VALUE_UNSET,
+                ),
+            ) or changed
+
+        for reason_key, previous in active_by_reason.items():
+            if reason_key in current_reason_keys:
+                continue
+            code, detail, stage = reason_key
+            changed = self._append_decision_audit_event(
+                decision_id=decision_id,
+                symbol=symbol,
+                signal=signal,
+                code=code,
+                category=str(
+                    previous.get("category") or "SYSTEM_EXECUTION"
+                ),
+                detail=detail,
+                stage=stage,
+                status="RESOLVED",
+                is_blocking=False,
+                previous_event_id=str(previous.get("event_id") or ""),
+                actual_value=previous.get(
+                    "actual_value",
+                    _AUDIT_VALUE_UNSET,
+                ),
+                threshold_value=previous.get(
+                    "threshold_value",
+                    _AUDIT_VALUE_UNSET,
+                ),
+            ) or changed
+
+        if signal.get("eligible_at_submit") is True:
+            changed = self._append_decision_audit_event(
+                decision_id=decision_id,
+                symbol=symbol,
+                signal=signal,
+                code="ELIGIBLE_AT_SUBMIT",
+                category="ACCOUNT_ORDER",
+                detail="原子提交前全部公开开仓条件已通过",
+                stage="EXECUTION",
+                status="OBSERVED",
+                is_blocking=False,
+            ) or changed
+        if signal.get("auto_open_attempted") is True:
+            succeeded = signal.get("auto_open_succeeded") is True
+            changed = self._append_decision_audit_event(
+                decision_id=decision_id,
+                symbol=symbol,
+                signal=signal,
+                code=(
+                    "AUTO_OPEN_ATTEMPT_SUCCEEDED"
+                    if succeeded
+                    else "AUTO_OPEN_ATTEMPT_FAILED"
+                ),
+                category="SYSTEM_EXECUTION",
+                detail=(
+                    "自动开仓已提交并成功"
+                    if succeeded
+                    else "自动开仓已提交但执行失败"
+                ),
+                stage="EXECUTION",
+                status="OBSERVED",
+                # The attempt outcome is informational.  The concrete order,
+                # persistence or account failure is recorded separately as an
+                # ACTIVE classified root cause.
+                is_blocking=False,
+            ) or changed
+        return changed
+
+    def _append_decision_audit_event(
+        self,
+        *,
+        decision_id: str,
+        symbol: str,
+        signal: dict[str, object],
+        code: str,
+        category: str,
+        detail: str,
+        stage: str,
+        status: str,
+        is_blocking: bool,
+        previous_event_id: str = "",
+        actual_value: object = _AUDIT_VALUE_UNSET,
+        threshold_value: object = _AUDIT_VALUE_UNSET,
+    ) -> bool:
+        key = (decision_id, code, detail, stage, status)
+        if key in self._decision_audit_keys:
+            return False
+        event_seed = "|".join(key)
+        event_id = (
+            "DECISION-EVENT-"
+            + hashlib.sha256(event_seed.encode("utf-8")).hexdigest()[:24]
+        )
+        required_score = _float_or_none(
+            signal.get("policy_score_required")
+        )
+        actual_score = _float_or_none(signal.get("score"))
+        if actual_value is _AUDIT_VALUE_UNSET:
+            actual_value = actual_score
+        if threshold_value is _AUDIT_VALUE_UNSET:
+            threshold_value = required_score
+        event = {
+            "event_id": event_id,
+            "decision_id": decision_id,
+            "symbol": symbol.upper(),
+            "code": code,
+            "category": category,
+            "detail": detail,
+            "stage": stage,
+            "status": status,
+            "is_blocking": is_blocking,
+            "recorded_at": self._now().isoformat(),
+            "decision_as_of": str(
+                signal.get("decision_effective_at")
+                or signal.get("timestamp")
+                or ""
+            ),
+            "setup_id": str(
+                signal.get("setup_id")
+                or signal.get("primary_setup")
+                or signal.get("setup_type")
+                or ""
+            ),
+            "actual_value": actual_value,
+            "threshold_value": threshold_value,
+            "previous_event_id": previous_event_id or None,
+            "version_bundle": {
+                "score_model_version": int(
+                    signal.get("score_model_version") or 0
+                ),
+                "entry_pipeline_version": int(
+                    signal.get("entry_pipeline_version") or 0
+                ),
+                "decision_reason_schema_version": (
+                    DECISION_REASON_SCHEMA_VERSION
+                ),
+            },
+        }
+        self.account.decision_audit_log.append(event)
+        self._decision_audit_keys.add(key)
+        return True
 
     async def _rebalance_for_better_candidate(self, candidates: list[tuple[str, dict[str, object]]]) -> None:
         if not AUTO_ROTATION_ENABLED:
@@ -3806,6 +4632,20 @@ class PaperTradingEngine:
             price,
             signal,
         )
+        if position.plan_target_mode == PLAN_TARGET_MODE_OPEN_SPACE:
+            structure_reason = (
+                _open_space_protected_structure_exit_reason(
+                    position,
+                    self.latest_timeframe_indicators
+                    .get(position.symbol, {})
+                    .get("1h", [])[-1]
+                    if self.latest_timeframe_indicators
+                    .get(position.symbol, {})
+                    .get("1h", [])
+                    else None,
+                )
+                or structure_reason
+            )
         if structure_reason:
             self._close_position_unlocked(
                 position,
@@ -3888,6 +4728,23 @@ class PaperTradingEngine:
             )
             return
 
+        if position.plan_target_mode == PLAN_TARGET_MODE_OPEN_SPACE:
+            h1_indicators = (
+                self.latest_timeframe_indicators
+                .get(position.symbol, {})
+                .get("1h", [])
+            )
+            if _advance_open_space_position_plan(
+                position,
+                signal,
+                h1_indicators[-1] if h1_indicators else None,
+            ):
+                self._save_state_unlocked()
+            # OPEN_SPACE never consumes the legacy TP1/TP2 or mark-price
+            # breakeven paths.  It remains governed by closed 1H/4H
+            # structures and the independent disaster boundary above.
+            return
+
         if (
             position.first_tp_done
             and str(position.metadata.get("position_stage") or "")
@@ -3968,12 +4825,43 @@ class PaperTradingEngine:
             price,
             signal,
         )
+        if position.plan_target_mode == PLAN_TARGET_MODE_OPEN_SPACE:
+            h1_indicators = (
+                self.latest_timeframe_indicators
+                .get(position.symbol, {})
+                .get("1h", [])
+            )
+            structure_reason = (
+                _open_space_protected_structure_exit_reason(
+                    position,
+                    h1_indicators[-1] if h1_indicators else None,
+                )
+                or structure_reason
+            )
         if structure_reason:
             self._close_position_unlocked(
                 position,
                 price,
                 structure_reason,
             )
+            return
+
+        if position.plan_target_mode == PLAN_TARGET_MODE_OPEN_SPACE:
+            h1_indicators = (
+                self.latest_timeframe_indicators
+                .get(position.symbol, {})
+                .get("1h", [])
+            )
+            if _advance_open_space_position_plan(
+                position,
+                signal,
+                h1_indicators[-1] if h1_indicators else None,
+            ):
+                self._save_state_unlocked()
+            # OPEN_SPACE has no TP1/TP2 and never enters the legacy time-stop
+            # or mark-price breakeven branches.  It is managed only by the
+            # entered 1H/4H structure, disaster protection, and later closed
+            # 1H protected swings.
             return
 
         if (
@@ -4137,16 +5025,26 @@ class PaperTradingEngine:
                 if position.side == PositionSide.LONG
                 else min(position.stop_price, candidate_stop)
             )
-            final_tp1 = (
-                max(position.take_profit_1, candidate_tp1)
-                if position.side == PositionSide.LONG
-                else min(position.take_profit_1, candidate_tp1)
-            )
-            final_tp2 = (
-                max(position.take_profit_2, candidate_tp2)
-                if position.side == PositionSide.LONG
-                else min(position.take_profit_2, candidate_tp2)
-            )
+            if position.plan_target_mode == PLAN_TARGET_MODE_OPEN_SPACE:
+                final_tp1 = None
+                final_tp2 = None
+            else:
+                final_tp1 = (
+                    max(position.take_profit_1, candidate_tp1)
+                    if position.side == PositionSide.LONG
+                    and position.take_profit_1 is not None
+                    else min(position.take_profit_1, candidate_tp1)
+                    if position.take_profit_1 is not None
+                    else candidate_tp1
+                )
+                final_tp2 = (
+                    max(position.take_profit_2, candidate_tp2)
+                    if position.side == PositionSide.LONG
+                    and position.take_profit_2 is not None
+                    else min(position.take_profit_2, candidate_tp2)
+                    if position.take_profit_2 is not None
+                    else candidate_tp2
+                )
             decision = self.portfolio_risk.evaluate(
                 TradePlan(
                     symbol=position.symbol,
@@ -4158,6 +5056,7 @@ class PaperTradingEngine:
                     leverage=leverage,
                     is_addition=True,
                     requested_margin_usdt=add_margin,
+                    plan_target_mode=position.plan_target_mode,
                 ),
                 self._account_risk_snapshot(status),
             )
@@ -5041,6 +5940,7 @@ def _entry_context_from_signal(signal: dict[str, object]) -> dict[str, object]:
         "policy_entry_state",
         "policy_score_required",
         "policy_blocks",
+        "policy_block_codes",
         "signal_timeframe",
         "trend_state",
         "regime",
@@ -5110,6 +6010,12 @@ def _entry_context_from_signal(signal: dict[str, object]) -> dict[str, object]:
         "score_model_version",
         "entry_pipeline_version",
         "entry_zone_policy_version",
+        "market_state_authority",
+        "market_state_shadow_version",
+        "channel_geometry_shadow_version",
+        "er12_formula_version",
+        "market_state_shadow_v4",
+        "h4_background_shadow_v4",
         "legacy_score",
         "legacy_action",
         "legacy_vetoes",
@@ -5179,6 +6085,7 @@ def _paper_account_payload(account: PaperAccount) -> dict[str, Any]:
         "daily_pnl_baselines": account.daily_pnl_baselines,
         "pnl_history": account.pnl_history,
         "latest_signals": account.latest_signals,
+        "decision_audit_log": account.decision_audit_log,
         "market_context_state": account.market_context_state,
         "reentry_barriers": account.reentry_barriers,
         "risk_day_key": account.risk_day_key,
@@ -5258,6 +6165,11 @@ def _paper_account_from_payload(raw: dict[str, Any]) -> PaperAccount:
             ).items()
             if isinstance(signal, dict)
         },
+        decision_audit_log=[
+            dict(item)
+            for item in list(raw.get("decision_audit_log") or [])
+            if isinstance(item, dict)
+        ],
         market_context_state=(
             dict(raw.get("market_context_state") or {})
             if isinstance(raw.get("market_context_state"), dict)
@@ -5312,10 +6224,29 @@ def _position_payload(position: Position) -> dict[str, Any]:
         "second_tp_done": position.second_tp_done,
         "bars_held": position.bars_held,
         "metadata": position.metadata,
+        "position_schema_version": position.position_schema_version,
+        "plan_target_mode": position.plan_target_mode,
     }
 
 
 def _position_from_payload(payload: dict[str, Any]) -> Position:
+    metadata = dict(payload.get("metadata") or {})
+    target_mode = str(
+        payload.get("plan_target_mode")
+        or metadata.get("plan_target_mode")
+        or PLAN_TARGET_MODE_LEGACY_BOUNDED_DUAL_TP
+    )
+    schema_version = int(
+        payload.get("position_schema_version")
+        or metadata.get("position_schema_version")
+        or 1
+    )
+    if not isinstance(metadata.get("decision_version_bundle"), dict):
+        metadata["decision_version_bundle"] = {
+            "position_management": "LEGACY_PRE_V4",
+            "position_schema_version": schema_version,
+        }
+    metadata.setdefault("market_state_at_entry", "LEGACY_PRE_V4")
     return Position(
         symbol=str(payload["symbol"]).upper(),
         side=PositionSide(str(payload["side"])),
@@ -5323,13 +6254,15 @@ def _position_from_payload(payload: dict[str, Any]) -> Position:
         quantity=float(payload["quantity"]),
         opened_at=_parse_datetime(payload["opened_at"]),
         stop_price=float(payload["stop_price"]),
-        take_profit_1=float(payload["take_profit_1"]),
-        take_profit_2=float(payload["take_profit_2"]),
+        take_profit_1=_float_or_none(payload.get("take_profit_1")),
+        take_profit_2=_float_or_none(payload.get("take_profit_2")),
         remaining_fraction=float(payload.get("remaining_fraction", 1.0)),
         first_tp_done=bool(payload.get("first_tp_done", False)),
         second_tp_done=bool(payload.get("second_tp_done", False)),
         bars_held=int(payload.get("bars_held", 0)),
-        metadata=dict(payload.get("metadata") or {}),
+        metadata=metadata,
+        position_schema_version=schema_version,
+        plan_target_mode=target_mode,
     )
 
 
@@ -5357,8 +6290,8 @@ def _fill_from_payload(payload: dict[str, Any]) -> PaperFill:
         leverage=int(payload.get("leverage", 1)),
         margin_usdt=float(payload.get("margin_usdt", 0.0)),
         stop_price=float(payload.get("stop_price", 0.0)),
-        take_profit_1=float(payload.get("take_profit_1", 0.0)),
-        take_profit_2=float(payload.get("take_profit_2", 0.0)),
+        take_profit_1=_float_or_none(payload.get("take_profit_1")),
+        take_profit_2=_float_or_none(payload.get("take_profit_2")),
         opened_at=_parse_datetime(payload["opened_at"]),
         entry_position=str(payload.get("entry_position", "")),
         closed_at=_parse_datetime(payload["closed_at"]) if payload.get("closed_at") else None,
@@ -5634,12 +6567,16 @@ def _plan4_profit_protection_stop_hit(
 
 
 def _take_profit_hit(position: Position, price: float) -> bool:
+    if position.take_profit_2 is None:
+        return False
     if position.side == PositionSide.LONG:
         return price >= position.take_profit_2
     return price <= position.take_profit_2
 
 
 def _take_profit_1_hit(position: Position, price: float) -> bool:
+    if position.take_profit_1 is None:
+        return False
     if position.side == PositionSide.LONG:
         return price >= position.take_profit_1
     return price <= position.take_profit_1
@@ -6096,6 +7033,137 @@ def _v3_h1_structure_snapshot(
     return event_id, mapping
 
 
+def _advance_open_space_position_plan(
+    position: Position,
+    signal: dict[str, object],
+    h1_indicator: IndicatorSnapshot | None,
+) -> bool:
+    if h1_indicator is None:
+        return False
+    context = position.metadata.get("entry_context")
+    if not isinstance(context, dict):
+        return False
+    reference = _float_or_none(context.get("open_space_reference_price"))
+    breakeven = _float_or_none(
+        context.get("fee_adjusted_breakeven_price")
+    )
+    if reference is None or breakeven is None:
+        return False
+    closed_at = h1_indicator.timestamp.isoformat()
+    if context.get("open_space_last_h1_closed_at") == closed_at:
+        return False
+
+    event_id, structure = _v3_h1_structure_snapshot(position, signal)
+    previous_event_id = str(
+        context.get("open_space_protected_structure_event_id") or ""
+    )
+    entry_baseline_event_id = str(
+        context.get("open_space_baseline_h1_structure_event_id") or ""
+    )
+    eligibility_baseline_event_id = str(
+        context.get("open_space_eligibility_h1_structure_event_id") or ""
+    )
+    previous_state = str(
+        context.get("open_space_protection_state") or PROTECTION_INACTIVE
+    )
+    eligible_for_new_structure = previous_state in {
+        PROTECTION_ELIGIBLE,
+        "PROTECTION_ACTIVE",
+    }
+    candidate = (
+        _open_space_h1_invalidation_price(position.side, structure)
+        if (
+            eligible_for_new_structure
+            and event_id
+            and event_id
+            not in {
+                previous_event_id,
+                entry_baseline_event_id,
+                eligibility_baseline_event_id,
+            }
+        )
+        else None
+    )
+    previous_price = _float_or_none(
+        context.get("protected_structure_invalidation_price")
+    )
+    decision = advance_open_space_protection(
+        side=position.side,
+        previous_state=previous_state,
+        previous_protected_price=previous_price,
+        closed_h1_price=h1_indicator.close,
+        reference_price=reference,
+        fee_adjusted_breakeven_price=breakeven,
+        confirmed_h1_swing_invalidation_price=candidate,
+        tick_size=float(
+            context.get("tick_size")
+            or _execution_tick_size(position.entry_price)
+        ),
+    )
+    context["open_space_last_h1_closed_at"] = closed_at
+    context["open_space_protection_state"] = decision.state
+    if (
+        previous_state == PROTECTION_INACTIVE
+        and decision.state == PROTECTION_ELIGIBLE
+    ):
+        # The structure visible on the candle that first reaches 1.30R is the
+        # baseline, not a newly formed post-threshold protective swing.
+        context["open_space_eligibility_h1_structure_event_id"] = event_id
+    if decision.protected_structure_invalidation_price is not None:
+        context["protected_structure_invalidation_price"] = (
+            decision.protected_structure_invalidation_price
+        )
+        context["open_space_protected_structure_event_id"] = event_id
+    return (
+        decision.state != previous_state
+        or decision.protected_structure_invalidation_price != previous_price
+        or context.get("open_space_last_h1_closed_at") == closed_at
+    )
+
+
+def _open_space_h1_invalidation_price(
+    side: PositionSide,
+    structure: dict[str, object],
+) -> float | None:
+    keys = (
+        ("support_zone_low", "swing_low", "support")
+        if side == PositionSide.LONG
+        else ("resistance_zone_high", "swing_high", "resistance", "rejection_high")
+    )
+    values = [
+        value
+        for key in keys
+        if (value := _float_or_none(structure.get(key))) is not None
+    ]
+    if not values:
+        return None
+    return min(values) if side == PositionSide.LONG else max(values)
+
+
+def _open_space_protected_structure_exit_reason(
+    position: Position,
+    h1_indicator: IndicatorSnapshot | None,
+) -> str | None:
+    if h1_indicator is None:
+        return None
+    context = position.metadata.get("entry_context")
+    if not isinstance(context, dict):
+        return None
+    protected = _float_or_none(
+        context.get("protected_structure_invalidation_price")
+    )
+    if protected is None:
+        return None
+    failed = (
+        h1_indicator.close < protected
+        if position.side == PositionSide.LONG
+        else h1_indicator.close > protected
+    )
+    if not failed:
+        return None
+    return "take profit: 1小时保护结构失效"
+
+
 def _v3_runner_can_continue(
     position: Position,
     signal: dict[str, object],
@@ -6148,7 +7216,7 @@ def _activate_plan3_runner_stop(
         else {}
     )
     buffer = (
-        indicator.atr14 * 0.35
+        indicator.atr14 * 0.40
         if indicator is not None and indicator.atr14
         else position.entry_price * 0.003
     )
@@ -7456,6 +8524,33 @@ def _structure_targets_for_plan(
     return ordered
 
 
+def _opposing_structure_prices_for_plan(
+    signal: dict[str, object],
+    side: PositionSide,
+    price: float,
+) -> tuple[float, ...]:
+    """Freeze every known 1H/4H obstacle for final OPEN_SPACE review.
+
+    This deliberately reuses the same structure facts as bounded targets.  It
+    does not infer a synthetic barrier from ATR, EMA spacing or a desired R.
+    """
+
+    candidates = [
+        *_timeframe_target_candidates(signal, side, price, "1h"),
+        *_timeframe_target_candidates(signal, side, price, "4h"),
+    ]
+    return tuple(
+        sorted(
+            {
+                float(value)
+                for value in candidates
+                if _target_is_profitable(side, price, value)
+            },
+            reverse=side == PositionSide.SHORT,
+        )
+    )
+
+
 def _weighted_target_distance(
     side: PositionSide,
     entry_price: float,
@@ -7729,7 +8824,15 @@ def _auto_entry_status_signal(
     return payload
 
 
-def _record_auto_entry_block(signal: dict[str, object], reason: str) -> None:
+def _record_auto_entry_block(
+    signal: dict[str, object],
+    reason: str,
+    *,
+    reason_code: str = "",
+    reason_category: str = "",
+    actual_value: object = _AUDIT_VALUE_UNSET,
+    threshold_value: object = _AUDIT_VALUE_UNSET,
+) -> None:
     # Pipeline 4 keeps diagnostic/runtime blocks separate from strategy vetoes.
     # Feeding a policy block back into ``vetoes`` would make the next policy
     # evaluation reinterpret its own previous diagnosis as an ACTIVE_VETO.
@@ -7738,10 +8841,389 @@ def _record_auto_entry_block(signal: dict[str, object], reason: str) -> None:
         if int(signal.get("entry_pipeline_version") or 0) >= 4
         else "vetoes"
     )
+    raw_reason = str(reason).strip()
+    visible_reason = _visible_auto_entry_block(raw_reason)
     blocks = list(signal.get(key) or ())
-    if reason not in blocks:
-        blocks.append(reason)
+    if visible_reason not in blocks:
+        blocks.append(visible_reason)
     signal[key] = tuple(blocks)
+    signal["decision_reason_schema_version"] = (
+        DECISION_REASON_SCHEMA_VERSION
+    )
+    ledger = [
+        dict(item)
+        for item in signal.get("decision_reason_ledger") or ()
+        if isinstance(item, dict)
+    ]
+    # Policy reasons already exist in the classified signal ledger.  Do not
+    # append a second generic runtime reason merely because the same Chinese
+    # projection is copied into auto_entry_blocks for the existing UI.
+    if any(str(item.get("detail") or "") == visible_reason for item in ledger):
+        signal["decision_reason_ledger"] = tuple(ledger)
+        return
+    code, category = (
+        (str(reason_code), str(reason_category or "SYSTEM_EXECUTION"))
+        if reason_code
+        else _canonical_auto_block(raw_reason)
+    )
+    entry = {
+        "code": code,
+        "category": category,
+        "detail": visible_reason,
+        "stage": (
+            "EXECUTION"
+            if category in {"TRADE_PLAN", "ACCOUNT_ORDER", "SYSTEM_EXECUTION"}
+            else "SIGNAL"
+        ),
+    }
+    if actual_value is not _AUDIT_VALUE_UNSET:
+        entry["actual_value"] = actual_value
+    if threshold_value is not _AUDIT_VALUE_UNSET:
+        entry["threshold_value"] = threshold_value
+    if not any(
+        item.get("code") == code and item.get("detail") == visible_reason
+        for item in ledger
+    ):
+        ledger.append(entry)
+    signal["decision_reason_ledger"] = tuple(ledger)
+
+
+def _canonical_auto_block(reason: str) -> tuple[str, str]:
+    text = str(reason).strip()
+    upper = text.upper()
+    embedded_plan_code = re.search(
+        r"(?:执行计划未通过：|execution plan blocked:\s*)([A-Z][A-Z0-9_]+)",
+        text,
+    )
+    if embedded_plan_code:
+        return embedded_plan_code.group(1), "TRADE_PLAN"
+    for prefix in (
+        "auto entry execution failed:",
+        "risk gate blocked entry at execution:",
+        "risk gate blocked entry:",
+    ):
+        if text.lower().startswith(prefix):
+            nested = text[len(prefix) :].strip()
+            nested_code, nested_category = _canonical_auto_block(nested)
+            if nested_code != "SYSTEM_OR_EXECUTION_BLOCKED":
+                return nested_code, nested_category
+            return (
+                (
+                    "AUTO_ENTRY_EXECUTION_FAILED",
+                    "SYSTEM_EXECUTION",
+                )
+                if prefix.startswith("auto entry")
+                else ("ACCOUNT_RISK_GATE_BLOCKED", "ACCOUNT_ORDER")
+            )
+    exact_account_codes = {
+        "daily loss limit reached": "DAILY_LOSS_LIMIT",
+        "weekly loss limit reached": "WEEKLY_LOSS_LIMIT",
+        "maximum drawdown circuit breaker active": "MAX_DRAWDOWN",
+        "consecutive-loss cooldown active": "LOSS_COOLDOWN",
+        "consecutive loss limit reached": "CONSECUTIVE_LOSSES",
+        "symbol already has an open position": "SYMBOL_ALREADY_OPEN",
+        "max open positions reached": "MAX_POSITIONS",
+        "requested margin must be positive": "MARGIN_LIMIT",
+        "portfolio open-risk limit reached": "OPEN_RISK_LIMIT",
+        "margin limits leave no tradable size": "MARGIN_LIMIT",
+    }
+    if text.lower() in exact_account_codes:
+        return exact_account_codes[text.lower()], "ACCOUNT_ORDER"
+    if "ALREADY HAS AN OPEN PAPER POSITION" in upper:
+        return "SYMBOL_ALREADY_OPEN", "ACCOUNT_ORDER"
+    if (
+        "INSUFFICIENT PAPER BALANCE" in upper
+        or "ENTRY MARGIN BELOW" in upper
+        or "MARGIN_USDT MUST BE POSITIVE" in upper
+    ):
+        return "MARGIN_LIMIT", "ACCOUNT_ORDER"
+    if "POSITION CAPACITY FULL" in upper:
+        return "MAX_POSITIONS", "ACCOUNT_ORDER"
+    if (
+        "UNSUPPORTED PLAN TARGET MODE" in upper
+        or "INVALID STOP LOSS" in upper
+        or "OPEN-SPACE PLAN" in upper
+        or "TAKE PROFIT" in upper
+    ):
+        return "INVALID_TRADE_PLAN", "TRADE_PLAN"
+    if "EXECUTION PRICE RESOLVER" in upper:
+        return "EXECUTION_PRICE_INVALID", "SYSTEM_EXECUTION"
+    classified_chinese_prefixes = (
+        ("标的资格与行情数据：", "MARKET_DATA_BLOCKED", "MARKET_DATA"),
+        ("方向、结构与市场环境：", "DIRECTION_OR_STRUCTURE_BLOCKED", "DIRECTION_STRUCTURE"),
+        ("评分与入场：", "SCORE_OR_ENTRY_BLOCKED", "SCORE_ENTRY"),
+        ("交易计划：", "EXECUTION_PLAN_BLOCKED", "TRADE_PLAN"),
+        ("资金、仓位与交易限制：", "ACCOUNT_OR_MARGIN_BLOCKED", "ACCOUNT_ORDER"),
+        ("系统与下单：", "SYSTEM_OR_EXECUTION_BLOCKED", "SYSTEM_EXECUTION"),
+    )
+    for prefix, code, category in classified_chinese_prefixes:
+        if text.startswith(prefix):
+            return code, category
+    stable_prefixes = (
+        "CANDIDATE_",
+        "PRICE_DATA_",
+        "H4_DIRECTION_",
+        "SEMANTIC_STRUCTURE_",
+        "SETUP_",
+        "AUTHORIZED_ENTRY_",
+        "CURRENT_PRICE_",
+        "TOTAL_SCORE_",
+        "RESEARCH_SCORE_",
+    )
+    if upper.startswith(stable_prefixes):
+        code = upper.split(":", 1)[0]
+        category = (
+            "MARKET_DATA"
+            if code.startswith("PRICE_DATA_")
+            else "SCORE_ENTRY"
+            if code.startswith(
+                (
+                    "AUTHORIZED_ENTRY_",
+                    "CURRENT_PRICE_",
+                    "TOTAL_SCORE_",
+                    "RESEARCH_SCORE_",
+                )
+            )
+            else "DIRECTION_STRUCTURE"
+        )
+        return code, category
+    if "POSITION CAPACITY" in upper:
+        return "POSITION_CAPACITY_FULL", "ACCOUNT_ORDER"
+    if "CAPITAL UNIT CAPACITY" in upper:
+        return "CAPITAL_UNIT_CAPACITY_FULL", "ACCOUNT_ORDER"
+    if "MARGIN" in upper or "BALANCE" in upper or "MINIMUM 5" in upper:
+        return "ACCOUNT_OR_MARGIN_BLOCKED", "ACCOUNT_ORDER"
+    if "STALE" in upper or "K-LINE" in upper or "DATA" in upper:
+        return "MARKET_DATA_BLOCKED", "MARKET_DATA"
+    if "EXECUTION PLAN" in upper or "REWARD/RISK" in upper or "STOP" in upper:
+        return "EXECUTION_PLAN_BLOCKED", "TRADE_PLAN"
+    if "DIRECTION" in upper or "STRUCTURE" in upper or "SETUP" in upper:
+        return "DIRECTION_OR_STRUCTURE_BLOCKED", "DIRECTION_STRUCTURE"
+    if "SCORE" in upper or "ENTRY POSITION" in upper or "建议区" in text:
+        return "SCORE_OR_ENTRY_BLOCKED", "SCORE_ENTRY"
+    if "UNIVERSE" in upper or "POOL" in upper:
+        return "UNIVERSE_BLOCKED", "UNIVERSE"
+    return "SYSTEM_OR_EXECUTION_BLOCKED", "SYSTEM_EXECUTION"
+
+
+def _visible_auto_entry_block(reason: str) -> str:
+    """Project runtime blockers into the unchanged UI as Chinese root causes."""
+
+    text = str(reason or "").strip()
+    if not text:
+        return "系统与下单：自动开仓审核返回空原因"
+    embedded_plan_code = re.search(
+        r"(?:执行计划未通过：|execution plan blocked:\s*)([A-Z][A-Z0-9_]+)",
+        text,
+    )
+    if embedded_plan_code:
+        code = embedded_plan_code.group(1)
+        plan_messages = {
+            "PLAN_INPUT_NOT_FINITE": "执行计划输入包含非有限数值",
+            "PLAN_INPUT_OUT_OF_RANGE": "执行计划输入超出有效价格范围",
+            "TARGET_NOT_FINITE": "目标价格包含非有限数值",
+            "OPPOSING_STRUCTURE_NOT_FINITE": "对手结构价格包含非有限数值",
+            "BOUNDED_TARGET_COUNT_INVALID": "有界目标计划没有形成两个目标",
+            "TARGET_WEIGHT_COUNT_INVALID": "目标权重数量与目标数量不一致",
+            "TARGET_WEIGHTS_INVALID": "目标权重无效",
+            "TARGET_DIRECTION_INVALID": "目标价格方向与候选交易方向不一致",
+            "TARGET_ORDER_INVALID": "目标未按最近对手结构到更远结构排序",
+            "INVALID_STOP_GEOMETRY": "结构失效价或灾难保护价的方向关系无效",
+            "INVALID_RISK_UNIT": "预计风险单位无效",
+            "NET_PLAN_R_BELOW_MINIMUM": "执行时预计净计划R低于最低要求",
+            "OPEN_SPACE_STRONG_TREND_REQUIRED": "开放空间计划缺少方向一致的强单边行情",
+            "OPEN_SPACE_DIRECTION_MISMATCH": "开放空间方向与候选交易方向不一致",
+            "OPEN_SPACE_TARGET_ABSENCE_UNCONFIRMED": "尚未确认历史数据中不存在可靠对手目标",
+            "OPEN_SPACE_REFERENCE_INVALID": "无法生成开放空间最低计划R参考价",
+            "OPEN_SPACE_OPPOSING_STRUCTURE_BEFORE_1_30R": "最低计划R参考价之前存在已知对手结构",
+            "FINAL_PRICE_OUTSIDE_ENTRY_ZONE": "最终模拟成交价已经离开授权建议区",
+            "DISASTER_STOP_UNAVAILABLE": "远端灾难保护价无法生成",
+        }
+        return f"交易计划：{plan_messages.get(code, '执行计划输入或结构关系无效')}"
+    auto_failure_prefix = "auto entry execution failed:"
+    if text.lower().startswith(auto_failure_prefix):
+        nested = text[len(auto_failure_prefix) :].strip()
+        nested_visible = _visible_auto_entry_block(nested)
+        classified_prefixes = (
+            "标的资格与行情数据：",
+            "方向、结构与市场环境：",
+            "评分与入场：",
+            "交易计划：",
+            "资金、仓位与交易限制：",
+            "系统与下单：",
+        )
+        if nested_visible.startswith(classified_prefixes) and "未分类" not in nested_visible:
+            return nested_visible
+        if re.search(r"[\u3400-\u9fff]", nested_visible):
+            return f"系统与下单：自动开仓执行失败（{nested_visible}）"
+        return "系统与下单：自动开仓执行失败，具体原因已写入决策流水"
+    for risk_prefix in (
+        "risk gate blocked entry at execution:",
+        "risk gate blocked entry:",
+    ):
+        if text.lower().startswith(risk_prefix):
+            return _visible_auto_entry_block(
+                text[len(risk_prefix) :].strip()
+            )
+    token_labels = {
+        "STRONG_UP": "强单边上涨",
+        "STRONG_DOWN": "强单边下跌",
+        "ONE_WAY_UP": "强单边上涨",
+        "ONE_WAY_DOWN": "强单边下跌",
+        "LONG": "多头",
+        "SHORT": "空头",
+    }
+    for token, label in token_labels.items():
+        text = re.sub(
+            rf"(?<![A-Z0-9_]){token}(?![A-Z0-9_])",
+            label,
+            text,
+        )
+    if re.search(r"[\u3400-\u9fff]", text):
+        return text
+
+    exact = {
+        "directional entry signal not established": (
+            "方向、结构与市场环境：候选多空方向尚未建立"
+        ),
+        "entry lacks a valid structure stop": (
+            "交易计划：无法由1小时或4小时结构生成有效失效价"
+        ),
+        "entry reward/risk target unavailable": (
+            "交易计划：最近对手结构目标或开放空间条件无法验证"
+        ),
+        "symbol already has an open position": (
+            "资金、仓位与交易限制：同标的已有持仓"
+        ),
+        "max open positions reached": (
+            "资金、仓位与交易限制：总持仓容量已满"
+        ),
+        "requested margin must be positive": (
+            "资金、仓位与交易限制：固定资本单位必须大于0"
+        ),
+        "portfolio open-risk limit reached": (
+            "资金、仓位与交易限制：已达到明确启用的组合风险上限"
+        ),
+        "margin limits leave no tradable size": (
+            "资金、仓位与交易限制：余额或保证金不足以形成可交易数量"
+        ),
+        "daily loss limit reached": (
+            "资金、仓位与交易限制：已达到明确启用的当日亏损上限"
+        ),
+        "weekly loss limit reached": (
+            "资金、仓位与交易限制：已达到明确启用的本周亏损上限"
+        ),
+        "maximum drawdown circuit breaker active": (
+            "资金、仓位与交易限制：已触发明确启用的最大回撤限制"
+        ),
+        "consecutive-loss cooldown active": (
+            "资金、仓位与交易限制：已触发明确启用的连续亏损冷却"
+        ),
+        "consecutive loss limit reached": (
+            "资金、仓位与交易限制：已达到明确启用的连续亏损上限"
+        ),
+        "auto strategy disabled; new entries are paused": (
+            "系统与下单：自动策略已关闭，新开仓暂停"
+        ),
+        "latest price is stale for more than 15 seconds": (
+            "标的资格与行情数据：最新价格超过15秒未更新"
+        ),
+        "OI/long-short ratio data is stale for more than 180 seconds": (
+            "标的资格与行情数据：OI或多空比超过180秒未更新"
+        ),
+        "BTC 4h extreme volatility; pause new altcoin entries": (
+            "方向、结构与市场环境：比特币4小时处于极端波动状态"
+        ),
+    }
+    if text in exact:
+        return exact[text]
+    if re.match(r"^[A-Z0-9]+ already has an open paper position$", text):
+        return "资金、仓位与交易限制：同标的已有持仓"
+    if text.startswith("insufficient paper balance:"):
+        return "资金、仓位与交易限制：模拟账户可用余额不足"
+    if text == "margin_usdt must be positive":
+        return "资金、仓位与交易限制：固定资本单位必须大于0"
+    if text == "position capacity full at atomic submission":
+        return "资金、仓位与交易限制：原子提交时持仓容量已满"
+    if text.startswith("current risk capacity leaves entry margin below"):
+        return "资金、仓位与交易限制：最终风险容量不足以形成最小开仓单位"
+    if text.startswith("unsupported plan target mode"):
+        return "交易计划：目标模式不受支持"
+    if (
+        text.startswith("invalid stop loss:")
+        or text.startswith("open-space plan ")
+        or text.startswith("take profit ")
+    ):
+        return "交易计划：止损、止盈或目标顺序关系无效"
+    if text == "execution price resolver returned an invalid price":
+        return "系统与下单：最终模拟成交价无效"
+    if text.endswith(" derivatives data is incomplete"):
+        return (
+            "标的资格与行情数据：该标的衍生品数据不完整，"
+            "相关证据记0分但不阻断价格策略"
+        )
+    match = re.match(r"^(15m|1h|4h|1d) K-line context is missing or discontinuous$", text)
+    if match:
+        return f"标的资格与行情数据：{match.group(1)}闭合K线缺失或不连续"
+    match = re.match(r"^(15m|1h|4h|1d) K-line context is stale$", text)
+    if match:
+        return f"标的资格与行情数据：{match.group(1)}闭合K线已过期"
+    match = re.match(r"^position capacity full: ([0-9]+) open positions$", text)
+    if match:
+        return f"资金、仓位与交易限制：持仓容量已满（上限{match.group(1)}个）"
+    if text.startswith("capital unit capacity full"):
+        return "资金、仓位与交易限制：固定资本单位已全部占用"
+    if text.startswith("available entry margin "):
+        return "资金、仓位与交易限制：可用保证金不足"
+    if text.startswith("auto entry already attempted for current decision:"):
+        return "系统与下单：当前决策已提交过开仓尝试，禁止重复提交"
+    if text.startswith("entry reward/risk unavailable:"):
+        return (
+            "交易计划：未找到最近1小时或4小时对手结构，"
+            "且不满足强单边开放空间计划"
+        )
+    match = re.match(
+        r"^entry reward/risk ([0-9.+-]+)R below minimum ([0-9.+-]+)R$",
+        text,
+    )
+    if match:
+        return (
+            f"交易计划：执行时预计净计划R为{match.group(1)}R，"
+            f"低于最低{match.group(2)}R"
+        )
+    if text.startswith("execution plan blocked:"):
+        return "交易计划：结构、目标、费用或开放空间审核未通过"
+    if text.startswith("final score "):
+        values = re.search(
+            r"final score ([0-9]+) below (?:auto-entry minimum|required entry policy score) ([0-9]+)",
+            text,
+        )
+        if values:
+            return (
+                f"评分与入场：当前总分{values.group(1)}，"
+                f"低于本通道要求{values.group(2)}"
+            )
+        return "评分与入场：当前总分未达到适用通道要求"
+    if text.startswith("current entry position is not excellent:"):
+        return "评分与入场：当前价格尚未进入任何授权建议区"
+    if text.startswith("waiting for new "):
+        timeframe = text.split(" ", 3)[3].split(" ", 1)[0]
+        return f"方向、结构与市场环境：完整平仓后等待新的{timeframe}闭合结构事件"
+    if text.startswith("invalid entry stop") or text.startswith("invalid stop"):
+        return "交易计划：结构失效价的价格关系无效"
+    if text.startswith("entry stop distance too wide"):
+        return "交易计划：结构失效距离过宽，当前固定资本单位无法执行"
+    if text.startswith("auto entry execution failed:"):
+        return "系统与下单：自动开仓执行失败，账户状态未发生副作用"
+    if text.startswith("rotation skipped:"):
+        return "资金、仓位与交易限制：轮动后仍无足够保证金容量"
+    if text.startswith("liquidity state "):
+        return "标的资格与行情数据：流动性状态不满足新开仓要求"
+    if text.startswith("system risk state "):
+        return "方向、结构与市场环境：系统性市场风险状态阻断新开仓"
+    if text.startswith("entry state "):
+        return "方向、结构与市场环境：当前入场状态尚未完成"
+    return "系统与下单：自动开仓前置审核返回未分类异常，已写入决策流水"
 
 
 def _market_risk_warning_texts(
@@ -7774,10 +9256,61 @@ def _record_risk_warning(
     signal: dict[str, object],
     reason: str,
 ) -> None:
+    reason = _visible_risk_warning(reason)
     warnings = list(signal.get("risk_warnings") or ())
     if reason not in warnings:
         warnings.append(reason)
     signal["risk_warnings"] = tuple(warnings)
+
+
+def _visible_risk_warning(reason: str) -> str:
+    text = str(reason or "").strip()
+    advisory_prefix = "模拟盘账户风险仅提示，不阻断策略样本："
+    if text.startswith(advisory_prefix):
+        code = text[len(advisory_prefix) :].strip()
+        labels = {
+            "DAILY_LOSS_LIMIT": "当日亏损达到观察线",
+            "WEEKLY_LOSS_LIMIT": "本周亏损达到观察线",
+            "MAX_DRAWDOWN": "最大回撤达到观察线",
+            "LOSS_COOLDOWN": "连续亏损冷却处于观察状态",
+            "CONSECUTIVE_LOSSES": "连续亏损次数达到观察线",
+            "OPEN_RISK_LIMIT": "组合风险达到观察线",
+            "MARGIN_LIMIT": "保证金使用达到观察线",
+        }
+        return f"模拟盘账户风险仅提示，不阻断策略样本：{labels.get(code, '账户风险观察')}"
+    exact = {
+        "extreme volatility observed; paper entry remains eligible": (
+            "极端波动观察（模拟盘仅提示，不阻断）"
+        ),
+        "liquidity state THIN; paper entry remains eligible": (
+            "流动性偏薄（模拟盘仅提示，不阻断）"
+        ),
+        "system risk state STRESS; paper entry remains eligible": (
+            "系统性市场风险承压（模拟盘仅提示，不阻断）"
+        ),
+        "BTC 4h extreme volatility; pause new altcoin entries": (
+            "比特币4小时极端波动（模拟盘仅提示，不阻断）"
+        ),
+        "4h OI drained and volume is weak; keep the long eligible with reduced leverage and margin": (
+            "4小时OI去杠杆且量能偏弱（模拟盘仅提示，不阻断）"
+        ),
+        "high pullback has OI/funding/crowd risk; keep the long eligible with reduced leverage and margin": (
+            "高位回踩伴随OI、资金费率或拥挤观察（模拟盘仅提示，不阻断）"
+        ),
+        "low pullback has OI/funding/crowd risk; keep the short eligible with reduced leverage and margin": (
+            "低位反抽伴随OI、资金费率或拥挤观察（模拟盘仅提示，不阻断）"
+        ),
+        "4h OI dropped while long/short ratio rose; retail longs are carrying the decline, so leverage and margin are reduced": (
+            "4小时OI下降但多空比上升，散户多头承接下跌（模拟盘仅提示，不阻断）"
+        ),
+    }
+    if text in exact:
+        return exact[text]
+    if text.endswith(" derivatives data is incomplete"):
+        return "该标的衍生品数据不完整，相关证据记0分且不阻断价格策略"
+    if re.search(r"[\u3400-\u9fff]", text):
+        return text
+    return "市场或账户风险观察已记录（模拟盘仅提示，不阻断）"
 
 
 def _score_before_entry_quality(signal: dict[str, object]) -> int:
@@ -8176,6 +9709,11 @@ def _update_trade_plan_fields(signal: dict[str, object]) -> None:
         if int(signal.get("score_model_version") or 0) >= 8
         else 2
     )
+    signal_stage_v7 = bool(
+        int(signal.get("entry_pipeline_version") or 0)
+        >= ENTRY_PIPELINE_VERSION
+        and not signal.get("exit_plan_status")
+    )
     plan = {
         "plan_version": plan_version,
         "side": side.value,
@@ -8188,18 +9726,28 @@ def _update_trade_plan_fields(signal: dict[str, object]) -> None:
             signal.get("primary_entry_zone") or {}
         ),
         "entry_trigger": str(signal.get("entry_trigger") or ""),
-        "invalidation_price": _float_or_none(
-            signal.get("preview_structure_stop")
+        "invalidation_price": (
+            None
+            if signal_stage_v7
+            else _float_or_none(signal.get("preview_structure_stop"))
         ),
-        "target_1": _float_or_none(
-            signal.get("planned_take_profit_1")
+        "target_1": (
+            None
+            if signal_stage_v7
+            else _float_or_none(signal.get("planned_take_profit_1"))
         ),
-        "target_2": _float_or_none(
-            signal.get("planned_take_profit_2")
+        "target_2": (
+            None
+            if signal_stage_v7
+            else _float_or_none(signal.get("planned_take_profit_2"))
         ),
-        "net_plan_r": _float_or_none(
-            signal.get("net_plan_r")
-            or signal.get("effective_risk_reward")
+        "net_plan_r": (
+            None
+            if signal_stage_v7
+            else _float_or_none(
+                signal.get("net_plan_r")
+                or signal.get("effective_risk_reward")
+            )
         ),
         "entry_state": str(signal.get("entry_state") or ""),
         "valid_until": valid_until,
@@ -8243,6 +9791,12 @@ _TRANSIENT_AUTO_ENTRY_BLOCK_PREFIXES = (
     "4h K-line context",
     "waiting for new ",
     "衍生品数据不完整",
+    "标的资格与行情数据：",
+    "方向、结构与市场环境：",
+    "评分与入场：",
+    "交易计划：",
+    "资金、仓位与交易限制：",
+    "系统与下单：",
 )
 
 
@@ -8256,7 +9810,42 @@ _AUTO_ENTRY_EVALUATION_RESULT_PREFIXES = (
     "entry stop distance too wide",
     "entry reward/risk ",
     "auto entry execution failed",
+    "交易计划：",
+    "资金、仓位与交易限制：",
+    "系统与下单：",
 )
+
+
+def _clear_execution_stage_signal_fields(
+    signal: dict[str, object],
+) -> None:
+    """Restore a persisted signal to the strategy-signal stage.
+
+    Exact stop/target/R values are produced only for one automatic execution
+    attempt.  Keeping them on the next scan would make an old plan look like a
+    current signal-stage fact and could also leak a stale denial into the UI.
+    """
+
+    for key in _EXECUTION_STAGE_SIGNAL_FIELDS:
+        signal.pop(key, None)
+    trade_plan = signal.get("trade_plan")
+    if isinstance(trade_plan, dict):
+        refreshed = dict(trade_plan)
+        refreshed.update(
+            {
+                "invalidation_price": None,
+                # V7 trade plans use these names.  Keep the older aliases
+                # empty as well so persisted pre-V7 snapshots cannot leak an
+                # executable plan back into the signal stage.
+                "target_1": None,
+                "target_2": None,
+                "net_plan_r": None,
+                "take_profit_1": None,
+                "take_profit_2": None,
+                "effective_risk_reward": None,
+            }
+        )
+        signal["trade_plan"] = refreshed
 
 
 def _clear_transient_auto_entry_blocks(
@@ -8291,6 +9880,21 @@ def _clear_transient_auto_entry_blocks(
         )
     ]
     signal["auto_entry_blocks"] = tuple(auto_blocks)
+    active_details = {
+        *(str(reason) for reason in signal.get("vetoes") or ()),
+        *(str(reason) for reason in signal.get("auto_entry_blocks") or ()),
+        *(str(reason) for reason in signal.get("policy_blocks") or ()),
+        *(str(reason) for reason in signal.get("policy_block_codes") or ()),
+    }
+    signal["decision_reason_ledger"] = tuple(
+        dict(item)
+        for item in signal.get("decision_reason_ledger") or ()
+        if isinstance(item, dict)
+        and (
+            str(item.get("detail") or "") in active_details
+            or str(item.get("code") or "") in active_details
+        )
+    )
 
 
 def _entry_stop_error(side: PositionSide, entry_price: float, stop_price: float) -> str | None:
@@ -8311,17 +9915,28 @@ def _exit_plan_error(
     side: PositionSide,
     entry_price: float,
     stop_price: float,
-    take_profit_1: float,
-    take_profit_2: float,
+    take_profit_1: float | None,
+    take_profit_2: float | None,
+    *,
+    plan_target_mode: str = PLAN_TARGET_MODE_LEGACY_BOUNDED_DUAL_TP,
 ) -> str | None:
     stop_error = _entry_stop_error(side, entry_price, stop_price)
     if stop_error:
         return f"invalid stop loss: {stop_error}"
+    if plan_target_mode == PLAN_TARGET_MODE_OPEN_SPACE:
+        if take_profit_1 is not None or take_profit_2 is not None:
+            return "open-space plan must not contain fixed take-profit prices"
+        return None
+    if plan_target_mode not in {
+        PLAN_TARGET_MODE_BOUNDED_TARGETS,
+        PLAN_TARGET_MODE_LEGACY_BOUNDED_DUAL_TP,
+    }:
+        return "unsupported plan target mode"
     for label, target in (
         ("take profit 1", take_profit_1),
         ("take profit 2", take_profit_2),
     ):
-        if not math.isfinite(target) or target <= 0:
+        if target is None or not math.isfinite(target) or target <= 0:
             return f"{label} is not positive and finite"
         if not _target_is_profitable(side, entry_price, target):
             direction = "above" if side == PositionSide.LONG else "below"
@@ -8337,8 +9952,10 @@ def _assert_valid_exit_plan(
     side: PositionSide,
     entry_price: float,
     stop_price: float,
-    take_profit_1: float,
-    take_profit_2: float,
+    take_profit_1: float | None,
+    take_profit_2: float | None,
+    *,
+    plan_target_mode: str = PLAN_TARGET_MODE_LEGACY_BOUNDED_DUAL_TP,
 ) -> None:
     error = _exit_plan_error(
         side,
@@ -8346,6 +9963,7 @@ def _assert_valid_exit_plan(
         stop_price,
         take_profit_1,
         take_profit_2,
+        plan_target_mode=plan_target_mode,
     )
     if error:
         raise ExitPlanAssertionError(error)
@@ -11377,7 +12995,7 @@ def _four_hour_oi_valley_long_setup(
         and bool(valley.get("price_recovered_after_valley"))
         and ema60_reclaimed
     )
-    stop_buffer = max(current_atr * 0.35, floor_price * 0.003)
+    stop_buffer = max(current_atr * 0.40, floor_price * 0.003)
     return {
         "state": "CONFIRMED" if confirmed else "WATCH",
         "bottom_absorption": bottom_absorption,
@@ -13330,10 +14948,23 @@ def _apply_score_model_v8(
         else None
     )
     score_result = selected_result or display_result
-    out["prd_version"] = "5.0"
+    out["prd_version"] = "7.5"
     out["score_model_version"] = SCORE_MODEL_VERSION
     out["entry_pipeline_version"] = ENTRY_PIPELINE_VERSION
-    out["entry_zone_policy_version"] = 5
+    out["entry_zone_policy_version"] = 7
+    # V4 is deliberately shadow-only until the PRD release sample gates pass;
+    # do not claim that the live V8 route consumed it as its authority.
+    out["market_state_authority"] = "LEGACY_V8"
+    out["market_state_shadow_version"] = MARKET_STATE_VERSION
+    out["channel_geometry_shadow_version"] = CHANNEL_GEOMETRY_VERSION
+    out["er12_formula_version"] = ER12_FORMULA_VERSION
+    out["execution_plan_formula_version"] = (
+        EXECUTION_PLAN_FORMULA_VERSION
+    )
+    out["position_schema_version"] = POSITION_SCHEMA_VERSION_ACTIVE
+    out["decision_reason_schema_version"] = (
+        DECISION_REASON_SCHEMA_VERSION
+    )
     out["candidate_action"] = candidate_action
     out["direction"] = selected_side.value if selected_side else "NONE"
     out["direction_decision"] = (
@@ -13493,6 +15124,7 @@ def _apply_score_model_v8(
         out.update(_empty_entry_quality_v8())
     _apply_entry_policy_v4_fields(out)
     _update_entry_position_fields(out)
+    _clear_execution_stage_signal_fields(out)
     return out
 
 
@@ -13592,6 +15224,9 @@ def _empty_entry_quality_v8() -> dict[str, object]:
 
 
 def _apply_entry_policy_v4_fields(signal: dict[str, object]) -> None:
+    if int(signal.get("score_model_version") or 0) >= SCORE_MODEL_VERSION:
+        _apply_entry_policy_v7_fields(signal)
+        return
     breakdown = (
         signal.get("score_breakdown")
         if isinstance(signal.get("score_breakdown"), dict)
@@ -13670,6 +15305,369 @@ def _apply_entry_policy_v4_fields(signal: dict[str, object]) -> None:
     )
 
 
+def _apply_entry_policy_v7_fields(signal: dict[str, object]) -> None:
+    confidence = (
+        signal.get("data_confidence")
+        if isinstance(signal.get("data_confidence"), dict)
+        else {}
+    )
+    candidate_action = str(
+        signal.get("candidate_action")
+        or signal.get("decision_action")
+        or signal.get("action")
+        or ""
+    )
+    side = _candidate_entry_side(
+        {**signal, "candidate_action": candidate_action}
+    )
+    price = _float_or_none(signal.get("price"))
+    selected_zone = (
+        signal.get("selected_level_zone")
+        if isinstance(signal.get("selected_level_zone"), dict)
+        else {}
+    )
+    _, fallback_zone = _primary_entry_zone(signal, side)
+    authorized_zone = (
+        dict(selected_zone) if selected_zone else dict(fallback_zone)
+    )
+    authorized_zone_exists = bool(
+        authorized_zone and _entry_level_has_values(authorized_zone)
+    )
+    price_inside_zone = bool(
+        price is not None
+        and authorized_zone_exists
+        and _entry_level_hit(price, authorized_zone)
+    )
+    h1_structure = (
+        signal.get("h1_structure")
+        if isinstance(signal.get("h1_structure"), dict)
+        else {}
+    )
+    h4_structure = (
+        signal.get("h4_structure")
+        if isinstance(signal.get("h4_structure"), dict)
+        else {}
+    )
+    semantic_structure_exists = bool(
+        signal.get("semantic_structure_exists")
+        or signal.get("selected_level_structural")
+        or h1_structure
+        or h4_structure
+        or signal.get("primary_setup")
+        or signal.get("setup_type")
+    )
+    setup_valid_value = signal.get("setup_valid")
+    setup_valid = bool(
+        semantic_structure_exists
+        and setup_valid_value is not False
+        and str(signal.get("setup_lifecycle_state") or "VALID").upper()
+        not in {"INVALID", "EXPIRED", "STALE"}
+    )
+    direction_state = str(
+        signal.get("direction_confirmation_state") or ""
+    ).upper()
+    h4_direction = str(
+        signal.get("h4_direction")
+        or (
+            h4_structure.get("direction")
+            if isinstance(h4_structure, dict)
+            else ""
+        )
+        or ""
+    ).upper()
+    direction_gate = str(signal.get("direction_gate") or "").upper()
+    h4_direction_mismatch = bool(
+        side is not None
+        and (
+            (
+                side == PositionSide.LONG
+                and (
+                    h4_direction in {"SHORT", "DOWN", "BEARISH"}
+                    or direction_gate == "SHORT_ONLY"
+                )
+            )
+            or (
+                side == PositionSide.SHORT
+                and (
+                    h4_direction in {"LONG", "UP", "BULLISH"}
+                    or direction_gate == "LONG_ONLY"
+                )
+            )
+        )
+    )
+    h4_opposed = bool(
+        signal.get("h4_direction_opposed")
+        or h4_direction_mismatch
+        or direction_state
+        in {
+            "OPPOSED",
+            "OPPOSITE",
+            "REVERSED",
+            "H4_OPPOSED",
+            "H4_OPPOSITE",
+            "H4_REVERSED",
+        }
+        or "H4_DIRECTION_OPPOSED"
+        in {
+            str(reason).split(":", 1)[0]
+            for reason in (
+                *(signal.get("policy_blocks") or ()),
+                *(signal.get("policy_block_codes") or ()),
+                *(signal.get("vetoes") or ()),
+            )
+        }
+    )
+    entry_route = _entry_policy_v7_route(signal, side)
+    decision = decide_entry_policy_v7(
+        EntryPolicyV7Input(
+            total_score=int(
+                signal.get("setup_score")
+                or signal.get("score")
+                or 0
+            ),
+            candidate_action=candidate_action,
+            entry_route=entry_route,
+            data_confidence=EntryDataConfidenceV7(
+                price_data_contiguous=bool(
+                    confidence.get("price_data_contiguous", True)
+                ),
+                price_data_fresh=bool(
+                    confidence.get("price_data_fresh", True)
+                ),
+                derivatives_data_complete=bool(
+                    confidence.get("derivatives_data_complete", True)
+                ),
+            ),
+            semantic_structure_exists=semantic_structure_exists,
+            setup_valid=setup_valid,
+            authorized_entry_zone_exists=authorized_zone_exists,
+            current_price_inside_zone=price_inside_zone,
+            h4_direction_opposed=h4_opposed,
+        )
+    )
+    legacy_vetoes = tuple(str(item) for item in signal.get("vetoes") or ())
+    visible_policy_blocks = tuple(
+        _entry_policy_v7_reason_text(
+            reason.code,
+            decision=decision,
+        )
+        for reason in decision.reasons
+    )
+    policy_reason_ledger = tuple(
+        {
+            "code": reason.code,
+            "category": reason.category,
+            "strategy_hard_veto": reason.strategy_hard_veto,
+            "detail": _entry_policy_v7_reason_text(
+                reason.code,
+                decision=decision,
+            ),
+            **_entry_policy_v7_reason_values(
+                reason.code,
+                signal=signal,
+                decision=decision,
+                candidate_action=candidate_action,
+                entry_route=entry_route,
+                authorized_zone_exists=authorized_zone_exists,
+                price_inside_zone=price_inside_zone,
+                semantic_structure_exists=semantic_structure_exists,
+                setup_valid=setup_valid,
+                h4_opposed=h4_opposed,
+            ),
+        }
+        for reason in decision.reasons
+    )
+    signal.update(
+        {
+            "entry_pipeline_version": ENTRY_PIPELINE_VERSION,
+            "entry_route": entry_route,
+            "decision_action": decision.decision_action,
+            "entry_mode": decision.entry_mode,
+            "policy_entry_state": decision.entry_state,
+            "entry_state": decision.entry_state,
+            "policy_score_required": decision.required_score,
+            # Existing UI keeps consuming ``policy_blocks``.  Project Chinese
+            # classified root causes here while retaining stable machine codes
+            # separately for replay, audit and compatibility consumers.
+            "policy_blocks": visible_policy_blocks,
+            "policy_block_codes": decision.blocks,
+            "policy_reason_ledger": policy_reason_ledger,
+            "decision_reason_schema_version": (
+                DECISION_REASON_SCHEMA_VERSION
+            ),
+            "decision_reason_ledger": tuple(
+                {**item, "stage": "SIGNAL"}
+                for item in policy_reason_ledger
+            ),
+            "policy_diagnostics": decision.diagnostics,
+            "preliminary_eligible": decision.preliminary_eligible,
+            "location_status_v7": decision.location_status,
+            "legacy_signal_vetoes": legacy_vetoes,
+            # V7 has exactly one strategy hard veto, represented by the
+            # classified policy ledger.  Historical RSI/crowding/subscore
+            # veto strings remain auditable but cannot become a second hidden
+            # gate through this legacy field.
+            "vetoes": (),
+        }
+    )
+    signal["action"] = (
+        SignalAction.NO_TRADE.value
+        if (
+            decision.decision_action == SignalAction.WATCH.value
+            and bool(candidate_action)
+            and int(signal.get("score") or 0) < AUTO_MAIN_POOL_MIN_SCORE
+        )
+        else decision.decision_action
+    )
+
+
+def _entry_policy_v7_reason_text(
+    code: str,
+    *,
+    decision: object,
+) -> str:
+    """Return the existing veto-column projection without English codes."""
+
+    messages = {
+        "CANDIDATE_ACTION_NOT_ESTABLISHED": (
+            "方向、结构与市场环境：候选多空方向尚未建立"
+        ),
+        "CANDIDATE_ROUTE_NOT_ESTABLISHED": (
+            "方向、结构与市场环境：候选方向尚未匹配可执行行情通道"
+        ),
+        "PRICE_DATA_DISCONTINUOUS": (
+            "标的资格与行情数据：必需价格K线不连续"
+        ),
+        "PRICE_DATA_STALE": "标的资格与行情数据：价格数据已过期",
+        "H4_DIRECTION_OPPOSED": (
+            "方向、结构与市场环境：已闭合4小时方向与候选方向明确相反"
+        ),
+        "SEMANTIC_STRUCTURE_UNAVAILABLE": (
+            "方向、结构与市场环境：可靠价格结构尚未成立"
+        ),
+        "SETUP_INVALID": (
+            "评分与入场：所选结构事件已失效或已被新结构取代"
+        ),
+        "AUTHORIZED_ENTRY_ZONE_UNAVAILABLE": (
+            "评分与入场：当前没有已授权的建议入场区"
+        ),
+        "CURRENT_PRICE_OUTSIDE_AUTHORIZED_ZONE": (
+            "评分与入场：当前价格尚未进入任何授权建议区"
+        ),
+        "TOTAL_SCORE_INVALID": "评分与入场：当前总分数据无效",
+    }
+    if code == "RESEARCH_SCORE_BELOW_MINIMUM":
+        actual = int(getattr(decision, "effective_score", 0) or 0)
+        required = int(getattr(decision, "required_score", 0) or 0)
+        return (
+            f"评分与入场：当前总分{actual}，低于可执行研究通道要求"
+            f"{required}"
+        )
+    return messages.get(code, f"系统与下单：未识别的决策原因（{code}）")
+
+
+def _entry_policy_v7_reason_values(
+    code: str,
+    *,
+    signal: dict[str, object],
+    decision: object,
+    candidate_action: str,
+    entry_route: str,
+    authorized_zone_exists: bool,
+    price_inside_zone: bool,
+    semantic_structure_exists: bool,
+    setup_valid: bool,
+    h4_opposed: bool,
+) -> dict[str, object]:
+    """Attach replayable actual/required values to every signal reason."""
+
+    if code == "CANDIDATE_ACTION_NOT_ESTABLISHED":
+        return {
+            "actual_value": candidate_action or None,
+            "threshold_value": "ENTRY_LONG_OR_ENTRY_SHORT",
+        }
+    if code == "CANDIDATE_ROUTE_NOT_ESTABLISHED":
+        return {
+            "actual_value": entry_route or None,
+            "threshold_value": "AUTHORIZED_ENTRY_ROUTE",
+        }
+    if code == "PRICE_DATA_DISCONTINUOUS":
+        return {"actual_value": False, "threshold_value": True}
+    if code == "PRICE_DATA_STALE":
+        return {"actual_value": False, "threshold_value": True}
+    if code == "H4_DIRECTION_OPPOSED":
+        return {
+            "actual_value": bool(h4_opposed),
+            "threshold_value": False,
+        }
+    if code == "SEMANTIC_STRUCTURE_UNAVAILABLE":
+        return {
+            "actual_value": bool(semantic_structure_exists),
+            "threshold_value": True,
+        }
+    if code == "SETUP_INVALID":
+        return {"actual_value": bool(setup_valid), "threshold_value": True}
+    if code == "AUTHORIZED_ENTRY_ZONE_UNAVAILABLE":
+        return {
+            "actual_value": bool(authorized_zone_exists),
+            "threshold_value": True,
+        }
+    if code == "CURRENT_PRICE_OUTSIDE_AUTHORIZED_ZONE":
+        return {
+            "actual_value": bool(price_inside_zone),
+            "threshold_value": True,
+        }
+    if code in {"TOTAL_SCORE_INVALID", "RESEARCH_SCORE_BELOW_MINIMUM"}:
+        return {
+            "actual_value": getattr(decision, "effective_score", None),
+            "threshold_value": getattr(decision, "required_score", None),
+        }
+    return {
+        "actual_value": signal.get("score"),
+        "threshold_value": signal.get("policy_score_required"),
+    }
+
+
+def _entry_policy_v7_route(
+    signal: dict[str, object],
+    side: PositionSide | None,
+) -> str:
+    setup = str(
+        signal.get("primary_setup") or signal.get("setup_type") or ""
+    ).upper()
+    if setup.startswith("M15_EARLY_STRUCTURE_"):
+        return ENTRY_ROUTE_M15_EARLY_RESEARCH
+    direction_state = str(
+        signal.get("direction_confirmation_state") or ""
+    ).upper()
+    if direction_state in {
+        "TEMPORARY_CONFIRMED",
+        "PROVISIONAL_CONFIRMED",
+        "TREND_STARTUP_CONFIRMED",
+        "H4_NEUTRAL_TEMPORARY",
+        "H4_NEUTRAL_TEMP_CONFIRMED",
+        "H4_NEUTRAL_TEMPORARY_CONFIRMED",
+    }:
+        return ENTRY_ROUTE_H4_CLEAN_NEUTRAL
+    h4_direction = str(
+        signal.get("h4_direction")
+        or (
+            signal.get("h4_structure", {}).get("direction")
+            if isinstance(signal.get("h4_structure"), dict)
+            else ""
+        )
+        or ""
+    ).upper()
+    if h4_direction in {"", "NEUTRAL", "CLEAN_NEUTRAL", "RANGE"}:
+        return ENTRY_ROUTE_H4_CLEAN_NEUTRAL
+    if side is not None and (
+        (side == PositionSide.LONG and h4_direction in {"LONG", "UP"})
+        or (side == PositionSide.SHORT and h4_direction in {"SHORT", "DOWN"})
+    ):
+        return ENTRY_ROUTE_H4_ALIGNED
+    return ENTRY_ROUTE_H4_ALIGNED
+
+
 def _refresh_score_model_v8_for_live_price(
     signal: dict[str, object],
 ) -> None:
@@ -13684,6 +15682,7 @@ def _refresh_score_model_v8_for_live_price(
     if side is None or price is None or not selected_key or not selected_zone:
         _apply_entry_policy_v4_fields(signal)
         _update_entry_position_fields(signal)
+        _clear_execution_stage_signal_fields(signal)
         return
     location = location_for_selected_level_v8(
         price=price,
@@ -13740,6 +15739,7 @@ def _refresh_score_model_v8_for_live_price(
         )
     _apply_entry_policy_v4_fields(signal)
     _update_entry_position_fields(signal)
+    _clear_execution_stage_signal_fields(signal)
 
 
 def _rsi_entry_adjustment(
@@ -14276,7 +16276,7 @@ def _refine_stop_with_distribution_stage(
         return stop
     minimum_distance = max(
         entry_price * 0.003,
-        (indicator.atr14 * 0.35)
+        (indicator.atr14 * 0.40)
         if indicator is not None and indicator.atr14
         else 0.0,
     )
@@ -14323,7 +16323,7 @@ def _refine_stop_with_keltner(
 ) -> float:
     if indicator is None or indicator.atr14 is None or indicator.atr14 <= 0 or indicator.kc_mid is None:
         return stop
-    buffer = indicator.atr14 * 0.35
+    buffer = indicator.atr14 * 0.40
     if side == PositionSide.LONG:
         candidates: list[float] = []
         if indicator.kc_lower is not None and indicator.kc_lower < entry:
@@ -14422,7 +16422,9 @@ def _retest_structure_stop_relevant(
 
 
 def _structure_stop_buffer(entry: float, indicator: IndicatorSnapshot | None) -> float:
-    atr_buffer = indicator.atr14 * 0.35 if indicator is not None and indicator.atr14 else 0.0
+    # 0.15ATR is a boundary-touch tolerance only.  Executable 1H/4H
+    # structural invalidation keeps the wider 0.40ATR body-close buffer.
+    atr_buffer = indicator.atr14 * 0.40 if indicator is not None and indicator.atr14 else 0.0
     return max(entry * 0.003, atr_buffer)
 
 
@@ -14798,8 +16800,223 @@ def _indicator_atr_pct(indicator: IndicatorSnapshot | None) -> float:
     return indicator.atr14 / indicator.close
 
 
+def _market_state_shadow_payload(
+    snapshot: MarketStateSnapshotV4,
+) -> dict[str, object]:
+    """Persist a JSON-safe shadow snapshot without changing live routing."""
+
+    return {
+        "market_state_version": snapshot.market_state_version,
+        "channel_geometry_version": snapshot.channel_geometry_version,
+        "state": snapshot.state.value if snapshot.state is not None else None,
+        "data_status": snapshot.data_status.value,
+        "as_of": snapshot.as_of.isoformat(),
+        "data_cutoff": (
+            snapshot.data_cutoff.isoformat()
+            if snapshot.data_cutoff is not None
+            else None
+        ),
+        "direction": (
+            snapshot.direction.value
+            if snapshot.direction is not None
+            else None
+        ),
+        "channel_shape": (
+            snapshot.channel_shape.value
+            if snapshot.channel_shape is not None
+            else None
+        ),
+        "channel_id": snapshot.channel_id,
+        "range_id": snapshot.range_id,
+        "range_tradeable": snapshot.range_tradeable,
+        "range_position": snapshot.range_position.value,
+        "entry_permission": snapshot.entry_permission,
+        "direction_conflict": snapshot.direction_conflict,
+        "structure_ids": tuple(snapshot.structure_ids),
+        "primary_rail": _rail_shadow_payload(snapshot.primary_rail),
+        "paired_rail": _rail_shadow_payload(snapshot.paired_rail),
+        "frozen_range": _range_shadow_payload(snapshot.frozen_range),
+        "reasons": tuple(snapshot.reasons),
+    }
+
+
+def _auto_entry_decision_id(
+    symbol: str,
+    signal: dict[str, object],
+) -> str:
+    """Return a replay-stable identity for one closed-candle decision."""
+
+    selected_zone = (
+        signal.get("selected_level_zone")
+        if isinstance(signal.get("selected_level_zone"), dict)
+        else signal.get("primary_entry_zone")
+        if isinstance(signal.get("primary_entry_zone"), dict)
+        else {}
+    )
+    payload = {
+        "symbol": symbol.upper(),
+        "timestamp": str(signal.get("timestamp") or ""),
+        "decision_effective_at": str(
+            signal.get("decision_effective_at") or ""
+        ),
+        "candidate_action": str(
+            signal.get("candidate_action")
+            or signal.get("decision_action")
+            or signal.get("action")
+            or ""
+        ),
+        "score_model_version": int(
+            signal.get("score_model_version") or 0
+        ),
+        "entry_pipeline_version": int(
+            signal.get("entry_pipeline_version") or 0
+        ),
+        "setup": str(
+            signal.get("primary_setup")
+            or signal.get("setup_type")
+            or ""
+        ),
+        "level_key": str(
+            signal.get("selected_level_key")
+            or signal.get("primary_entry_zone_key")
+            or ""
+        ),
+        "zone_low": _float_or_none(selected_zone.get("low")),
+        "zone_high": _float_or_none(selected_zone.get("high")),
+        "zone_price": _float_or_none(selected_zone.get("price")),
+    }
+    digest = hashlib.sha256(
+        json.dumps(
+            payload,
+            sort_keys=True,
+            ensure_ascii=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()[:24]
+    return f"AUTO-{digest}"
+
+
+def _h4_background_shadow_payload(
+    snapshot: H4BackgroundSnapshotV4,
+) -> dict[str, object]:
+    return {
+        "market_state_version": snapshot.market_state_version,
+        "channel_geometry_version": snapshot.channel_geometry_version,
+        "background": (
+            snapshot.background.value
+            if snapshot.background is not None
+            else None
+        ),
+        "data_status": snapshot.data_status.value,
+        "as_of": snapshot.as_of.isoformat(),
+        "data_cutoff": (
+            snapshot.data_cutoff.isoformat()
+            if snapshot.data_cutoff is not None
+            else None
+        ),
+        "bullish_structure_ids": tuple(snapshot.bullish_structure_ids),
+        "bearish_structure_ids": tuple(snapshot.bearish_structure_ids),
+        "source": snapshot.source,
+        "reasons": tuple(snapshot.reasons),
+    }
+
+
+def _rail_shadow_payload(rail: object | None) -> dict[str, object] | None:
+    if rail is None:
+        return None
+    direction = getattr(rail, "direction", None)
+    confirmation_time = getattr(rail, "confirmation_time", None)
+    return {
+        "structure_id": str(getattr(rail, "structure_id", "")),
+        "direction": (
+            direction.value if hasattr(direction, "value") else str(direction)
+        ),
+        "side": str(getattr(rail, "side", "")),
+        "anchor_ids": tuple(getattr(rail, "anchor_ids", ())),
+        "confirmation_time": (
+            confirmation_time.isoformat()
+            if isinstance(confirmation_time, datetime)
+            else None
+        ),
+        "validation_count": int(getattr(rail, "validation_count", 0)),
+        "span_bars": int(getattr(rail, "span_bars", 0)),
+        "slope_per_bar": float(getattr(rail, "slope_per_bar", 0.0)),
+        "current_boundary": float(
+            getattr(rail, "current_boundary", 0.0)
+        ),
+        "touch_buffer": float(getattr(rail, "touch_buffer", 0.0)),
+        "invalidation_buffer": float(
+            getattr(rail, "invalidation_buffer", 0.0)
+        ),
+        "entry_side_valid": bool(
+            getattr(rail, "entry_side_valid", False)
+        ),
+    }
+
+
+def _range_shadow_payload(
+    frozen_range: object | None,
+) -> dict[str, object] | None:
+    if frozen_range is None:
+        return None
+    position = getattr(frozen_range, "position", None)
+    confirmation_time = getattr(frozen_range, "confirmation_time", None)
+    return {
+        "structure_id": str(
+            getattr(frozen_range, "structure_id", "")
+        ),
+        "lower": float(getattr(frozen_range, "lower", 0.0)),
+        "upper": float(getattr(frozen_range, "upper", 0.0)),
+        "support_anchor_ids": tuple(
+            getattr(frozen_range, "support_anchor_ids", ())
+        ),
+        "resistance_anchor_ids": tuple(
+            getattr(frozen_range, "resistance_anchor_ids", ())
+        ),
+        "confirmation_time": (
+            confirmation_time.isoformat()
+            if isinstance(confirmation_time, datetime)
+            else None
+        ),
+        "validation_count": int(
+            getattr(frozen_range, "validation_count", 0)
+        ),
+        "span_bars": int(getattr(frozen_range, "span_bars", 0)),
+        "position": (
+            position.value if hasattr(position, "value") else str(position)
+        ),
+    }
+
+
 def _entry_signal_timeframe(configured_interval: str) -> str:
-    return configured_interval if configured_interval in {"1h", "4h"} else "1h"
+    # entry_pipeline_version=7 has one decision clock: 4H background, 1H
+    # market state and 15m execution.  The configured interval remains a
+    # display/manual-query preference and must not silently select a second
+    # automatic strategy.
+    del configured_interval
+    return "1h"
+
+
+def _execution_tick_size(price: float) -> float:
+    """Deterministic simulation tick when exchange filters are unavailable.
+
+    Public market snapshots in this project do not currently persist symbol
+    filters.  This scale-aware fallback is versioned by the execution plan and
+    is applied identically in live simulation and historical replay.
+    """
+
+    value = abs(float(price))
+    if value >= 10_000:
+        return 1.0
+    if value >= 1_000:
+        return 0.1
+    if value >= 100:
+        return 0.01
+    if value >= 1:
+        return 0.0001
+    if value >= 0.01:
+        return 0.000001
+    return 0.00000001
 
 
 def _bars_for_4h(interval: str) -> int:

@@ -1382,7 +1382,7 @@ def test_stale_price_is_recorded_as_auto_entry_veto_and_clears_after_refresh() -
 
     asyncio.run(engine._auto_trade_once())
 
-    stale_reason = "latest price is stale for more than 15 seconds"
+    stale_reason = "标的资格与行情数据：最新价格超过15秒未更新"
     assert symbol not in engine.account.positions
     assert stale_reason in engine.latest_signals[symbol]["vetoes"]
     assert stale_reason in engine.status()["latest_signals"][symbol]["vetoes"]
@@ -1422,7 +1422,7 @@ def test_status_surfaces_stale_derivatives_vetoes_when_auto_trade_is_off() -> No
 
     vetoes = engine.status()["latest_signals"]["TESTUSDT"]["vetoes"]
 
-    assert "OI/long-short ratio data is stale for more than 180 seconds" in vetoes
+    assert "标的资格与行情数据：OI或多空比超过180秒未更新" in vetoes
     assert "current funding rate data is stale for more than 15 minutes" not in vetoes
 
 
@@ -2242,7 +2242,7 @@ def test_risk_exit_management_waits_until_position_reaches_one_r() -> None:
     assert not _position_profit_management_enabled(position, 99.0)
 
 
-def test_auto_top80_universe_refreshes_symbols_in_turnover_order() -> None:
+def test_auto_top80_evaluation_universe_keeps_top50_decision_pool() -> None:
     engine = PaperTradingEngine(AppSettings(), starting_balance=1000, market_data=FakeMarketData())
     engine.latest_signals["STALEUSDT"] = {"score": 99}
     engine.account.latest_signals["STALEUSDT"] = {"score": 99}
@@ -2252,8 +2252,9 @@ def test_auto_top80_universe_refreshes_symbols_in_turnover_order() -> None:
     assert engine.symbols == ["AUTO_TOP50"]
     asyncio.run(engine.refresh_universe_if_needed())
 
-    assert len(engine.symbols) == 80
-    assert len(engine._candidate_symbols) == 0
+    assert len(engine._universe_symbols) == 80
+    assert len(engine.symbols) == 50
+    assert len(engine._candidate_symbols) == 30
     assert "BTCUSDT" not in engine.symbols
     assert "ETHUSDT" not in engine.symbols
     assert "SOLUSDT" not in engine.symbols
@@ -2957,7 +2958,7 @@ def test_ma_cluster_uses_strongest_location_evidence_only() -> None:
     assert not vetoes
 
 
-def test_auto_main_pool_never_exceeds_80_and_excludes_score_54() -> None:
+def test_auto_main_pool_never_exceeds_50_and_excludes_score_54() -> None:
     engine = PaperTradingEngine(
         AppSettings(),
         starting_balance=1000,
@@ -2977,10 +2978,13 @@ def test_auto_main_pool_never_exceeds_80_and_excludes_score_54() -> None:
 
     engine._rebalance_auto_signal_pools()
 
-    assert len(engine.symbols) == 79
+    assert len(engine.symbols) == 50
     assert engine.symbols[0] == "TEST1USDT"
-    assert engine.symbols[-1] == "TEST79USDT"
-    assert engine._candidate_symbols == ["TEST0USDT"]
+    assert engine.symbols[-1] == "TEST50USDT"
+    assert engine._candidate_symbols == [
+        "TEST0USDT",
+        *[f"TEST{index}USDT" for index in range(51, 80)],
+    ]
     assert set(engine.symbols).isdisjoint(engine._candidate_symbols)
 
 
@@ -3469,7 +3473,7 @@ def test_status_exposes_strategy_switch_without_mutating_live_signal() -> None:
 
     status_signal = engine.status()["latest_signals"]["TESTUSDT"]
 
-    assert "auto strategy disabled; new entries are paused" in status_signal["vetoes"]
+    assert "系统与下单：自动策略已关闭，新开仓暂停" in status_signal["vetoes"]
     assert not engine.latest_signals["TESTUSDT"].get("vetoes")
 
 
@@ -6021,10 +6025,10 @@ def test_short_squeeze_long_keeps_the_15m_tactical_exception() -> None:
     )
 
 
-def test_strategy_signal_timeframe_is_limited_to_1h_or_4h() -> None:
+def test_strategy_signal_timeframe_is_fixed_to_1h_decision_clock() -> None:
     assert _entry_signal_timeframe("15m") == "1h"
     assert _entry_signal_timeframe("1h") == "1h"
-    assert _entry_signal_timeframe("4h") == "4h"
+    assert _entry_signal_timeframe("4h") == "1h"
     assert _entry_signal_timeframe("1d") == "1h"
 
 
@@ -6153,7 +6157,7 @@ def test_auto_trade_skips_m15_entry_when_stop_would_fall_back_to_wider_timeframe
     assert not engine.account.positions
 
 
-def test_auto_trade_uses_15m_only_for_short_squeeze_long() -> None:
+def test_auto_trade_15m_tactical_zone_still_requires_h1_or_h4_stop() -> None:
     engine = PaperTradingEngine(
         AppSettings(),
         starting_balance=1000,
@@ -6196,9 +6200,15 @@ def test_auto_trade_uses_15m_only_for_short_squeeze_long() -> None:
 
     asyncio.run(engine._auto_trade_once())
 
-    position = engine.account.positions[symbol]
-    assert position.metadata["entry_context"]["stop_timeframe"] == "1h"
-    assert position.stop_price == 98.5
+    assert symbol not in engine.account.positions
+    published = engine.latest_signals[symbol]
+    assert any(
+        "1小时或4小时结构生成有效失效价" in str(reason)
+        for reason in (
+            *(published.get("vetoes") or ()),
+            *(published.get("auto_entry_blocks") or ()),
+        )
+    )
 
 
 def test_multi_timeframe_context_adjusts_score_and_veto() -> None:
@@ -7802,7 +7812,7 @@ def test_auto_trade_skips_low_r_target_and_uses_next_valid_setup() -> None:
     assert set(engine.account.positions) == {"NEXTUSDT"}
     blocked = engine.latest_signals["HIGHUSDT"]
     assert any(
-        "below minimum 1.30R" in reason
+        "低于最低1.30R" in reason
         for reason in blocked.get("vetoes", ())
     )
     position = engine.account.positions["NEXTUSDT"]
@@ -7845,7 +7855,7 @@ def test_auto_trade_waits_when_late_stage_structure_reward_is_too_low() -> None:
 
     assert not engine.account.positions
     assert any(
-        "below minimum 1.30R" in reason
+        "低于最低1.30R" in reason
         for reason in engine.latest_signals["LATEUSDT"]["vetoes"]
     )
 
@@ -7878,7 +7888,7 @@ def test_auto_trade_waits_when_real_structure_target_is_unavailable() -> None:
 
     assert "TESTUSDT" not in engine.account.positions
     assert (
-        "entry reward/risk unavailable: no real 1h/4h structure target"
+        "交易计划：未找到最近1小时或4小时对手结构，且不满足强单边开放空间计划"
         in engine.latest_signals["TESTUSDT"]["vetoes"]
     )
 
@@ -7964,7 +7974,7 @@ def test_auto_trade_marks_ready_candidates_blocked_after_position_capacity_is_fi
     asyncio.run(engine._auto_trade_once())
 
     assert set(engine.account.positions) == {"BESTUSDT"}
-    assert "position capacity full: 1 open positions" in engine.latest_signals["SECONDUSDT"]["vetoes"]
+    assert "资金、仓位与交易限制：持仓容量已满（上限1个）" in engine.latest_signals["SECONDUSDT"]["vetoes"]
 
 
 def test_paper_auto_trade_records_btc_extreme_as_warning_without_blocking() -> None:
@@ -7991,7 +8001,7 @@ def test_paper_auto_trade_records_btc_extreme_as_warning_without_blocking() -> N
     assert set(engine.account.positions) == {"TESTUSDT"}
     assert engine.latest_signals["TESTUSDT"]["entry_timing"] == "GOOD"
     assert (
-        "BTC 4h extreme volatility; pause new altcoin entries"
+        "比特币4小时极端波动（模拟盘仅提示，不阻断）"
         in engine.latest_signals["TESTUSDT"]["risk_warnings"]
     )
     assert (
